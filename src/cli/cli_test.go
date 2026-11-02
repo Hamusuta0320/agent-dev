@@ -12,6 +12,7 @@ import (
 
 	"hamusuta/agent-dev/src/config"
 	"hamusuta/agent-dev/src/domain"
+	"hamusuta/agent-dev/src/session"
 	"hamusuta/agent-dev/src/tool"
 
 	tea "charm.land/bubbletea/v2"
@@ -24,6 +25,7 @@ func TestParseCommand(t *testing.T) {
 	cases := map[string]command{
 		"/help":      cmdHelp,
 		"/new":       cmdNew,
+		"/resume":    cmdResume,
 		"/session":   cmdSession,
 		"/exit":      cmdExit,
 		"/quit":      cmdExit,
@@ -234,8 +236,9 @@ func TestWithMark(t *testing.T) {
 // 输入以 / 开头时列出能补全的命令，打全了就不再提示
 func TestSuggestCommands(t *testing.T) {
 	cases := map[string][]string{
-		"/":     {"/help", "/new", "/session", "/config", "/mode", "/exit"},
+		"/":     {"/help", "/new", "/resume", "/session", "/config", "/mode", "/exit"},
 		"/c":    {"/config"},
+		"/re":   {"/resume"},
 		"/se":   {"/session"},
 		"/help": nil, // 已经是完整命令
 		"/zzz":  nil,
@@ -1137,5 +1140,79 @@ func TestApprovalPaste(t *testing.T) {
 	}
 	if v := after.input.Value(); v != "原本在输入框里的内容" {
 		t.Fatalf("输入框不该被粘贴内容改到: %q", v)
+	}
+}
+
+// /resume 序号或 id 都能挑中会话，挑不到要说清楚
+func TestPickSession(t *testing.T) {
+	infos := []session.Info{{Id: "20240103-000000-0002"}, {Id: "20240102-000000-0001"}}
+
+	id, err := pickSession(infos, "1")
+	if err != nil || id != "20240103-000000-0002" {
+		t.Fatalf("序号 1 应该是最新的那个: %q %v", id, err)
+	}
+	id, err = pickSession(infos, "20240102-000000-0001")
+	if err != nil || id != "20240102-000000-0001" {
+		t.Fatalf("按 id 应该能挑中: %q %v", id, err)
+	}
+	if _, err := pickSession(infos, "3"); err == nil {
+		t.Fatal("序号越界应该报错")
+	}
+	if _, err := pickSession(infos, "0"); err == nil {
+		t.Fatal("序号 0 应该报错")
+	}
+	if _, err := pickSession(infos, "不存在的会话"); err == nil {
+		t.Fatal("找不到 id 应该报错")
+	}
+}
+
+// /resume <序号> 把当前会话换成存盘的那一份，下一句提问接着这段历史聊
+func TestResumeSession(t *testing.T) {
+	store := session.NewStore(filepath.Join(t.TempDir(), "sessions"))
+	old := domain.NewSession(`D:\旧目录`)
+	old.AppendUser("上次聊到一半")
+	if err := store.Save(old); err != nil {
+		t.Fatalf("保存失败: %v", err)
+	}
+
+	m := newModel(config.GlobalConfig{}, store, ".", domain.NewSession("."))
+	got, _ := m.resume("/resume 1")
+	restored := got.(model)
+	if restored.cur.Id != old.Id {
+		t.Fatalf("应该恢复成 %s，实际 %s", old.Id, restored.cur.Id)
+	}
+	if len(restored.cur.Messages) != 1 || restored.cur.Messages[0].Content != "上次聊到一半" {
+		t.Fatalf("历史消息没恢复对: %+v", restored.cur.Messages)
+	}
+
+	// 别的目录里开的会话按 id 也能恢复，工具仍按当前目录跑
+	m.workdir = `D:\code\agent-dev`
+	if got, _ := m.resume("/resume " + old.Id); got.(model).cur.Id != old.Id {
+		t.Fatalf("按 id 恢复失败，当前是 %s", got.(model).cur.Id)
+	}
+}
+
+// /resume 不带参数的列表：最近的在最前，当前会话要标出来
+func TestResumeListText(t *testing.T) {
+	cur := &domain.Session{Id: "20240102-000000-0001"}
+	infos := []session.Info{
+		{Id: "20240103-000000-0002", Size: 2048, ModTime: time.Date(2024, 1, 3, 9, 30, 0, 0, time.UTC)},
+		{Id: cur.Id, Size: 512, ModTime: time.Date(2024, 1, 2, 9, 30, 0, 0, time.UTC)},
+	}
+	text := stripANSI(resumeListText(infos, cur))
+
+	for _, want := range []string{"共 2 个", "1. 20240103-000000-0002", "2K", "512B", "/resume 序号"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("列表里应该有 %q:\n%s", want, text)
+		}
+	}
+	if !strings.Contains(text, "▸ 2. "+cur.Id) {
+		t.Fatalf("当前会话应该标出来:\n%s", text)
+	}
+
+	// 一条都没有时给句提示，不要打出空列表
+	empty := stripANSI(resumeListText(nil, cur))
+	if !strings.Contains(empty, "还没有存过的会话") {
+		t.Fatalf("空列表的说明不对: %s", empty)
 	}
 }

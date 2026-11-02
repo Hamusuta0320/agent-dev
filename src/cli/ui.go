@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -54,11 +55,13 @@ const (
 	toolMarkDone = "●"
 	// maxTaskChips 是后台任务栏里最多列几个任务，再多就折成一个"还有 N 个"
 	maxTaskChips = 3
+	// maxResumeList 是 /resume 列表最多列几个会话，再多就折成一句"还有 N 个"
+	maxResumeList = 10
 	// activeRows 是输入框上方那块会变的内容固定占几行：跑任务时是状态、工具调用
 	// 和预览的尾巴，闲着时是补全候选。行数必须恒定——Bubble Tea 在 inline 模式下
 	// 遇到帧变矮，会把腾出来的行空在屏幕底部，输入框就离了屏幕底边；宁可在上面
-	// 补空行。6 行正好放得下全部命令候选。
-	activeRows = 6
+	// 补空行。7 行正好放得下全部命令候选。
+	activeRows = 7
 )
 
 var (
@@ -1052,6 +1055,8 @@ func (m model) submit() (tea.Model, tea.Cmd) {
 		m.cur = domain.NewSession(m.workdir)
 		return m, tea.Println(bannerStyle.Render("新会话 "+m.cur.Id) +
 			hintStyle.Render("，消息 "+fmt.Sprint(len(m.cur.Messages))+" 条"))
+	case cmdResume:
+		return m.resume(input)
 	case cmdSession:
 		return m, tea.Println(sessionText(m.cur, m.store))
 	case cmdConfig:
@@ -1087,6 +1092,108 @@ func (m model) switchMode(input string) (tea.Model, tea.Cmd) {
 		out += "\n" + hintStyle.Render("（没能写回配置: "+err.Error()+"，本次运行仍然生效）")
 	}
 	return m, tea.Println(out)
+}
+
+// resume 处理 /resume：不带参数列出现有会话，带参数就切过去。
+// 参数可以是列表里的序号（1 是最新的），也可以是完整的会话 id。
+// 恢复只换 m.cur，下一句提问就接着这段历史往下聊，会话文件也接着往同一个 id 里写。
+func (m model) resume(input string) (tea.Model, tea.Cmd) {
+	arg := ""
+	if fields := strings.Fields(input); len(fields) > 1 {
+		arg = strings.Join(fields[1:], " ")
+	}
+	if m.store == nil {
+		return m, tea.Println(errStyle.Render("恢复会话失败: 没有会话存储目录"))
+	}
+	infos, err := m.store.ListInfo()
+	if err != nil {
+		return m, tea.Println(errStyle.Render("恢复会话失败: " + err.Error()))
+	}
+	if arg == "" {
+		return m, tea.Println(resumeListText(infos, m.cur))
+	}
+
+	id, err := pickSession(infos, arg)
+	if err != nil {
+		return m, tea.Println(errStyle.Render("恢复会话失败: " + err.Error()))
+	}
+	next, err := m.store.Load(id)
+	if err != nil {
+		return m, tea.Println(errStyle.Render("恢复会话失败: " + err.Error()))
+	}
+	if next.Id == "" {
+		next.Id = id
+	}
+	m.cur = next
+	out := bannerStyle.Render("已恢复会话 "+next.Id) +
+		hintStyle.Render(fmt.Sprintf("，共 %d 条消息，目录 %s", len(next.Messages), m.store.Dir))
+	// 别的目录里开的会话也照样能接着聊，只是工具仍按当前目录跑，提一句免得误会
+	if next.WorkDir != "" && next.WorkDir != m.workdir {
+		out += "\n" + hintStyle.Render("  这个会话是在 "+next.WorkDir+" 开的；继续聊时工具还是在当前目录 "+
+			m.workdir+" 里跑")
+	}
+	return m, tea.Println(out)
+}
+
+// pickSession 把 /resume 的参数认成一个会话 id：纯数字按列表序号算，其余按 id 精确匹配
+func pickSession(infos []session.Info, arg string) (string, error) {
+	if n, err := strconv.Atoi(arg); err == nil {
+		if n < 1 || n > len(infos) {
+			return "", fmt.Errorf("序号 %d 超出范围（1-%d），先 /resume 看列表", n, len(infos))
+		}
+		return infos[n-1].Id, nil
+	}
+	for _, info := range infos {
+		if info.Id == arg {
+			return info.Id, nil
+		}
+	}
+	return "", fmt.Errorf("没找到会话 %q，先 /resume 看列表", arg)
+}
+
+// resumeListText 是 /resume 不带参数时的会话列表：最近的在最前，当前会话标出来
+func resumeListText(infos []session.Info, cur *domain.Session) string {
+	title := bannerStyle.Render("会话列表") +
+		hintStyle.Render(fmt.Sprintf("  共 %d 个，最近的在最前", len(infos)))
+	if len(infos) == 0 {
+		return title + "\n" + hintStyle.Render("  还没有存过的会话：跑完一轮就会自动存一份")
+	}
+
+	shown := infos
+	if len(shown) > maxResumeList {
+		shown = shown[:maxResumeList]
+	}
+	lines := []string{title}
+	for i, info := range shown {
+		mark := "  "
+		style := hintStyle
+		if cur != nil && info.Id == cur.Id {
+			mark, style = "▸ ", promptStyle
+		}
+		when := "—"
+		if !info.ModTime.IsZero() {
+			when = info.ModTime.Format("01-02 15:04")
+		}
+		lines = append(lines, style.Render(fmt.Sprintf("%s%d. %-24s %s  %s",
+			mark, i+1, info.Id, when, sizeText(info.Size))))
+	}
+	if len(infos) > len(shown) {
+		lines = append(lines, hintStyle.Render(fmt.Sprintf("  …还有 %d 个更早的", len(infos)-len(shown))))
+	}
+	lines = append(lines, "", hintStyle.Render("  恢复：/resume 序号 或 /resume 会话 id"))
+	return strings.Join(lines, "\n")
+}
+
+// sizeText 把字节数说成人话，用来粗略估计一个会话有多长
+func sizeText(n int64) string {
+	switch {
+	case n >= 1024*1024:
+		return fmt.Sprintf("%.1fM", float64(n)/(1024*1024))
+	case n >= 1024:
+		return fmt.Sprintf("%.0fK", float64(n)/1024)
+	default:
+		return fmt.Sprintf("%dB", n)
+	}
 }
 
 // startRun 把提问丢给 core.Loop，用 goroutine + channel 把过程事件送回 UI

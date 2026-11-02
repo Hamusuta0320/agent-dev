@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"hamusuta/agent-dev/src/domain"
 )
@@ -77,6 +78,46 @@ func (s *Store) Load(id string) (*domain.Session, error) {
 		session.Id = id
 	}
 	return &session, nil
+}
+
+// Info 是一条会话的摘要，用来在列表里挑一个恢复
+type Info struct {
+	Id string
+	// Size 是会话文件大小，粗略体现会话有多长
+	Size    int64
+	ModTime time.Time
+}
+
+// ListInfo 列出已保存的会话摘要，按修改时间从新到旧（最新的排最前）。
+// 只看文件名和文件属性，不解析会话内容——会话多了也不会卡。
+func (s *Store) ListInfo() ([]Info, error) {
+	entries, err := os.ReadDir(s.Dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("读取会话目录失败: %w", err)
+	}
+	infos := make([]Info, 0, len(entries))
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		info := Info{Id: strings.TrimSuffix(name, ".json")}
+		if fi, err := e.Info(); err == nil {
+			info.Size = fi.Size()
+			info.ModTime = fi.ModTime()
+		}
+		infos = append(infos, info)
+	}
+	sort.Slice(infos, func(i, j int) bool {
+		if !infos[i].ModTime.Equal(infos[j].ModTime) {
+			return infos[i].ModTime.After(infos[j].ModTime)
+		}
+		return infos[i].Id > infos[j].Id
+	})
+	return infos, nil
 }
 
 // List 列出已保存的会话 id，按时间（文件名）从旧到新

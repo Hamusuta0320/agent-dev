@@ -15,6 +15,7 @@ const (
 	cmdNone command = iota
 	cmdHelp
 	cmdNew
+	cmdResume
 	cmdSession
 	cmdConfig
 	cmdMode
@@ -32,6 +33,7 @@ type commandSpec struct {
 var commandSpecs = []commandSpec{
 	{cmdHelp, "/help", "看这个帮助"},
 	{cmdNew, "/new", "开一个新会话"},
+	{cmdResume, "/resume", "恢复以前的会话：不带参数列出来，带序号或 id 切过去"},
 	{cmdSession, "/session", "看当前会话 id 和消息条数"},
 	{cmdConfig, "/config", "配置模型：接口地址、密钥、模型名"},
 	{cmdMode, "/mode", "看或切换工作模式：只读 / 编辑需授权 / 完全授权"},
@@ -49,6 +51,8 @@ func parseCommand(input string) command {
 		return cmdHelp
 	case "/new":
 		return cmdNew
+	case "/resume":
+		return cmdResume
 	case "/session":
 		return cmdSession
 	case "/config":
