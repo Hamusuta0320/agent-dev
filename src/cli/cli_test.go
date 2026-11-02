@@ -130,62 +130,99 @@ func TestEnterKeys(t *testing.T) {
 	}
 }
 
-// 工具调用要把状态贴到标题行，成功/失败和耗时打在结果前面
-func TestToolStatusLines(t *testing.T) {
-	ok := stripANSI(strings.Join(toolStatusLines(domain.Event{
+// 工具调用的标题行最前面是圆圈：成功绿色、失败红色，耗时和原因都跟在同一行
+func TestToolResultLines(t *testing.T) {
+	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+	m.width = 80
+	call := domain.ToolCall{Name: "Bash", Arguments: `{"intent":"跑测试","command":"go test ./..."}`}
+	m.pending = m.toolCallLines(call)
+
+	ok := m.toolResultLines(domain.Event{
 		Kind:    domain.EventToolResult,
+		Call:    call,
 		Status:  domain.ToolStatusSuccess,
 		Elapsed: 1200 * time.Millisecond,
-	}), "\n"))
+	})
+	if len(ok) != 2 || stripANSI(ok[1]) != "  $ go test ./..." {
+		t.Fatalf("成功应该只有标题行和命令行: %q", ok)
+	}
+	if !strings.HasPrefix(ok[0], doneMark(domain.ToolStatusSuccess)+" ") ||
+		!strings.HasPrefix(stripANSI(ok[0]), "● Bash") {
+		t.Fatalf("标题行前面应该是绿色圆圈: %q", ok[0])
+	}
 	for _, want := range []string{"调用成功", "耗时 1.20s"} {
-		if !strings.Contains(ok, want) {
-			t.Fatalf("成功状态少了 %q:\n%s", want, ok)
+		if !strings.Contains(stripANSI(ok[0]), want) {
+			t.Fatalf("成功状态少了 %q: %q", want, ok[0])
 		}
 	}
 
-	fail := stripANSI(strings.Join(toolStatusLines(domain.Event{
+	fail := m.toolResultLines(domain.Event{
 		Kind:    domain.EventToolResult,
+		Call:    call,
 		Status:  domain.ToolStatusFailed,
 		Err:     "打开文件失败\n: a.go",
 		Elapsed: 3 * time.Millisecond,
-	}), "\n"))
+	})
+	if !strings.HasPrefix(fail[0], doneMark(domain.ToolStatusFailed)+" ") {
+		t.Fatalf("标题行前面应该是红色圆圈: %q", fail[0])
+	}
 	for _, want := range []string{"调用失败", "耗时 3ms", "原因: 打开文件失败 : a.go"} {
-		if !strings.Contains(fail, want) {
-			t.Fatalf("失败状态少了 %q:\n%s", want, fail)
+		if !strings.Contains(stripANSI(fail[0]), want) {
+			t.Fatalf("失败状态少了 %q: %q", want, fail[0])
 		}
 	}
 
 	// 失败没带原因时也不能空着，长原因要压成一行
-	noReason := stripANSI(strings.Join(toolStatusLines(domain.Event{
+	// （pending 清掉，走“没有调用中的行，重新渲染”的兜底路径）
+	m.pending = nil
+	noReason := stripANSI(m.toolResultLines(domain.Event{
+		Call:   domain.ToolCall{Name: "Read"},
 		Status: domain.ToolStatusFailed,
-	}), "\n"))
+	})[0])
 	if !strings.Contains(noReason, "未提供失败原因") {
-		t.Fatalf("缺少原因的兜底文案:\n%s", noReason)
+		t.Fatalf("缺少原因的兜底文案: %q", noReason)
 	}
-	long := stripANSI(strings.Join(toolStatusLines(domain.Event{
+	long := m.toolResultLines(domain.Event{
+		Call:   domain.ToolCall{Name: "Read"},
 		Status: domain.ToolStatusFailed,
 		Err:    strings.Repeat("很", toolErrRunes+50),
-	}), "\n"))
-	if strings.Contains(long, "\n") || !strings.Contains(long, "…") {
-		t.Fatalf("长原因应该压成一行并截断:\n%s", long)
+	})
+	if len(long) != 1 || !strings.Contains(stripANSI(long[0]), "…") {
+		t.Fatalf("长原因应该压成一行并截断: %q", long)
 	}
 }
 
-// 状态文案只贴在标题行，原来的调用内容不能动
-func TestWithCallSuffix(t *testing.T) {
-	lines := []string{"⏺ Bash", "  $ ls"}
-	got := withCallSuffix(lines, "  · 12:03:22 · 调用中")
-	if len(got) != 2 || !strings.HasSuffix(stripANSI(got[0]), "12:03:22 · 调用中") || got[1] != "  $ ls" {
-		t.Fatalf("状态没贴对: %q", got)
+// 调用中的圆圈是转圈，跟在工具名前面；没工具在跑时还是原来的状态行
+func TestRunningViewToolMark(t *testing.T) {
+	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+	m.width = 80
+	m.state = stateRunning
+	m.status = "执行 Read…"
+
+	m.pending = m.toolCallLines(domain.ToolCall{Name: "Read", Arguments: `{"file_path":"a.go"}`})
+	head := strings.Split(stripANSI(m.runningView()), "\n")[0]
+	if want := stripANSI(m.spinMark()) + " Read"; !strings.HasPrefix(head, want) {
+		t.Fatalf("调用中应该在工具前面转圈，想要 %q，实际 %q", want, head)
 	}
-	if !strings.HasPrefix(stripANSI(got[0]), "⏺ Bash") {
-		t.Fatalf("标题行不能被动到: %q", got[0])
+
+	m.pending = nil
+	if got := stripANSI(m.runningView()); !strings.Contains(got, "执行 Read…") {
+		t.Fatalf("没有工具在跑时不该贴调用行: %q", got)
 	}
-	if lines[0] != "⏺ Bash" {
+}
+
+// 圆圈只贴在标题行最前面，原来的调用内容不能动
+func TestWithMark(t *testing.T) {
+	lines := []string{"Bash", "  $ ls"}
+	got := withMark(lines, "●")
+	if len(got) != 2 || got[0] != "● Bash" || got[1] != "  $ ls" {
+		t.Fatalf("圆圈没贴对: %q", got)
+	}
+	if lines[0] != "Bash" {
 		t.Fatalf("不该改动传进来的切片: %q", lines)
 	}
-	if got := withCallSuffix(lines, ""); got[0] != "⏺ Bash" {
-		t.Fatalf("没有状态时不该加内容: %q", got)
+	if got := withMark(lines, ""); got[0] != "Bash" {
+		t.Fatalf("没有圆圈时不该加内容: %q", got)
 	}
 }
 

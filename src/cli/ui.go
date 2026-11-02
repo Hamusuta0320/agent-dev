@@ -41,6 +41,8 @@ const (
 	toolArgRunes = 80
 	// toolErrRunes 是失败原因最多保留的字符数
 	toolErrRunes = 200
+	// toolMarkDone 是工具调用结束后贴在标题行最前面的圆圈，颜色表示成败
+	toolMarkDone = "●"
 )
 
 var (
@@ -83,6 +85,13 @@ type model struct {
 	state  uiState
 	status string
 
+	// toolSpin 是工具调用标题行前面那个转圈的圆圈，和底部状态行的转圈各转各的
+	toolSpin spinner.Model
+	// pending 是正在执行、还没出结果的工具调用（渲染好的行，不含最前面的圆圈）。
+	// 调用期间它顶在底部转圈，结果回来才带着状态色打进上方历史区——
+	// 历史区打出去的行改不了，颜色得等结果才知道
+	pending []string
+
 	cancel context.CancelFunc
 	runner *runner
 
@@ -119,6 +128,16 @@ func newModel(cfg config.GlobalConfig, store *session.Store, workdir string, cur
 	spin.Spinner = spinner.Dot
 	spin.Style = statusStyle
 
+	toolSpin := spinner.New()
+	// 调用中的圆圈：Dot 的每一帧自带一个尾随空格，这里去掉，圆圈后面统一补空格
+	// （不能直接改 spinner.Dot.Frames，那是包级变量共享的切片）
+	frames := make([]string, len(spinner.Dot.Frames))
+	for i, f := range spinner.Dot.Frames {
+		frames[i] = strings.TrimRight(f, " ")
+	}
+	toolSpin.Spinner = spinner.Spinner{Frames: frames, FPS: spinner.Dot.FPS}
+	toolSpin.Style = toolStyle
+
 	return model{
 		cfg:       cfg,
 		store:     store,
@@ -126,6 +145,7 @@ func newModel(cfg config.GlobalConfig, store *session.Store, workdir string, cur
 		cur:       cur,
 		input:     input,
 		spin:      spin,
+		toolSpin:  toolSpin,
 		state:     stateIdle,
 		reasoning: &strings.Builder{},
 		answer:    &strings.Builder{},
@@ -155,9 +175,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.state != stateRunning {
 			return m, nil // 停下来就别让时钟继续空转
 		}
-		var cmd tea.Cmd
+		var cmd, toolCmd tea.Cmd
 		m.spin, cmd = m.spin.Update(msg)
-		return m, cmd
+		m.toolSpin, toolCmd = m.toolSpin.Update(msg)
+		return m, tea.Batch(cmd, toolCmd)
 
 	case eventMsg:
 		if m.state != stateRunning {
@@ -209,42 +230,66 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-// toolCallLines 渲染一次工具调用。Bash 会把意图和完整命令都摊开，
+// toolCallLines 渲染一次工具调用的内容，不含最前面的圆圈（圆圈要按状态上色，
+// 得等结果出来才知道）。Bash 会把意图和完整命令都摊开，
 // 其余工具没有专门的格式，压成一行摘要就够了。
 func (m model) toolCallLines(call domain.ToolCall) []string {
 	lines, ok := bashCallLines(call)
 	if ok {
 		return lines
 	}
-	return []string{toolStyle.Render("⏺ "+call.Name) +
+	return []string{toolStyle.Render(call.Name) +
 		hintStyle.Render(" "+firstLines(call.Arguments, toolArgRunes))}
 }
 
-// withCallSuffix 把状态文案（时间 + 调用中）贴到工具调用标题行的末尾。
-// 标题行可能已经被着色，所以只追加一段，不动原来的内容。
-func withCallSuffix(lines []string, suffix string) []string {
-	if suffix == "" || len(lines) == 0 {
+// withMark 把圆圈贴到标题行最前面。标题行可能已经被着色，所以只在前面加一段，
+// 不动原来的内容；也不改传进来的切片。
+func withMark(lines []string, mark string) []string {
+	if mark == "" || len(lines) == 0 {
 		return lines
 	}
 	out := append([]string{}, lines...)
-	out[0] += hintStyle.Render(suffix)
+	out[0] = mark + " " + out[0]
 	return out
 }
 
-// toolStatusLines 渲染工具调用结束后的状态行：成功/失败和耗时；
+// spinMark 是调用中圆圈的位置：转圈的当前帧
+func (m model) spinMark() string {
+	return m.toolSpin.View()
+}
+
+// doneMark 是调用结束后的圆圈：成功绿色、失败红色
+func doneMark(status domain.ToolStatus) string {
+	if status == domain.ToolStatusFailed {
+		return errStyle.Render(toolMarkDone)
+	}
+	return toolOKStyle.Render(toolMarkDone)
+}
+
+// callResultSuffix 是贴在调用标题行末尾的结果：状态和耗时都在同一行，
 // 失败时把原因也摊在同一行，太长的原因压成一行再截断。
-func toolStatusLines(ev domain.Event) []string {
+func callResultSuffix(ev domain.Event) string {
+	text := "  · " + ev.Status.Label() + " · 耗时 " + ev.ElapsedLabel()
 	if ev.Status != domain.ToolStatusFailed {
-		return []string{"  " + toolOKStyle.Render("✓ "+ev.Status.Label()) +
-			hintStyle.Render(" · 耗时 "+ev.ElapsedLabel())}
+		return hintStyle.Render(text)
 	}
 	reason := firstLines(ev.Err, toolErrRunes)
 	if strings.TrimSpace(reason) == "" {
 		reason = "未提供失败原因"
 	}
-	return []string{"  " + errStyle.Render("✗ "+ev.Status.Label()) +
-		hintStyle.Render(" · 耗时 "+ev.ElapsedLabel()+" · 原因: ") +
-		errStyle.Render(reason)}
+	return hintStyle.Render(text+" · 原因: ") + errStyle.Render(reason)
+}
+
+// toolResultLines 渲染一次调用结束后的样子：圆圈按成败上色，耗时和失败原因
+// 都跟在标题行后面，调用内容沿用调用中已经渲染好的那几行。
+func (m model) toolResultLines(ev domain.Event) []string {
+	lines := m.pending
+	if lines == nil {
+		lines = m.toolCallLines(ev.Call)
+	}
+	out := withMark(lines, doneMark(ev.Status))
+	out[0] += callResultSuffix(ev)
+	return out
 }
 
 // bashCallLines 把 Bash 调用渲染成"意图 + 完整命令"：命令不截断，
@@ -262,7 +307,7 @@ func bashCallLines(call domain.ToolCall) ([]string, bool) {
 		return nil, false
 	}
 
-	title := toolStyle.Render("⏺ " + call.Name)
+	title := toolStyle.Render(call.Name)
 	if intent := strings.TrimSpace(args.Intent); intent != "" {
 		title += hintStyle.Render("  " + intent)
 	}
@@ -319,6 +364,7 @@ func (m model) startRun(prompt string) (tea.Model, tea.Cmd) {
 	m.runner = r
 	m.state = stateRunning
 	m.status = "连接模型…"
+	m.pending = nil
 	m.reasoning.Reset()
 	m.answer.Reset()
 	m.reasoningShown = false
@@ -347,6 +393,7 @@ func (m model) startRun(prompt string) (tea.Model, tea.Cmd) {
 		// 把用户原话原样回显到历史区，多行输入也保留换行
 		tea.Println(promptStyle.Render(prompt)),
 		m.spin.Tick,
+		m.toolSpin.Tick,
 		waitEvent(r),
 	)
 }
@@ -388,12 +435,13 @@ func (m model) handleEvent(ev domain.Event) (tea.Model, tea.Cmd) {
 		m.reasoningShown = false
 
 	case domain.EventToolCall:
-		m.status = "执行 " + ev.Call.Name + "…（" + ev.Status.Label() + "）"
-		suffix := "  · " + ev.StartedAt.Format("15:04:05") + " · " + ev.Status.Label()
-		out = append(out, withCallSuffix(m.toolCallLines(ev.Call), suffix)...)
+		// 内容先挂到底部转圈，结果回来才带状态色打进历史区
+		m.status = "执行 " + ev.Call.Name + "…"
+		m.pending = m.toolCallLines(ev.Call)
 
 	case domain.EventToolResult:
-		out = append(out, toolStatusLines(ev)...)
+		out = append(out, m.toolResultLines(ev)...)
+		m.pending = nil
 		out = append(out, m.block("", toolResStyle, ev.Text, printToolResultLines)...)
 		m.status = "等模型继续…"
 	}
@@ -413,6 +461,14 @@ func (m model) finish(err error) (tea.Model, tea.Cmd) {
 		out = append(out, m.block("思考", thinkStyle, m.reasoning.String(), printReasoningLines)...)
 	}
 	out = append(out, m.block("", answerStyle(), m.answer.String(), 0)...)
+
+	// 工具跑到一半被打断，调用那几行还没打进历史区，补上并标成未完成
+	if len(m.pending) > 0 {
+		lines := withMark(m.pending, doneMark(domain.ToolStatusFailed))
+		lines[0] += hintStyle.Render("  · 未完成")
+		out = append(out, lines...)
+		m.pending = nil
+	}
 
 	m.state = stateIdle
 	m.cancel = nil
@@ -457,10 +513,15 @@ func (m model) View() tea.View {
 	return tea.NewView(b.String())
 }
 
-// runningView 是跑任务时贴在底部的那几行：状态 + 思考和回答的尾巴
+// runningView 是跑任务时贴在底部的那几行：状态 + 思考和回答的尾巴。
+// 有工具在跑的时候，第一行换成这次调用本身，圆圈的位置转圈。
 func (m model) runningView() string {
 	var b strings.Builder
-	b.WriteString(statusStyle.Render(m.spin.View() + " " + m.status))
+	if len(m.pending) > 0 {
+		b.WriteString(strings.Join(withMark(m.pending, m.spinMark()), "\n"))
+	} else {
+		b.WriteString(statusStyle.Render(m.spin.View() + " " + m.status))
+	}
 
 	if tail := tailLines(m.reasoning.String(), previewReasoningLines); tail != "" {
 		b.WriteString("\n" + thinkStyle.Render(m.wrap("  "+tail)))
