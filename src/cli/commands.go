@@ -106,12 +106,16 @@ func helpText() string {
 	return strings.Join(lines, "\n")
 }
 
-func sessionText(cur *domain.Session, store *session.Store) string {
+func sessionText(cur *domain.Session, workdir string, store *session.Store) string {
 	dir := ""
 	if store != nil {
 		dir = store.Dir
 	}
-	return fmt.Sprintf("会话 %s，共 %d 条消息，目录 %s", cur.Id, len(cur.Messages), dir)
+	out := fmt.Sprintf("工作区 %s\n会话 %s，共 %d 条消息", workdir, cur.Id, len(cur.Messages))
+	if dir != "" {
+		out += "\n存到 " + dir
+	}
+	return out
 }
 
 // modeText 是 /mode 不带参数时的说明：当前模式标出来，顺便列出怎么切

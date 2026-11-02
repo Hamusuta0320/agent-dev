@@ -26,7 +26,13 @@ func main() {
 	}
 
 	cur := domain.NewSession(workdir)
-	m := newModel(cfg, session.NewStore(session.DefaultDir(workdir)), workdir, cur)
+	store, notice, err := openStore(workdir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	m := newModel(cfg, store, workdir, cur)
+	m.notice = notice
 
 	p := tea.NewProgram(m)
 	if _, err := p.Run(); err != nil {
@@ -35,6 +41,29 @@ func main() {
 	}
 	// 退出时把还没跑完的后台任务一起收掉，别留一堆看不见的进程
 	tool.StopAllTasks()
+}
+
+// openStore 准备当前工作区的会话目录：会话统一放在用户目录下，按工作区分开。
+// 顺便把老版本留在项目里的 <workDir>/.agent/sessions 迁过来（只复制，不删原件），
+// 返回一句要显示给用户的说明。
+func openStore(workdir string) (*session.Store, string, error) {
+	dir, err := session.DefaultDir(workdir)
+	if err != nil {
+		return nil, "", fmt.Errorf("准备会话目录失败: %w", err)
+	}
+	store := session.NewStore(dir)
+	// 工作区信息只是方便排查，写不进去不该拦住启动
+	_ = store.SaveWorkspace(workdir)
+
+	notice := ""
+	n, err := session.Migrate(session.LegacyDir(workdir), dir)
+	if err != nil {
+		notice = fmt.Sprintf("迁移老会话时出了点问题: %v", err)
+	} else if n > 0 {
+		notice = fmt.Sprintf("已把 %d 个老会话从 %s 复制过来，/resume 能看到",
+			n, session.LegacyDir(workdir))
+	}
+	return store, notice, nil
 }
 
 // loadConfig 确保 config.yaml 存在并解析成配置，返回工作目录和配置

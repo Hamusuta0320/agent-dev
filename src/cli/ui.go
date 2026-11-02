@@ -22,6 +22,7 @@ import (
 	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 )
 
 type uiState int
@@ -190,6 +191,9 @@ type model struct {
 	// approval 是正在等用户确认的那项写操作，为 nil 表示没有在等
 	approval *approvalState
 
+	// notice 是启动时想顺带说一句的事情（比如刚把老会话迁过来），空着就不显示
+	notice string
+
 	width    int
 	quitting bool
 }
@@ -265,6 +269,9 @@ func (m model) bannerLines() []string {
 		lines = append(lines, hintStyle.Render(
 			"提示：VS Code 终端里 Tab 可能被接走，补全请用 Ctrl+Space 或 →"))
 	}
+	if m.notice != "" {
+		lines = append(lines, hintStyle.Render(m.notice))
+	}
 	return lines
 }
 
@@ -329,7 +336,7 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !m.started {
 			// 第一次知道窗口多大：这时候打开场白，才算得准要补多少空行
 			m.started = true
-			return m, tea.Sequence(tea.Println(m.startupText()), textarea.Blink)
+			return m, tea.Sequence(m.print(m.startupText()), textarea.Blink)
 		}
 		return m, nil
 
@@ -556,7 +563,7 @@ func (m model) finishApproval(pending *approvalState, ans domain.ApprovalAnswer,
 
 	// 确认框只出现在底部，打进历史区留个记录，事后能看出哪次改动是被同意的
 	out := append(m.approvalLines(pending.req), hintStyle.Render("  · "+decision))
-	return m, tea.Sequence(tea.Println(strings.Join(out, "\n")), waitEvent(m.runner))
+	return m, tea.Sequence(m.print(strings.Join(out, "\n")), waitEvent(m.runner))
 }
 
 // decisionText 是选项被选中后写进历史区的那句话
@@ -1050,15 +1057,15 @@ func (m model) submit() (tea.Model, tea.Cmd) {
 		m.quitting = true
 		return m, tea.Quit
 	case cmdHelp:
-		return m, tea.Println(helpText())
+		return m, m.print(helpText())
 	case cmdNew:
 		m.cur = domain.NewSession(m.workdir)
-		return m, tea.Println(bannerStyle.Render("新会话 "+m.cur.Id) +
+		return m, m.print(bannerStyle.Render("新会话 "+m.cur.Id) +
 			hintStyle.Render("，消息 "+fmt.Sprint(len(m.cur.Messages))+" 条"))
 	case cmdResume:
 		return m.resume(input)
 	case cmdSession:
-		return m, tea.Println(sessionText(m.cur, m.store))
+		return m, m.print(sessionText(m.cur, m.workdir, m.store))
 	case cmdConfig:
 		return m.openConfig()
 	case cmdMode:
@@ -1076,12 +1083,12 @@ func (m model) switchMode(input string) (tea.Model, tea.Cmd) {
 		arg = strings.Join(fields[1:], " ")
 	}
 	if arg == "" {
-		return m, tea.Println(modeText(m.mode))
+		return m, m.print(modeText(m.mode))
 	}
 
 	mode, err := domain.ParseMode(arg)
 	if err != nil {
-		return m, tea.Println(errStyle.Render("切换模式失败: " + err.Error()))
+		return m, m.print(errStyle.Render("切换模式失败: " + err.Error()))
 	}
 	m.mode = mode
 
@@ -1091,7 +1098,7 @@ func (m model) switchMode(input string) (tea.Model, tea.Cmd) {
 	if err := config.SaveMode(m.cfgPath, mode.String()); err != nil {
 		out += "\n" + hintStyle.Render("（没能写回配置: "+err.Error()+"，本次运行仍然生效）")
 	}
-	return m, tea.Println(out)
+	return m, m.print(out)
 }
 
 // resume 处理 /resume：不带参数列出现有会话，带参数就切过去。
@@ -1103,23 +1110,23 @@ func (m model) resume(input string) (tea.Model, tea.Cmd) {
 		arg = strings.Join(fields[1:], " ")
 	}
 	if m.store == nil {
-		return m, tea.Println(errStyle.Render("恢复会话失败: 没有会话存储目录"))
+		return m, m.print(errStyle.Render("恢复会话失败: 没有会话存储目录"))
 	}
 	infos, err := m.store.ListInfo()
 	if err != nil {
-		return m, tea.Println(errStyle.Render("恢复会话失败: " + err.Error()))
+		return m, m.print(errStyle.Render("恢复会话失败: " + err.Error()))
 	}
 	if arg == "" {
-		return m, tea.Println(resumeListText(infos, m.cur))
+		return m, m.print(resumeListText(infos, m.cur))
 	}
 
 	id, err := pickSession(infos, arg)
 	if err != nil {
-		return m, tea.Println(errStyle.Render("恢复会话失败: " + err.Error()))
+		return m, m.print(errStyle.Render("恢复会话失败: " + err.Error()))
 	}
 	next, err := m.store.Load(id)
 	if err != nil {
-		return m, tea.Println(errStyle.Render("恢复会话失败: " + err.Error()))
+		return m, m.print(errStyle.Render("恢复会话失败: " + err.Error()))
 	}
 	if next.Id == "" {
 		next.Id = id
@@ -1132,7 +1139,7 @@ func (m model) resume(input string) (tea.Model, tea.Cmd) {
 		out += "\n" + hintStyle.Render("  这个会话是在 "+next.WorkDir+" 开的；继续聊时工具还是在当前目录 "+
 			m.workdir+" 里跑")
 	}
-	return m, tea.Println(out)
+	return m, m.print(out)
 }
 
 // pickSession 把 /resume 的参数认成一个会话 id：纯数字按列表序号算，其余按 id 精确匹配
@@ -1200,7 +1207,7 @@ func sizeText(n int64) string {
 func (m model) startRun(prompt string) (tea.Model, tea.Cmd) {
 	p, err := buildProvider(m.cfg)
 	if err != nil {
-		return m, tea.Println(errStyle.Render("创建 Provider 失败: " + err.Error()))
+		return m, m.print(errStyle.Render("创建 Provider 失败: " + err.Error()))
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1249,8 +1256,10 @@ func (m model) startRun(prompt string) (tea.Model, tea.Cmd) {
 	}()
 
 	return m, tea.Sequence(
-		// 把用户原话原样回显到历史区，多行输入也保留换行
-		tea.Println(promptStyle.Render(prompt)),
+		// 把用户原话原样回显到历史区，多行输入也保留换行。
+		// 先折行再着色：lipgloss 是逐行套样式的，反过来（先着色再折行）的话
+		// 折出来的第二行起就丢了颜色
+		m.print(promptStyle.Render(m.fitWidth(prompt))),
 		m.spin.Tick,
 		m.toolSpin.Tick,
 		waitEvent(r),
@@ -1327,7 +1336,7 @@ func (m model) handleEvent(ev domain.Event) (tea.Model, tea.Cmd) {
 
 	cmds := []tea.Cmd{}
 	if len(out) > 0 {
-		cmds = append(cmds, tea.Println(strings.Join(out, "\n")))
+		cmds = append(cmds, m.print(strings.Join(out, "\n")))
 	}
 	cmds = append(cmds, waitEvent(m.runner))
 	return m, tea.Sequence(cmds...)
@@ -1368,7 +1377,7 @@ func (m model) finish(err error) (tea.Model, tea.Cmd) {
 
 	cmds := []tea.Cmd{}
 	if len(out) > 0 {
-		cmds = append(cmds, tea.Println(strings.Join(out, "\n")))
+		cmds = append(cmds, m.print(strings.Join(out, "\n")))
 	}
 	cmds = append(cmds, textarea.Blink)
 	return m, tea.Sequence(cmds...)
@@ -1604,6 +1613,31 @@ func (m model) block(title string, titleStyle lipgloss.Style, text string, maxLi
 			"  …(只显示前 %d 行，完整内容在会话文件里)", maxLines)))
 	}
 	return out
+}
+
+// print 把一段文本打进上方的历史区。
+// tea.Println 是绕过 Bubble Tea 的屏幕缓冲区、直接往终端写的：行宽一旦超过终端，
+// 终端会自己折行，程序记的行数就和屏幕实际用的行数对不上，之后每一行都会错位，
+// 最先看出来的是贴在最下面的输入框——上下边框被挤掉、界面糊成一片。
+// 所以所有打印都得先按终端宽度折好再交出去。
+func (m model) print(text string) tea.Cmd {
+	return tea.Println(m.fitWidth(text))
+}
+
+// fitWidth 把每一行折到终端宽度以内。留一列余量，避免正好写满最后一列，
+// 有的终端写满后会把光标挂在行尾，下一个字符就多折出一行。
+// 空行原样保留，行数不变——开场白靠空行把输入框顶到屏幕底部。
+func (m model) fitWidth(text string) string {
+	limit := m.width - 1
+	if limit <= 0 {
+		return text
+	}
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		// Windows 下的输出是 \r\n，行尾的 \r 留着会把光标拉回行首
+		lines[i] = ansi.Wrap(strings.TrimRight(line, "\r"), limit, "")
+	}
+	return strings.Join(lines, "\n")
 }
 
 // wrap 按终端宽度折行，宽度未知（还没收到 WindowSizeMsg）时原样返回

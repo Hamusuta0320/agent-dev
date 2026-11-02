@@ -235,7 +235,7 @@ func (m model) saveConfig() (tea.Model, tea.Cmd) {
 	m.state = stateIdle
 	m.input.Focus()
 	return m, tea.Sequence(
-		tea.Println(bannerStyle.Render("模型配置已保存")+hintStyle.Render("  → "+m.cfgPathLabel())),
+		m.print(bannerStyle.Render("模型配置已保存")+hintStyle.Render("  → "+m.cfgPathLabel())),
 		textarea.Blink,
 	)
 }

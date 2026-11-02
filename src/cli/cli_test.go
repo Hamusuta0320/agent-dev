@@ -16,6 +16,7 @@ import (
 	"hamusuta/agent-dev/src/tool"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 // ansiRe 匹配着色的转义序列，断言文案前要先剥掉
@@ -435,6 +436,41 @@ func TestMaskSecret(t *testing.T) {
 // stripANSI 去掉着色用的转义序列，测试只关心文案本身
 func stripANSI(s string) string {
 	return ansiRe.ReplaceAllString(s, "")
+}
+
+// 打进历史区的每一行都不能超过终端宽度：tea.Println 是直接写终端的，
+// 行太宽终端会自己折行，程序记的行数就和屏幕对不上，界面从此错位
+func TestPrintNeverExceedsWidth(t *testing.T) {
+	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+	m.width = 40
+
+	// 一份带空行、带缩进、中英文混杂的多行文本
+	text := "  " + strings.Repeat("中文", 20) + "\n\n" +
+		"  目录 D:\\code\\go\\agent-dev\\src\\cli\n" + strings.Repeat("a", 120)
+	got := m.fitWidth(text)
+
+	before := strings.Count(text, "\n") + 1
+	after := strings.Count(got, "\n") + 1
+	if after <= before {
+		t.Fatalf("超宽的行应该折成多行: %d -> %d 行\n%s", before, after, got)
+	}
+	for i, line := range strings.Split(got, "\n") {
+		// 留一列余量，避免正好写满最后一列
+		if w := lipgloss.Width(line); w >= m.width {
+			t.Fatalf("第 %d 行宽 %d，超过了终端宽度 %d: %q", i, w, m.width, line)
+		}
+	}
+
+	// 空行得原样留着：开场白靠补空行把输入框顶到屏幕底部
+	if !strings.Contains(got, "\n\n") {
+		t.Fatalf("空行不该被吃掉: %q", got)
+	}
+	// 宽度还不知道的时候原样交出去，别把内容折坏
+	unknown := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+	unknown.width = 0
+	if got := unknown.fitWidth(text); got != text {
+		t.Fatalf("宽度未知时不该动内容: %q", got)
+	}
 }
 
 // Bash 调用要能显示意图和完整命令，多行命令不截断
@@ -1214,5 +1250,63 @@ func TestResumeListText(t *testing.T) {
 	empty := stripANSI(resumeListText(nil, cur))
 	if !strings.Contains(empty, "还没有存过的会话") {
 		t.Fatalf("空列表的说明不对: %s", empty)
+	}
+}
+
+// 启动时会话目录指向用户目录下按工作区分的那一层，项目里留着的老会话顺手迁过来
+func TestOpenStoreUsesWorkspaceDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // Windows 上 os.UserHomeDir 读的是这个
+	work := t.TempDir()
+
+	// 老版本把它存在项目里的 .agent/sessions
+	legacyStore := session.NewStore(session.LegacyDir(work))
+	old := domain.NewSession(work)
+	old.AppendUser("老会话说的话")
+	if err := legacyStore.Save(old); err != nil {
+		t.Fatalf("准备老会话失败: %v", err)
+	}
+
+	store, notice, err := openStore(work)
+	if err != nil {
+		t.Fatalf("准备会话目录失败: %v", err)
+	}
+	root := filepath.Join(home, ".agent-dev", "sessions")
+	if !strings.HasPrefix(store.Dir, root+string(filepath.Separator)) {
+		t.Fatalf("会话目录应该在用户目录下的 %s 里，实际 %s", root, store.Dir)
+	}
+	if store.Dir == session.LegacyDir(work) {
+		t.Fatal("不该再往项目目录里写会话")
+	}
+	if !strings.Contains(notice, "1 个老会话") {
+		t.Fatalf("应该说明迁了几个老会话: %q", notice)
+	}
+
+	// 迁过来的会话 /resume 能看到，原件也还在
+	infos, err := store.ListInfo()
+	if err != nil || len(infos) != 1 || infos[0].Id != old.Id {
+		t.Fatalf("迁移后的会话没出现在列表里: %v %v", infos, err)
+	}
+	if _, err := os.Stat(filepath.Join(session.LegacyDir(work), old.Id+".json")); err != nil {
+		t.Fatalf("老文件应该留着: %v", err)
+	}
+	// 工作区信息写下来了，说明记的是哪个目录
+	if _, err := os.Stat(filepath.Join(store.Dir, "workspace.json")); err != nil {
+		t.Fatalf("工作区信息没写出来: %v", err)
+	}
+
+	// 第二次启动没东西可迁，也就不再提示
+	if _, notice, err := openStore(work); err != nil || notice != "" {
+		t.Fatalf("第二次启动不该再提示: %q %v", notice, err)
+	}
+
+	// 换个目录启动就是另一个工作区，看不到这边的会话
+	other, _, err := openStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("准备另一个工作区失败: %v", err)
+	}
+	if infos, err := other.ListInfo(); err != nil || len(infos) != 0 {
+		t.Fatalf("别的工作区不该看到这里的会话: %v %v", infos, err)
 	}
 }
