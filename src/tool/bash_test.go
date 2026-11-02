@@ -1,6 +1,7 @@
 package tool
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -17,7 +18,7 @@ func runBash(t *testing.T, args map[string]any) (string, error) {
 	if err != nil {
 		t.Fatalf("序列化参数失败: %v", err)
 	}
-	return BashTool{}.Execute(raw)
+	return BashTool{}.Execute(context.Background(), raw)
 }
 
 func TestBashEcho(t *testing.T) {
@@ -102,8 +103,42 @@ func TestBashTimeout(t *testing.T) {
 }
 
 func TestBashNoArgs(t *testing.T) {
-	if _, err := (BashTool{}).Execute(nil); err == nil {
+	if _, err := (BashTool{}).Execute(context.Background(), nil); err == nil {
 		t.Fatal("缺少参数应该报错")
+	}
+}
+
+// 父 Context 被取消（用户按 Ctrl+C）时，命令要立刻停下来，不用等到超时
+func TestBashCancelStopsCommand(t *testing.T) {
+	if runtime.GOOS == "windows" && activeShell().Name == "cmd" {
+		t.Skip("cmd 下没有统一的 sleep 命令，跳过")
+	}
+	command := "sleep 30"
+	if runtime.GOOS == "windows" {
+		command = "Start-Sleep -Seconds 30"
+	}
+	raw, err := json.Marshal(map[string]any{"command": command})
+	if err != nil {
+		t.Fatalf("序列化参数失败: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		cancel()
+	}()
+	defer cancel()
+
+	start := time.Now()
+	out, err := (BashTool{}).Execute(ctx, raw)
+	if err != nil {
+		t.Fatalf("中断不该当成工具错误: %v", err)
+	}
+	if !strings.Contains(out, "中断") {
+		t.Fatalf("应提示被中断: %s", out)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("中断没有生效，耗时 %s", elapsed)
 	}
 }
 

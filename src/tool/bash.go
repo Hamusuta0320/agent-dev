@@ -12,7 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
+
+	"hamusuta/agent-dev/src/domain"
 )
 
 const (
@@ -20,6 +21,9 @@ const (
 	maxBashTimeout     = 120 * time.Second
 	// maxBashOutput 是 stdout+stderr 合并后保留的字节数，超出时开头和结尾各留一半
 	maxBashOutput = 64 * 1024
+	// psUTF8Prefix 让 PowerShell 按 UTF-8 解码原生命令的输出、也按 UTF-8 写出去。
+	// 中文 Windows 的默认代码页是 GBK，不改的话 go test、ls 这类输出里的中文会全变成乱码
+	psUTF8Prefix = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
 )
 
 // shellSpec 描述命令要怎么交给 shell：程序路径 + 固定参数，命令本体作为最后一个参数
@@ -28,6 +32,10 @@ type shellSpec struct {
 	Path string
 	Args []string
 	Hint string // 给模型看的语法提示
+	// UTF8Prefix 是拼在命令最前面的固定语句，用来让 shell 按 UTF-8 解码子进程输出。
+	// PowerShell 在中文 Windows 上默认按本地代码页（GBK）解码原生命令的输出，
+	// Go 程序打的 UTF-8 中文到这儿就成了乱码，所以先把它掰回 UTF-8。
+	UTF8Prefix string
 }
 
 var (
@@ -67,18 +75,20 @@ func detectShell() shellSpec {
 	// 其次 Windows PowerShell 5.1，最后才退回 cmd
 	if p, err := exec.LookPath("pwsh"); err == nil {
 		return shellSpec{
-			Name: "pwsh",
-			Path: p,
-			Args: []string{"-NoLogo", "-NoProfile", "-NonInteractive", "-Command"},
-			Hint: "（PowerShell 7：ls/cat/pwd/rm 等别名可用，支持 && 和管道）",
+			Name:       "pwsh",
+			Path:       p,
+			Args:       []string{"-NoLogo", "-NoProfile", "-NonInteractive", "-Command"},
+			Hint:       "（PowerShell 7：ls/cat/pwd/rm 等别名可用，支持 && 和管道）",
+			UTF8Prefix: psUTF8Prefix,
 		}
 	}
 	if p, err := exec.LookPath("powershell"); err == nil {
 		return shellSpec{
-			Name: "powershell",
-			Path: p,
-			Args: []string{"-NoLogo", "-NoProfile", "-NonInteractive", "-Command"},
-			Hint: "（Windows PowerShell 5.1：不支持 &&，多条命令请用 ; 分隔）",
+			Name:       "powershell",
+			Path:       p,
+			Args:       []string{"-NoLogo", "-NoProfile", "-NonInteractive", "-Command"},
+			Hint:       "（Windows PowerShell 5.1：不支持 &&，多条命令请用 ; 分隔）",
+			UTF8Prefix: psUTF8Prefix,
 		}
 	}
 	return shellSpec{
@@ -94,6 +104,9 @@ type BashTool struct{}
 func (t BashTool) Name() string {
 	return "Bash"
 }
+
+// Mutating 是 true：shell 里什么都能干，一律当成会改动磁盘
+func (t BashTool) Mutating() bool { return true }
 
 func (t BashTool) Description() string {
 	s := activeShell()
@@ -138,7 +151,31 @@ type BashArgs struct {
 	TimeoutSeconds int    `json:"timeout_seconds"`
 }
 
-func (t BashTool) Execute(rawArgs json.RawMessage) (string, error) {
+// Preview 是"编辑需授权"模式下给用户看的一句话摘要：要跑的命令原样摊开，
+// 目录和意图放在补充说明里
+func (t BashTool) Preview(rawArgs json.RawMessage) domain.ApprovalRequest {
+	req := domain.ApprovalRequest{Kind: domain.ApprovalRunCommand, Target: "（命令参数不完整）"}
+	var args BashArgs
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return req
+	}
+	command := strings.TrimRight(args.Command, "\r\n")
+	if strings.TrimSpace(command) == "" {
+		return req
+	}
+	req.Target = command
+	var detail []string
+	if intent := strings.TrimSpace(args.Intent); intent != "" {
+		detail = append(detail, intent)
+	}
+	if wd := strings.TrimSpace(args.Workdir); wd != "" {
+		detail = append(detail, "目录 "+wd)
+	}
+	req.Detail = strings.Join(detail, " · ")
+	return req
+}
+
+func (t BashTool) Execute(ctx context.Context, rawArgs json.RawMessage) (string, error) {
 	if len(rawArgs) == 0 || string(rawArgs) == "null" {
 		return "", fmt.Errorf("缺少参数: command")
 	}
@@ -171,13 +208,29 @@ func (t BashTool) Execute(rawArgs json.RawMessage) (string, error) {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	// 已经中断了就别启动子进程；没中断时把 ctx 当成父级，
+	// 这样用户按 Ctrl+C 能立刻把命令（连它的子进程）停下来，不用等超时
+	parent := ctxOrBackground(ctx)
+	if err := parent.Err(); err != nil {
+		return "", fmt.Errorf("命令没有执行: %w", err)
+	}
+	runCtx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
 	// 命令作为独立参数传给 shell，避免 cmd 再做一次引号解析
 	sh := activeShell()
-	shArgs := append(append([]string{}, sh.Args...), args.Command)
-	cmd := exec.CommandContext(ctx, sh.Path, shArgs...)
+	command := args.Command
+	if sh.UTF8Prefix != "" {
+		command = sh.UTF8Prefix + command
+	}
+	shArgs := append(append([]string{}, sh.Args...), command)
+	cmd := exec.CommandContext(runCtx, sh.Path, shArgs...)
+	// 超时或用户中断时除了子进程本身，还要把它拉起来的进程一起收拾，
+	// 否则 Windows 上 npm / go test 这类会留下孤儿进程继续跑
+	cmd.Cancel = func() error {
+		killTree(cmd.Process)
+		return nil
+	}
 	if workdir != "" {
 		cmd.Dir = workdir
 	}
@@ -194,9 +247,12 @@ func (t BashTool) Execute(rawArgs json.RawMessage) (string, error) {
 
 	err := cmd.Run()
 
-	if ctx.Err() == context.DeadlineExceeded {
-		killTree(cmd.Process)
+	switch {
+	case errors.Is(runCtx.Err(), context.DeadlineExceeded):
 		return fmt.Sprintf("命令超时（%s），已终止\nshell: %s\nexit_code: -1\n%s", timeout, sh.Name, orNoOutput(out.String())), nil
+	case runCtx.Err() != nil:
+		// 父 Context 被取消：用户按了 Ctrl+C，进程树已经在 Cancel 里杀掉了
+		return fmt.Sprintf("命令被中断，已终止\nshell: %s\nexit_code: -1\n%s", sh.Name, orNoOutput(out.String())), nil
 	}
 
 	exitCode := 0
@@ -211,15 +267,16 @@ func (t BashTool) Execute(rawArgs json.RawMessage) (string, error) {
 	return fmt.Sprintf("exit_code: %d\n%s", exitCode, orNoOutput(out.String())), nil
 }
 
-// killTree 把子进程一起干掉，否则 Windows 上 npm / go test 这类会留下孤儿进程
+// killTree 把子进程一起干掉，否则 Windows 上 npm / go test 这类会留下孤儿进程。
+// Windows 上必须先用 taskkill 按 PID 整棵树地杀：父进程一死，/T 就找不到它的子进程了。
 func killTree(p *os.Process) {
 	if p == nil {
 		return
 	}
-	_ = p.Kill()
 	if runtime.GOOS == "windows" {
 		_ = exec.Command("taskkill", "/F", "/T", "/PID", strconv.Itoa(p.Pid)).Run()
 	}
+	_ = p.Kill()
 }
 
 func orNoOutput(s string) string {
@@ -268,33 +325,23 @@ func (o *outputBuffer) Write(p []byte) (int, error) {
 
 func (o *outputBuffer) String() string {
 	if o.total <= o.headMax+o.tailMax {
-		return string(o.head) + string(o.tail)
+		return decodeOutput(o.head) + decodeOutput(o.tail)
 	}
-	head := trimIncompleteRuneRight(o.head)
-	tail := trimIncompleteRuneLeft(o.tail)
+	// 截断位置可能卡在字符中间：UTF-8 靠 rune 裁剪，转码后的内容靠去掉边界上的替换字符
+	head := trimReplacementRight(decodeOutput(o.head))
+	tail := trimReplacementLeft(decodeOutput(o.tail))
 	var sb strings.Builder
-	sb.Write(head)
+	sb.WriteString(head)
 	fmt.Fprintf(&sb, "\n...[输出过长，中间省略 %d 字节，只保留开头和结尾]\n", o.total-len(o.head)-len(o.tail))
-	sb.Write(tail)
+	sb.WriteString(tail)
 	return sb.String()
 }
 
-// trimIncompleteRuneRight 去掉末尾被截断的半个多字节字符
-func trimIncompleteRuneRight(b []byte) []byte {
-	for len(b) > 0 && !utf8.Valid(b) {
-		b = b[:len(b)-1]
-	}
-	return b
+// trimReplacementRight 去掉截断处残留的半个字符（解码成了 U+FFFD）
+func trimReplacementRight(s string) string {
+	return strings.TrimSuffix(s, "\uFFFD")
 }
 
-// trimIncompleteRuneLeft 去掉开头被截断的半个多字节字符
-func trimIncompleteRuneLeft(b []byte) []byte {
-	for len(b) > 0 {
-		r, size := utf8.DecodeRune(b)
-		if r != utf8.RuneError || size > 1 {
-			break
-		}
-		b = b[1:]
-	}
-	return b
+func trimReplacementLeft(s string) string {
+	return strings.TrimPrefix(s, "\uFFFD")
 }

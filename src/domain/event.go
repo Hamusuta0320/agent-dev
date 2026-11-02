@@ -21,6 +21,11 @@ const (
 	EventToolCall
 	// EventToolResult 表示工具执行完，Text 是结果，Status 是成功还是失败
 	EventToolResult
+	// EventUsage 表示拿到了这一轮的 token 用量，Usage 是上下文占用明细
+	EventUsage
+	// EventApproval 表示有一项写操作在等用户确认：Run 发出它之后就停在那儿，
+	// 直到 Reply 收到回答（或这一轮被中断）
+	EventApproval
 )
 
 // ToolStatus 是一次工具调用的执行状态
@@ -63,6 +68,13 @@ type Event struct {
 	StartedAt time.Time
 	// Elapsed 是这次工具调用花的时间，EventToolCall 时还是 0
 	Elapsed time.Duration
+	// Usage 是这一轮的 token 占用，只有 EventUsage 会带
+	Usage ContextUsage
+	// Approval 是要确认的写操作，只有 EventApproval 会带
+	Approval *ApprovalRequest
+	// Reply 是回答 EventApproval 用的 channel，只有 EventApproval 会带。
+	// 收事件的一方必须往里写一次（允许或拒绝），否则 Run 会一直等着
+	Reply chan ApprovalAnswer
 }
 
 // ElapsedLabel 把耗时格式化成给人看的样子，界面和控制台输出都用它

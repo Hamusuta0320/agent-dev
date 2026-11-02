@@ -86,11 +86,12 @@ func (p DeepSeekProvider) Chat(ctx context.Context, messages []domain.AIChatMess
 		ToolCalls: nil,
 	}
 	reqBody, err := json.Marshal(openai.AIRequestMessage{
-		Model:      p.Cfg.Model,
-		Messages:   buildMessages(messages),
-		Tools:      buildOpenAITools(tools),
-		ToolChoice: "auto",
-		Stream:     true,
+		Model:         p.Cfg.Model,
+		Messages:      buildMessages(messages),
+		Tools:         buildOpenAITools(tools),
+		ToolChoice:    "auto",
+		Stream:        true,
+		StreamOptions: &openai.StreamOptions{IncludeUsage: true},
 	})
 	if err != nil {
 		return chatResult, fmt.Errorf("序列化请求失败: %w", err)
@@ -122,6 +123,8 @@ func (p DeepSeekProvider) Chat(ctx context.Context, messages []domain.AIChatMess
 
 	var content, reasoning strings.Builder
 	var calls []domain.ToolCall
+	// 用量在带 include_usage 的那一帧里，那一帧没有 choices，得在筛掉空 choices 之前收着
+	var usage domain.Usage
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
@@ -144,6 +147,13 @@ func (p DeepSeekProvider) Chat(ctx context.Context, messages []domain.AIChatMess
 		}
 		if chunk.Error != nil {
 			return chatResult, fmt.Errorf("流式响应错误: %s", chunk.Error.Message)
+		}
+		if chunk.Usage != nil {
+			usage = domain.Usage{
+				PromptTokens:     chunk.Usage.PromptTokens,
+				CompletionTokens: chunk.Usage.CompletionTokens,
+				TotalTokens:      chunk.Usage.TotalTokens,
+			}
 		}
 		if len(chunk.Choices) == 0 {
 			continue
@@ -181,6 +191,7 @@ func (p DeepSeekProvider) Chat(ctx context.Context, messages []domain.AIChatMess
 
 	chatResult.Content = content.String()
 	chatResult.Reasoning = reasoning.String()
+	chatResult.Usage = usage
 	filtered := calls[:0]
 	for _, c := range calls {
 		if c.Name != "" || c.Id != "" {

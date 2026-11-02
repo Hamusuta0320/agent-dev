@@ -15,6 +15,9 @@ import (
 )
 
 func main() {
+	// 先把控制台切到 UTF-8，否则 Windows 下界面里的中文会乱码
+	useUTF8Console()
+
 	workdir, cfg, err := loadConfig("config.yaml")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -44,6 +47,10 @@ func loadConfig(path string) (string, config.GlobalConfig, error) {
 	}
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return "", cfg, fmt.Errorf("解析配置文件失败: %w", err)
+	}
+	// 模式写错了别等到界面里才发现，启动就报清楚
+	if _, err := domain.ParseMode(cfg.Mode); err != nil {
+		return "", cfg, fmt.Errorf("配置文件 %s 的 Mode 有问题: %w", path, err)
 	}
 
 	workdir, err := os.Getwd()

@@ -3,6 +3,7 @@ package tool
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -25,10 +26,13 @@ const (
 	maxGrepDisplayBytes = 400
 	// grepBinarySniff 读文件开头这么多字节判断是不是二进制
 	grepBinarySniff = 8000
+	// maxGrepContextLines 上下文行最多这么多，再多输出就刷屏了
+	maxGrepContextLines = 10
 )
 
-// grepSkipDirs 递归搜索时直接跳过的目录：版本库、依赖、构建产物
-var grepSkipDirs = map[string]bool{
+// skipDirs 遍历时直接跳过的目录：版本库、依赖、构建产物。
+// Grep 和 Glob 共用这一份，两边的"会搜哪些地方"保持一致。
+var skipDirs = map[string]bool{
 	".git": true, ".hg": true, ".svn": true,
 	"node_modules": true, "bower_components": true, "vendor": true,
 	".idea": true, ".vscode": true, ".vs": true,
@@ -44,11 +48,17 @@ func (t GrepTool) Name() string {
 	return "Grep"
 }
 
+// Mutating 是 false：Grep 只搜不改
+func (t GrepTool) Mutating() bool { return false }
+
 func (t GrepTool) Description() string {
 	return "按正则表达式搜索文件内容，输出格式 `路径:行号:内容`。" +
 		"默认在当前目录递归搜索，自动跳过 .git / node_modules / vendor / dist / build 等目录、二进制文件和超过 10MB 的文件。" +
+		"不是 UTF-8 的文件（例如 GBK / GB18030 编码）会先按本地编码解码再匹配，pattern 请照常写 UTF-8。" +
 		"path 可以指定文件或目录；glob 限定文件类型（如 *.go，多个用逗号分隔）；" +
-		"case_insensitive 忽略大小写；max_results 限制返回条数（默认 200）。" +
+		"case_insensitive 忽略大小写；max_results 限制返回条数（默认 200）；" +
+		"context_lines 让每处匹配多显示前后各几行上下文（默认 0，最多 10），上下文行用 `-` 分隔，" +
+		"需要看清命中周围在干什么时再传。" +
 		"pattern 是 Go 正则（RE2），不支持后向引用，搜代码里的符号要转义 ( ) [ ] { } * + ? | ^ $ . \\。"
 }
 
@@ -76,6 +86,10 @@ func (t GrepTool) Schema() map[string]any {
 				"type":        "integer",
 				"description": "最多返回多少处匹配，默认 200",
 			},
+			"context_lines": map[string]any{
+				"type":        "integer",
+				"description": "每处匹配前后各显示多少行上下文，默认 0（只显示命中行），最多 10",
+			},
 		},
 		"required": []string{"pattern"},
 	}
@@ -87,16 +101,23 @@ type GrepArgs struct {
 	Glob            string `json:"glob"`
 	CaseInsensitive bool   `json:"case_insensitive"`
 	MaxResults      int    `json:"max_results"`
+	ContextLines    int    `json:"context_lines"`
 }
 
-// grepMatch 一处命中：哪个文件的第几行、内容是什么
+// grepMatch 输出的一行：哪个文件的第几行、内容是什么。
+// context 为 true 表示这是命中行周围的上下文，不是命中本身。
 type grepMatch struct {
-	path string
-	line int
-	text string
+	path    string
+	line    int
+	text    string
+	context bool
 }
 
-func (t GrepTool) Execute(rawArgs json.RawMessage) (string, error) {
+func (t GrepTool) Execute(ctx context.Context, rawArgs json.RawMessage) (string, error) {
+	cctx := ctxOrBackground(ctx)
+	if err := cctx.Err(); err != nil {
+		return "", err
+	}
 	if len(rawArgs) == 0 || string(rawArgs) == "null" {
 		return "", fmt.Errorf("缺少参数: pattern")
 	}
@@ -128,22 +149,46 @@ func (t GrepTool) Execute(rawArgs json.RawMessage) (string, error) {
 	}
 	globs := splitGrepGlobs(args.Glob)
 
+	// 上下文行太多会把结果刷爆，超出范围就夹紧，不报错
+	ctxLines := args.ContextLines
+	if ctxLines < 0 {
+		ctxLines = 0
+	}
+	if ctxLines > maxGrepContextLines {
+		ctxLines = maxGrepContextLines
+	}
+
 	info, err := os.Stat(root)
 	if err != nil {
 		return "", fmt.Errorf("路径不可用 %s: %w", root, err)
 	}
 
-	var matches []grepMatch
+	var hits []grepMatch
+	matched := 0 // 命中行数，上下文行不算
 	scanned := 0 // 真正按文本读过的文件数
 	skipped := 0 // 因为是二进制/超大/读不了而跳过的文件数
+	decoded := 0 // 其中不是 UTF-8、按本地编码（GBK）解码过的文件数
+
+	countHits := func(got []grepMatch) {
+		for _, m := range got {
+			if !m.context {
+				matched++
+			}
+		}
+		hits = append(hits, got...)
+	}
 
 	if info.IsDir() {
 		err = filepath.WalkDir(root, func(p string, d fs.DirEntry, walkErr error) error {
+			// 用户中断了就赶紧收工：返回 ctx 的错误，WalkDir 会立刻停下并原样带出来
+			if err := cctx.Err(); err != nil {
+				return err
+			}
 			if walkErr != nil {
 				return nil // 没权限之类的目录直接跳过，不影响整体搜索
 			}
 			if d.IsDir() {
-				if p != root && grepSkipDirs[d.Name()] {
+				if p != root && skipDirs[d.Name()] {
 					return fs.SkipDir
 				}
 				return nil
@@ -152,14 +197,17 @@ func (t GrepTool) Execute(rawArgs json.RawMessage) (string, error) {
 				return nil
 			}
 			// 多留一条用来判断"是不是还有更多"，方便给出截断提示
-			got, reason := grepInFile(p, re, limit-len(matches)+1)
-			matches = append(matches, got...)
+			got, reason, wasDecoded := grepInFile(p, re, limit-matched+1, ctxLines)
+			countHits(got)
 			if reason == grepFileOK {
 				scanned++
+				if wasDecoded {
+					decoded++
+				}
 			} else {
 				skipped++
 			}
-			if len(matches) > limit {
+			if matched > limit {
 				return fs.SkipAll
 			}
 			return nil
@@ -168,17 +216,36 @@ func (t GrepTool) Execute(rawArgs json.RawMessage) (string, error) {
 			return "", fmt.Errorf("搜索 %s 失败: %w", root, err)
 		}
 	} else {
-		got, reason := grepInFile(root, re, limit+1)
+		got, reason, wasDecoded := grepInFile(root, re, limit+1, ctxLines)
 		if reason != grepFileOK {
-			return fmt.Sprintf("(没有搜索 %s：%s)", displayGrepPath(root), reason), nil
+			return fmt.Sprintf("(没有搜索 %s：%s)", displayPath(root), reason), nil
 		}
 		scanned = 1
-		matches = append(matches, got...)
+		if wasDecoded {
+			decoded = 1
+		}
+		countHits(got)
 	}
 
-	truncated := len(matches) > limit
+	// 最多只留前 limit 处命中：最后一处命中后面跟着的上下文行留着，再往后的（含下一处命中）都不要
+	truncated := matched > limit
+	shown := hits
 	if truncated {
-		matches = matches[:limit]
+		n, cut := 0, len(hits)
+		for i, m := range hits {
+			if m.context {
+				continue
+			}
+			n++
+			if n == limit {
+				cut = i + 1
+				for cut < len(hits) && hits[cut].context {
+					cut++
+				}
+				break
+			}
+		}
+		shown = hits[:cut]
 	}
 
 	// 跳过的文件在结果里说明一下，免得"没匹配"看起来像是搜索范围不够
@@ -186,25 +253,38 @@ func (t GrepTool) Execute(rawArgs json.RawMessage) (string, error) {
 	if skipped > 0 {
 		skipNote = fmt.Sprintf("，跳过 %d 个二进制/超大/不可读的文件", skipped)
 	}
+	if decoded > 0 {
+		skipNote += fmt.Sprintf("，%d 个文件不是 UTF-8（已按 GB18030 解码）", decoded)
+	}
 
-	if len(matches) == 0 {
+	if len(hits) == 0 {
 		if scanned == 0 {
 			return fmt.Sprintf("(没有匹配：目录下没有可搜索的文本文件%s，检查一下 path 和 glob)", skipNote), nil
 		}
 		return fmt.Sprintf("(没有匹配：搜索了 %d 个文件%s)", scanned, skipNote), nil
 	}
 
-	files := make(map[string]struct{}, len(matches))
-	for _, m := range matches {
+	files := make(map[string]struct{}, len(shown))
+	for _, m := range shown {
 		files[m.path] = struct{}{}
+	}
+
+	shownMatched := matched
+	if truncated {
+		shownMatched = limit
 	}
 
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "找到 %d 处匹配（%d 个文件，共搜索 %d 个文件%s）:\n",
-		len(matches), len(files), scanned, skipNote)
-	for _, m := range matches {
+		shownMatched, len(files), scanned, skipNote)
+	for _, m := range shown {
 		text := truncateGrepLine(strings.TrimRight(m.text, "\r"), maxGrepDisplayBytes)
-		fmt.Fprintf(&sb, "%s:%d:%s\n", displayGrepPath(m.path), m.line, text)
+		// 上下文行用 "-" 分隔，和命中行的 "路径:行号:内容" 区分开
+		sep := ":"
+		if m.context {
+			sep = "-"
+		}
+		fmt.Fprintf(&sb, "%s%s%d%s%s\n", displayPath(m.path), sep, m.line, sep, text)
 	}
 	if truncated {
 		fmt.Fprintf(&sb, "\n...[结果已截断：只显示前 %d 处匹配，请用更精确的 pattern、path 或 glob 缩小范围]", limit)
@@ -222,50 +302,90 @@ const (
 	grepFileUnreadable grepFileReason = "读取失败，可能没有权限"
 )
 
-// grepInFile 在一个文件里按行匹配，最多收集 max 条，读取/单行过长等异常都用已有结果
-func grepInFile(file string, re *regexp.Regexp, max int) ([]grepMatch, grepFileReason) {
+// grepInFile 在一个文件里按行匹配，最多收集 max 处命中；ctxLines > 0 时连命中前后的上下文行一起收集。
+// 读取/单行过长等异常都用已有结果。
+// 第三个返回值表示这个文件不是 UTF-8、按本地编码（GBK）解码过。
+func grepInFile(file string, re *regexp.Regexp, max, ctxLines int) ([]grepMatch, grepFileReason, bool) {
 	if max <= 0 {
-		return nil, grepFileOK
+		return nil, grepFileOK, false
 	}
 	info, err := os.Stat(file)
 	if err != nil || !info.Mode().IsRegular() {
-		return nil, grepFileUnreadable
+		return nil, grepFileUnreadable, false
 	}
 	if info.Size() > maxGrepFileBytes {
-		return nil, grepFileTooLarge
+		return nil, grepFileTooLarge, false
 	}
 	f, err := os.Open(file)
 	if err != nil {
-		return nil, grepFileUnreadable
+		return nil, grepFileUnreadable, false
 	}
 	defer f.Close()
 
 	head := make([]byte, grepBinarySniff)
 	n, _ := io.ReadFull(f, head)
 	if bytes.IndexByte(head[:n], 0) >= 0 {
-		return nil, grepFileBinary // 二进制文件，跳过
+		return nil, grepFileBinary, false // 二进制文件，跳过
 	}
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return nil, grepFileUnreadable
+		return nil, grepFileUnreadable, false
 	}
 
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), maxGrepLineBytes)
 
 	var out []grepMatch
+	decoded := false
 	lineNo := 0
+	matched := 0           // 本文件已经命中的行数
+	shown := 0             // 已经输出到的最大行号，命中挨得近时用来去重
+	var before []grepMatch // 最近的 ctxLines 行，留给下一处命中当前文
+	after := 0             // 当前命中后面还要补几行上下文
 	for scanner.Scan() {
 		lineNo++
 		line := scanner.Text()
-		if !re.MatchString(line) || !utf8.ValidString(line) {
+		if !utf8.ValidString(line) {
+			// GBK 之类的本地编码：pattern 是 UTF-8，得先解码再匹配
+			d, ok := decodeLocalLossless([]byte(line))
+			if !ok {
+				continue // 解不动的行多半是二进制残留，跳过
+			}
+			line, decoded = d, true
+		}
+		if re.MatchString(line) {
+			for _, b := range before {
+				if b.line > shown {
+					out = append(out, b)
+					shown = b.line
+				}
+			}
+			before = before[:0]
+			if lineNo > shown {
+				out = append(out, grepMatch{path: file, line: lineNo, text: line})
+				shown = lineNo
+			}
+			matched++
+			after = ctxLines
+			if matched >= max {
+				break
+			}
 			continue
 		}
-		out = append(out, grepMatch{path: file, line: lineNo, text: line})
-		if len(out) >= max {
-			break
+		if after > 0 {
+			after--
+			if lineNo > shown {
+				out = append(out, grepMatch{path: file, line: lineNo, text: line, context: true})
+				shown = lineNo
+			}
+		}
+		if ctxLines > 0 {
+			before = append(before, grepMatch{path: file, line: lineNo, text: line, context: true})
+			if len(before) > ctxLines {
+				before = before[1:]
+			}
 		}
 	}
-	return out, grepFileOK
+	return out, grepFileOK, decoded
 }
 
 // splitGrepGlobs 把 "*.go, *.yaml" 拆成多个通配符
@@ -307,7 +427,8 @@ func matchGrepGlobs(globs []string, root, file string) bool {
 	return false
 }
 
-func displayGrepPath(p string) string {
+// displayPath 把路径整理成给人看的样子：斜杠形式，去掉开头的 ./
+func displayPath(p string) string {
 	return strings.TrimPrefix(filepath.ToSlash(p), "./")
 }
 

@@ -19,11 +19,17 @@ type ToolSpec struct {
 }
 
 type AIRequestMessage struct {
-	Model      string          `json:"model"`
-	Messages   []AIChatMessage `json:"messages"`
-	Tools      []ToolSpec      `json:"tools,omitempty"`
-	ToolChoice string          `json:"tool_choice,omitempty"` // auto,none,required
-	Stream     bool            `json:"stream"`
+	Model         string          `json:"model"`
+	Messages      []AIChatMessage `json:"messages"`
+	Tools         []ToolSpec      `json:"tools,omitempty"`
+	ToolChoice    string          `json:"tool_choice,omitempty"` // auto,none,required
+	Stream        bool            `json:"stream"`
+	StreamOptions *StreamOptions  `json:"stream_options,omitempty"`
+}
+
+// StreamOptions 只为了拿到用量：流式接口默认不报 usage，要多要一次
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type AIResponseChoice struct {
@@ -61,9 +67,18 @@ type AIStreamResponse struct {
 		} `json:"delta"`
 		FinishReason string `json:"finish_reason"`
 	}
+	// Usage 只在流末尾带 include_usage 的那一帧里有，其余帧是空的
+	Usage *Usage `json:"usage"`
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error"`
+}
+
+// Usage 是响应里报的 token 用量
+type Usage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
 }
 
 type ToolCallDelta struct {

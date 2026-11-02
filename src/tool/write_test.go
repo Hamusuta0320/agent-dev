@@ -1,6 +1,7 @@
 package tool
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -14,7 +15,7 @@ func runWrite(t *testing.T, args map[string]any) (string, error) {
 	if err != nil {
 		t.Fatalf("序列化参数失败: %v", err)
 	}
-	return WriteTool{}.Execute(raw)
+	return WriteTool{}.Execute(context.Background(), raw)
 }
 
 func TestWriteCreateWithParentDirs(t *testing.T) {
@@ -36,6 +37,7 @@ func TestWriteCreateWithParentDirs(t *testing.T) {
 }
 
 func TestWriteOverwrite(t *testing.T) {
+	t.Chdir(t.TempDir()) // 覆盖会留备份，别写进源码目录
 	path := filepath.Join(t.TempDir(), "a.txt")
 	if err := os.WriteFile(path, []byte("old content\nold\n"), 0o644); err != nil {
 		t.Fatalf("准备文件失败: %v", err)
@@ -108,6 +110,7 @@ func TestWriteKeepsBytesVerbatim(t *testing.T) {
 
 // 以尾换行结尾时，行数按实际行数算，不要多算一行
 func TestWriteLineCountWithTrailingNewline(t *testing.T) {
+	t.Chdir(t.TempDir()) // 第二次写是覆盖，别把备份写进源码目录
 	path := filepath.Join(t.TempDir(), "a.txt")
 	out, err := runWrite(t, map[string]any{"path": path, "content": "x\ny\nz\n"})
 	if err != nil {
@@ -128,6 +131,7 @@ func TestWriteLineCountWithTrailingNewline(t *testing.T) {
 
 // 用空内容覆盖已有文件等于清空，不能残留旧内容
 func TestWriteOverwriteWithEmptyContent(t *testing.T) {
+	t.Chdir(t.TempDir()) // 覆盖会留备份，别写进源码目录
 	path := filepath.Join(t.TempDir(), "a.txt")
 	if err := os.WriteFile(path, []byte("old\n"), 0o644); err != nil {
 		t.Fatalf("准备文件失败: %v", err)
@@ -141,5 +145,70 @@ func TestWriteOverwriteWithEmptyContent(t *testing.T) {
 	}
 	if info.Size() != 0 {
 		t.Fatalf("覆盖成空内容后大小应为 0: %d", info.Size())
+	}
+}
+
+// 覆盖已有文件前先把原内容备份到 .agent/backups 下，结果里要说出备份去哪儿了
+func TestWriteBacksUpOverwrittenFile(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+
+	path := filepath.Join(root, "sub", "a.txt")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("创建目录失败: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("原来的内容\n"), 0o644); err != nil {
+		t.Fatalf("准备文件失败: %v", err)
+	}
+
+	out, err := runWrite(t, map[string]any{"path": path, "content": "新内容\n"})
+	if err != nil {
+		t.Fatalf("执行失败: %v", err)
+	}
+	if !strings.Contains(out, "备份到") {
+		t.Fatalf("覆盖时要说明备份位置: %s", out)
+	}
+
+	backups, err := filepath.Glob(filepath.Join(root, ".agent", "backups", "**", "*"))
+	if err != nil {
+		t.Fatalf("找备份文件失败: %v", err)
+	}
+	var files []string
+	for _, b := range backups {
+		if info, err := os.Stat(b); err == nil && info.Mode().IsRegular() {
+			files = append(files, b)
+		}
+	}
+	if len(files) != 1 {
+		t.Fatalf("应该有 1 份备份，实际 %d 份: %v", len(files), files)
+	}
+	got, err := os.ReadFile(files[0])
+	if err != nil {
+		t.Fatalf("读取备份失败: %v", err)
+	}
+	if string(got) != "原来的内容\n" {
+		t.Fatalf("备份内容应该是覆盖前的原文: %q", got)
+	}
+	// 备份按相对路径存，能看出是哪个文件被覆盖的
+	if !strings.Contains(filepath.ToSlash(files[0]), "sub/a.txt") {
+		t.Fatalf("备份路径里应带上被覆盖文件的相对路径: %s", files[0])
+	}
+}
+
+// 新建文件时没有原内容可备份，不该凭空造出备份目录
+func TestWriteNoBackupForNewFile(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+
+	path := filepath.Join(root, "new.txt")
+	out, err := runWrite(t, map[string]any{"path": path, "content": "x\n"})
+	if err != nil {
+		t.Fatalf("执行失败: %v", err)
+	}
+	if strings.Contains(out, "备份") {
+		t.Fatalf("新建文件不该提备份: %s", out)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".agent")); err == nil {
+		t.Fatal("新建文件不该创建备份目录")
 	}
 }

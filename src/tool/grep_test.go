@@ -1,6 +1,7 @@
 package tool
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -15,7 +16,7 @@ func runGrep(t *testing.T, args map[string]any) (string, error) {
 	if err != nil {
 		t.Fatalf("序列化参数失败: %v", err)
 	}
-	return GrepTool{}.Execute(raw)
+	return GrepTool{}.Execute(context.Background(), raw)
 }
 
 // newTempTree 按 map[相对路径]内容 建一棵临时目录树，返回根目录
@@ -165,7 +166,7 @@ func TestGrepInvalidPattern(t *testing.T) {
 }
 
 func TestGrepMissingPattern(t *testing.T) {
-	if _, err := (GrepTool{}).Execute(json.RawMessage(`{}`)); err == nil {
+	if _, err := (GrepTool{}).Execute(context.Background(), json.RawMessage(`{}`)); err == nil {
 		t.Fatal("缺 pattern 应该报错")
 	}
 }
@@ -280,5 +281,77 @@ func TestGrepCountsSkippedFiles(t *testing.T) {
 	}
 	if !strings.Contains(out, "跳过 1 个") {
 		t.Fatalf("应说明跳过了二进制文件: %s", out)
+	}
+}
+
+// context_lines 让命中前后多带几行，上下文行用 "-" 分隔
+func TestGrepContextLines(t *testing.T) {
+	root := newTempTree(t, map[string]string{"a.txt": "l1\nl2\nHIT\nl4\nl5\nl6\n"})
+	out, err := runGrep(t, map[string]any{"pattern": "HIT", "path": root, "context_lines": 1})
+	if err != nil {
+		t.Fatalf("执行失败: %v", err)
+	}
+	for _, want := range []string{"a.txt-2-l2", "a.txt:3:HIT", "a.txt-4-l4"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("缺少 %q: %s", want, out)
+		}
+	}
+	for _, notWant := range []string{"l1", "l5", "l6"} {
+		if strings.Contains(out, notWant) {
+			t.Fatalf("context_lines=1 不该带出 %q: %s", notWant, out)
+		}
+	}
+	if !strings.Contains(out, "找到 1 处匹配") {
+		t.Fatalf("上下文行不该算进匹配数: %s", out)
+	}
+}
+
+// 两处命中挨得很近时，重叠的上下文行只出现一次
+func TestGrepContextLinesOverlap(t *testing.T) {
+	root := newTempTree(t, map[string]string{"a.txt": "H1\nx\nH2\n"})
+	out, err := runGrep(t, map[string]any{"pattern": "H", "path": root, "context_lines": 1})
+	if err != nil {
+		t.Fatalf("执行失败: %v", err)
+	}
+	if n := strings.Count(out, "a.txt-2-x"); n != 1 {
+		t.Fatalf("重叠的上下文行应该只出现一次，实际 %d 次: %s", n, out)
+	}
+	if !strings.Contains(out, "找到 2 处匹配") {
+		t.Fatalf("匹配数不符合预期: %s", out)
+	}
+}
+
+// 上下文行不受 max_results 影响，截断后只保留最后一处命中后面的上下文
+func TestGrepContextLinesTruncated(t *testing.T) {
+	root := newTempTree(t, map[string]string{"a.txt": "HIT\nctx\nHIT\nx\n"})
+	out, err := runGrep(t, map[string]any{
+		"pattern":       "HIT",
+		"path":          root,
+		"max_results":   1,
+		"context_lines": 1,
+	})
+	if err != nil {
+		t.Fatalf("执行失败: %v", err)
+	}
+	if !strings.Contains(out, "找到 1 处匹配") {
+		t.Fatalf("max_results=1 应该只算一处匹配: %s", out)
+	}
+	if !strings.Contains(out, "a.txt:1:HIT") || !strings.Contains(out, "a.txt-2-ctx") {
+		t.Fatalf("应该保留第一处命中和它的上下文: %s", out)
+	}
+	if strings.Contains(out, "a.txt:3:") || !strings.Contains(out, "结果已截断") {
+		t.Fatalf("第二处命中应该被截掉并提示: %s", out)
+	}
+}
+
+// 默认不带上下文，传 0 也一样
+func TestGrepNoContextByDefault(t *testing.T) {
+	root := newTempTree(t, map[string]string{"a.txt": "l1\nHIT\nl3\n"})
+	out, err := runGrep(t, map[string]any{"pattern": "HIT", "path": root})
+	if err != nil {
+		t.Fatalf("执行失败: %v", err)
+	}
+	if strings.Contains(out, "l1") || strings.Contains(out, "l3") {
+		t.Fatalf("默认不该输出上下文行: %s", out)
 	}
 }

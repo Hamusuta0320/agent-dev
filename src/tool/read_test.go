@@ -1,6 +1,7 @@
 package tool
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -14,7 +15,7 @@ func runRead(t *testing.T, args map[string]any) (string, error) {
 	if err != nil {
 		t.Fatalf("序列化参数失败: %v", err)
 	}
-	return ReadTool{}.Execute(raw)
+	return ReadTool{}.Execute(context.Background(), raw)
 }
 
 func writeTempFile(t *testing.T, content string) string {
@@ -144,5 +145,36 @@ func TestReadLongLine(t *testing.T) {
 	}
 	if !strings.Contains(out, "     2→tail\n") {
 		t.Fatalf("超长行后面的行要保持行号正确: %q", out[max(0, len(out)-200):])
+	}
+}
+
+// 行号超过 6 位时，行号列要跟着加宽，"→" 才不会被顶歪
+func TestReadWideLineNumbers(t *testing.T) {
+	path := writeTempFile(t, strings.Repeat("x\n", 1000000))
+	out, err := runRead(t, map[string]any{"path": path, "offset": 999998, "lines": 3})
+	if err != nil {
+		t.Fatalf("执行失败: %v", err)
+	}
+	want := " 999998→x\n 999999→x\n1000000→x\n"
+	if !strings.HasPrefix(out, want) {
+		t.Fatalf("7 位行号没对齐:\n%q\nwant 前缀:\n%q", out, want)
+	}
+}
+
+// 没到 6 位时保持原来的 6 格宽度，别把已有的输出格式改掉
+func TestLineNumberWidth(t *testing.T) {
+	cases := []struct {
+		maxNo int
+		want  int
+	}{
+		{1, minLineNumberWidth},
+		{999999, minLineNumberWidth},
+		{1000000, 7},
+		{12345678, 8},
+	}
+	for _, c := range cases {
+		if got := lineNumberWidth(c.maxNo); got != c.want {
+			t.Fatalf("lineNumberWidth(%d) = %d，期望 %d", c.maxNo, got, c.want)
+		}
 	}
 }

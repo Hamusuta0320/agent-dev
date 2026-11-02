@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	"hamusuta/agent-dev/src/config"
@@ -28,7 +29,14 @@ const (
 	stateIdle uiState = iota
 	// stateRunning 是模型或工具在跑的状态
 	stateRunning
+	// stateConfig 是 /config 打开的表单，此时键盘全归表单
+	stateConfig
+	// stateApproval 是有写操作在等用户确认，此时只有 y / a / n 三个键有效
+	stateApproval
 )
+
+// 默认的配置文件路径，和 main 里 loadConfig 用的是同一个
+const defaultCfgPath = "config.yaml"
 
 // 运行中在底部预览几行，结束后打到上方历史区；太长的内容只显示开头几行，
 // 完整内容在会话文件里
@@ -59,6 +67,11 @@ var (
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("238")).
 			Padding(0, 1)
+
+	// 上下文占用里三类来源各用一种颜色，扫一眼就知道是哪一块在涨
+	usageSystemStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
+	usageToolStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("215"))
+	usageMsgStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("114"))
 )
 
 // 从模型那边流回来的消息
@@ -74,8 +87,44 @@ type runner struct {
 	err error
 }
 
+// approvalState 是一项等用户点头的写操作：req 用来渲染确认框，
+// reply 是 core 停在那儿等的那个 channel，回答完才能让这一轮继续。
+type approvalState struct {
+	req   domain.ApprovalRequest
+	reply chan domain.ApprovalAnswer
+
+	// choice 是选项列表里当前选中的那一项，进确认框时停在"允许一次"上，
+	// 所以直接回车就等于同意
+	choice int
+	// typing 为 true 表示正在写"拒绝并说明"的那句话
+	typing bool
+	// feedback / cursor 是那句话的输入缓冲和光标位置
+	feedback []rune
+	cursor   int
+}
+
+// approvalOption 是确认框里的一个选项。keys 是能直接按的快捷键，
+// 熟手不用挪手去按方向键。
+type approvalOption struct {
+	label string
+	keys  string
+	// answer 是这个选项对应的结论，feedback 由调用方补上
+	answer domain.ApprovalAnswer
+}
+
+// approvalOptions 是确认框的选项列表，顺序就是上下键的顺序。
+// 第一项是"允许一次"，所以默认选中、直接回车就是放行。
+func approvalOptions(tool string) []approvalOption {
+	return []approvalOption{
+		{label: "允许一次", keys: "y / Enter", answer: domain.ApprovalAnswer{Allowed: true}},
+		{label: "本回合都允许 " + tool, keys: "a", answer: domain.ApprovalAnswer{Allowed: true, Always: true}},
+		{label: "拒绝", keys: "n / Esc", answer: domain.ApprovalAnswer{}},
+	}
+}
+
 type model struct {
 	cfg     config.GlobalConfig
+	cfgPath string
 	store   *session.Store
 	workdir string
 	cur     *domain.Session
@@ -85,12 +134,18 @@ type model struct {
 	state  uiState
 	status string
 
+	// suggestIdx 是补全候选里当前选中的那个，输入变了就失效（渲染时夹到范围内）
+	suggestIdx int
+	// form 是 /config 的模型配置表单
+	form configForm
+
 	// toolSpin 是工具调用标题行前面那个转圈的圆圈，和底部状态行的转圈各转各的
 	toolSpin spinner.Model
 	// pending 是正在执行、还没出结果的工具调用（渲染好的行，不含最前面的圆圈）。
 	// 调用期间它顶在底部转圈，结果回来才带着状态色打进上方历史区——
-	// 历史区打出去的行改不了，颜色得等结果才知道
-	pending []string
+	// 历史区打出去的行改不了，颜色得等结果才知道。
+	// 同一轮里几个只读工具会并行跑，所以这儿是个列表，靠 id 把结果对回对应的调用
+	pending []pendingCall
 
 	cancel context.CancelFunc
 	runner *runner
@@ -102,6 +157,17 @@ type model struct {
 	reasoning      *strings.Builder
 	answer         *strings.Builder
 	reasoningShown bool
+
+	// usage 是最后一次请求的上下文占用（总数来自响应里的 usage），
+	// 贴在输入框上方常驻显示，新一轮开始时清零
+	usage domain.ContextUsage
+	// contextLimit 是配置里的上下文窗口大小，用来算已用百分比
+	contextLimit int
+
+	// mode 是当前工作模式，决定给模型哪些工具、写操作要不要问
+	mode domain.Mode
+	// approval 是正在等用户确认的那项写操作，为 nil 表示没有在等
+	approval *approvalState
 
 	width    int
 	quitting bool
@@ -138,27 +204,46 @@ func newModel(cfg config.GlobalConfig, store *session.Store, workdir string, cur
 	toolSpin.Spinner = spinner.Spinner{Frames: frames, FPS: spinner.Dot.FPS}
 	toolSpin.Style = toolStyle
 
+	// 配置里的模式写错了不该拦住启动，退回默认模式，/mode 会立刻显示成什么
+	mode, _ := domain.ParseMode(cfg.Mode)
+
 	return model{
-		cfg:       cfg,
-		store:     store,
-		workdir:   workdir,
-		cur:       cur,
-		input:     input,
-		spin:      spin,
-		toolSpin:  toolSpin,
-		state:     stateIdle,
-		reasoning: &strings.Builder{},
-		answer:    &strings.Builder{},
-		width:     80,
+		cfg:          cfg,
+		cfgPath:      defaultCfgPath,
+		store:        store,
+		workdir:      workdir,
+		cur:          cur,
+		input:        input,
+		spin:         spin,
+		toolSpin:     toolSpin,
+		state:        stateIdle,
+		form:         newConfigForm(deepSeekConfig(cfg)),
+		contextLimit: deepSeekConfig(cfg).Limit(),
+		mode:         mode,
+		reasoning:    &strings.Builder{},
+		answer:       &strings.Builder{},
+		width:        80,
 	}
 }
 
 func (m model) Init() tea.Cmd {
-	banner := strings.Join([]string{
+	lines := []string{
 		bannerStyle.Render("agent-dev") + hintStyle.Render("  会话 "+m.cur.Id),
-		hintStyle.Render("Enter 发送 · Shift+Enter 换行 · Ctrl+C 退出 · /help 看命令"),
-	}, "\n")
+		hintStyle.Render("模式 ") + statusStyle.Render(m.mode.Label()) +
+			hintStyle.Render(" · Enter 发送 · Shift+Enter 换行 · Ctrl+C 退出 · /help 看命令"),
+	}
+	if inVSCodeTerminal() {
+		// VS Code 集成终端会把 Tab 拿去移动焦点，键根本到不了程序，先把后路写在脸上
+		lines = append(lines, hintStyle.Render(
+			"提示：VS Code 终端里 Tab 可能被接走，补全请用 Ctrl+Space 或 →"))
+	}
+	banner := strings.Join(lines, "\n")
 	return tea.Sequence(tea.Println(banner), textarea.Blink)
+}
+
+// inVSCodeTerminal 判断是不是跑在 VS Code 的集成终端里
+func inVSCodeTerminal() bool {
+	return os.Getenv("TERM_PROGRAM") == "vscode"
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -166,9 +251,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = max(msg.Width, 24)
 		m.input.SetWidth(m.width - 4)
+		m.resizeForm()
 		return m, nil
 
 	case tea.KeyPressMsg:
+		if m.state == stateConfig {
+			return m.handleConfigKey(msg)
+		}
+		if m.state == stateApproval {
+			return m.handleApprovalKey(msg)
+		}
 		return m.handleKey(msg)
 
 	case spinner.TickMsg:
@@ -188,6 +280,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case doneMsg:
 		return m.finish(msg.err)
+
+	case tea.PasteMsg:
+		// 确认框里粘贴：当成"拒绝并说明"的内容，和打字是一回事
+		if m.state == stateApproval && m.approval != nil {
+			m.approval.typing = true
+			m.approval.insert([]rune(msg.Content)...)
+			return m, nil
+		}
+	}
+
+	// 表单里非按键的消息（光标闪烁）只交给正在编辑的那一格
+	if m.state == stateConfig {
+		if !m.form.editing {
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.form.inputs[m.form.cur], cmd = m.form.inputs[m.form.cur].Update(msg)
+		return m, cmd
+	}
+
+	// 确认框期间输入框是藏起来的，别让粘贴、光标闪烁之类的消息悄悄改到它
+	if m.state == stateApproval {
+		return m, nil
 	}
 
 	var cmd tea.Cmd
@@ -216,6 +331,40 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	// 补全键全归我们管：有候选就补全，没候选也直接吞掉，不再往下漏给输入框。
+	// （输入框本身没绑 Tab，漏下去什么都不会发生；真正的麻烦是 VS Code 集成终端
+	// 会把 Tab 当成"移动焦点"直接接走，那种情况 Tab 根本到不了这里，
+	// 所以补全还留了两条不经过 Tab 的路：Ctrl+Space，和光标停在行尾时的 →。
+	// 光标已经在行尾时 → 本来就无处可去，拿来接受补全正好。）
+	movingRight := msg.Code == tea.KeyRight && m.cursorAtEnd()
+	if isCompleteKey(msg) || movingRight {
+		if m.state == stateIdle {
+			if specs := suggestCommands(m.input.Value()); len(specs) > 0 {
+				return m.complete(specs)
+			}
+		}
+		if !movingRight {
+			return m, nil // 补全键吞掉；→ 没候选就照常交给输入框右移
+		}
+	}
+
+	// 输入框上方有补全候选时，↑↓ 选、Enter 补全
+	if m.state == stateIdle {
+		if specs := suggestCommands(m.input.Value()); len(specs) > 0 {
+			switch msg.String() {
+			case "up":
+				m.suggestIdx = (m.curSuggest(specs) - 1 + len(specs)) % len(specs)
+				return m, nil
+			case "down":
+				m.suggestIdx = (m.curSuggest(specs) + 1) % len(specs)
+				return m, nil
+			case "enter":
+				// 命令还没打完，回车先当成补全，别把半截 "/co" 发给模型
+				return m.complete(specs)
+			}
+		}
+	}
+
 	if msg.Code == tea.KeyEnter {
 		if m.state == stateRunning {
 			return m, nil // 运行中不接受新输入
@@ -228,6 +377,273 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
 	return m, cmd
+}
+
+// handleApprovalKey 处理确认框上的按键：
+//   - ↑↓ / j k 换选项，Enter 确认当前选项（默认是"允许一次"）
+//   - y 允许一次、a 本回合都不再问、n / Esc 拒绝，熟手直接按单键
+//   - 直接打字就进"拒绝并说明"：写完回车，这句话会转给模型
+func (m model) handleApprovalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	pending := m.approval
+	if pending == nil {
+		// 理论上不会发生：没有待确认的请求就回到正常状态，别把界面卡在确认框上
+		if m.runner == nil {
+			return m.finish(nil)
+		}
+		m.state = stateRunning
+		return m, waitEvent(m.runner)
+	}
+
+	options := approvalOptions(pending.req.Tool)
+	key := msg.String()
+
+	if pending.typing {
+		switch {
+		case key == "enter":
+			// 写了话就当成"拒绝并说明"，光标下面是空的就还是普通拒绝
+			ans := domain.ApprovalAnswer{Feedback: string(pending.feedback)}
+			return m.finishApproval(pending, ans, withFeedback("已拒绝并说明", ans.Feedback))
+		case key == "esc":
+			pending.typing = false
+			return m, nil
+		case key == "ctrl+c":
+			return m.finishApproval(pending, domain.ApprovalAnswer{}, "已拒绝")
+		case key == "backspace":
+			pending.backspace()
+			return m, nil
+		case key == "delete":
+			pending.deleteForward()
+			return m, nil
+		case key == "left":
+			pending.moveCursor(-1)
+			return m, nil
+		case key == "right":
+			pending.moveCursor(1)
+			return m, nil
+		}
+		// 其余可打印字符进缓冲区；ctrl+ 组合键之类不是内容，忽略掉
+		if msg.Text != "" {
+			pending.insert([]rune(msg.Text)...)
+		}
+		return m, nil
+	}
+
+	switch key {
+	case "up", "k":
+		pending.choice = (pending.choice - 1 + len(options)) % len(options)
+		return m, nil
+	case "down", "j":
+		pending.choice = (pending.choice + 1) % len(options)
+		return m, nil
+	case "enter":
+		opt := options[pending.choice]
+		return m.finishApproval(pending, opt.answer, decisionText(pending.req.Tool, opt))
+	case "y":
+		return m.finishApproval(pending, options[0].answer, decisionText(pending.req.Tool, options[0]))
+	case "a":
+		return m.finishApproval(pending, options[1].answer, decisionText(pending.req.Tool, options[1]))
+	case "n", "esc", "ctrl+c":
+		return m.finishApproval(pending, options[2].answer, decisionText(pending.req.Tool, options[2]))
+	}
+
+	// 开始打字就是"拒绝，顺便说明要怎么改"
+	if msg.Text != "" {
+		pending.typing = true
+		pending.insert([]rune(msg.Text)...)
+	}
+	return m, nil
+}
+
+// finishApproval 把回答送回 core，收起确认框，在历史区留一条记录
+func (m model) finishApproval(pending *approvalState, ans domain.ApprovalAnswer, decision string) (tea.Model, tea.Cmd) {
+	// channel 带一个缓冲，就算 core 已经走了（这一轮被中断）也不会卡住界面
+	pending.reply <- ans
+
+	m.approval = nil
+	m.state = stateRunning
+	switch {
+	case ans.Allowed && ans.Always:
+		m.status = "已允许，本回合不再问 " + pending.req.Tool + "…"
+	case ans.Allowed:
+		m.status = "已允许，执行 " + pending.req.Tool + "…"
+	default:
+		m.status = "已拒绝，等模型继续…"
+	}
+
+	// 确认框只出现在底部，打进历史区留个记录，事后能看出哪次改动是被同意的
+	out := append(m.approvalLines(pending.req), hintStyle.Render("  · "+decision))
+	return m, tea.Sequence(tea.Println(strings.Join(out, "\n")), waitEvent(m.runner))
+}
+
+// decisionText 是选项被选中后写进历史区的那句话
+func decisionText(tool string, opt approvalOption) string {
+	switch {
+	case opt.answer.Allowed && opt.answer.Always:
+		return "已允许，本回合不再问 " + tool
+	case opt.answer.Allowed:
+		return "已允许"
+	default:
+		return "已拒绝"
+	}
+}
+
+// withFeedback 在结论后面附上用户写的那句话，太长就截一下
+func withFeedback(base, feedback string) string {
+	feedback = strings.TrimSpace(feedback)
+	if feedback == "" {
+		return base
+	}
+	return base + "：" + firstLines(feedback, toolErrRunes)
+}
+
+// insert 把字符插到光标处，缓冲区每次都重建，免得 model 按值复制后共享同一段底层数组。
+// 换行和制表符换成空格、其它控制字符丢掉——这行只有一个显示行。
+func (s *approvalState) insert(rs ...rune) {
+	buf := make([]rune, 0, len(s.feedback)+len(rs))
+	buf = append(buf, s.feedback[:s.cursor]...)
+	added := 0
+	for _, r := range rs {
+		switch {
+		case r == '\r':
+			continue
+		case r == '\n' || r == '\t':
+			r = ' '
+		case r < 32 || r == 127:
+			continue
+		}
+		buf = append(buf, r)
+		added++
+	}
+	buf = append(buf, s.feedback[s.cursor:]...)
+	s.feedback = buf
+	s.cursor += added
+}
+
+// backspace 删掉光标前一个字
+func (s *approvalState) backspace() {
+	if s.cursor == 0 {
+		return
+	}
+	buf := make([]rune, 0, len(s.feedback))
+	buf = append(buf, s.feedback[:s.cursor-1]...)
+	buf = append(buf, s.feedback[s.cursor:]...)
+	s.feedback = buf
+	s.cursor--
+}
+
+// deleteForward 删掉光标处那一个字
+func (s *approvalState) deleteForward() {
+	if s.cursor >= len(s.feedback) {
+		return
+	}
+	buf := make([]rune, 0, len(s.feedback))
+	buf = append(buf, s.feedback[:s.cursor]...)
+	buf = append(buf, s.feedback[s.cursor+1:]...)
+	s.feedback = buf
+}
+
+// moveCursor 左右移光标，夹在缓冲区范围内
+func (s *approvalState) moveCursor(delta int) {
+	pos := s.cursor + delta
+	if pos < 0 {
+		pos = 0
+	}
+	if pos > len(s.feedback) {
+		pos = len(s.feedback)
+	}
+	s.cursor = pos
+}
+
+// approvalLines 渲染一次待确认的写操作：标题 + 目标 + 补充说明 + 改动预览。
+// 命令类（Bash）按多行摊开、每行前面带 $，和工具调用那几行保持同一种样子。
+func (m model) approvalLines(req domain.ApprovalRequest) []string {
+	out := []string{bannerStyle.Render("需要确认") + hintStyle.Render("  "+req.Tool)}
+	switch req.Kind {
+	case domain.ApprovalRunCommand:
+		for i, line := range strings.Split(req.Target, "\n") {
+			line = strings.TrimRight(line, "\r")
+			if i == 0 {
+				out = append(out, hintStyle.Render("  $ ")+line)
+				continue
+			}
+			out = append(out, "    "+line)
+		}
+	default:
+		out = append(out, "  "+statusStyle.Render(req.Target))
+	}
+	if detail := strings.TrimSpace(req.Detail); detail != "" {
+		for _, line := range strings.Split(detail, "\n") {
+			out = append(out, hintStyle.Render("  "+strings.TrimRight(line, "\r")))
+		}
+	}
+	out = append(out, m.diffLines(req.Diff)...)
+	return out
+}
+
+// diffLines 把改动预览画成 - 旧行 / + 新行，删的标红、加的标绿，扫一眼就知道动了什么
+func (m model) diffLines(diff *domain.DiffPreview) []string {
+	if diff == nil || diff.Empty() {
+		return nil
+	}
+	const maxRunes = 200
+	out := make([]string, 0, len(diff.Removed)+len(diff.Added)+1)
+	for _, line := range diff.Removed {
+		out = append(out, errStyle.Render("  - "+firstLines(line, maxRunes)))
+	}
+	for _, line := range diff.Added {
+		out = append(out, toolOKStyle.Render("  + "+firstLines(line, maxRunes)))
+	}
+	if diff.Truncated {
+		out = append(out, hintStyle.Render("  …(预览只显示开头几行)"))
+	}
+	return out
+}
+
+// approvalView 是等确认时顶替输入框的那个框：上面是这次要做什么，下面是选项。
+// 正在写"拒绝并说明"时，选项换成那行输入框。
+func (m model) approvalView() string {
+	if m.approval == nil {
+		return ""
+	}
+	lines := m.approvalLines(m.approval.req)
+	lines = append(lines, "")
+	if m.approval.typing {
+		lines = append(lines,
+			hintStyle.Render("  拒绝并说明：")+m.feedbackLine(),
+			hintStyle.Render("  Enter 连同这句话拒绝 · Esc 回到选项"),
+		)
+		return boxStyle.Width(m.width - 4).Render(strings.Join(lines, "\n"))
+	}
+
+	for i, opt := range approvalOptions(m.approval.req.Tool) {
+		text := fmt.Sprintf("%d. %s", i+1, opt.label)
+		if i == m.approval.choice {
+			lines = append(lines, promptStyle.Render("  ▸ "+text)+hintStyle.Render("  "+opt.keys))
+			continue
+		}
+		lines = append(lines, hintStyle.Render("    "+text)+hintStyle.Render("  "+opt.keys))
+	}
+	lines = append(lines, "", hintStyle.Render(
+		"  ↑↓ 选择 · Enter 确认 · 直接打字可以拒绝并说明要怎么改"))
+	return boxStyle.Width(m.width - 4).Render(strings.Join(lines, "\n"))
+}
+
+// feedbackLine 是"拒绝并说明"那行输入框，光标位置用一条竖线标出来
+func (m model) feedbackLine() string {
+	buf := m.approval.feedback
+	pos := m.approval.cursor
+	if pos < 0 || pos > len(buf) {
+		pos = len(buf)
+	}
+	return string(buf[:pos]) + statusStyle.Render("▏") + string(buf[pos:])
+}
+
+// pendingCall 是一次正在执行、还没出结果的工具调用。
+// id 用来把结果对回对应的调用（同一轮里可能有几个只读工具同时在跑），
+// lines 是已经渲染好的调用内容，不含最前面的圆圈。
+type pendingCall struct {
+	id    string
+	lines []string
 }
 
 // toolCallLines 渲染一次工具调用的内容，不含最前面的圆圈（圆圈要按状态上色，
@@ -281,14 +697,33 @@ func callResultSuffix(ev domain.Event) string {
 }
 
 // toolResultLines 渲染一次调用结束后的样子：圆圈按成败上色，耗时和失败原因
-// 都跟在标题行后面，调用内容沿用调用中已经渲染好的那几行。
-func (m model) toolResultLines(ev domain.Event) []string {
-	lines := m.pending
+// 都跟在标题行后面，调用内容用调用中已经渲染好的那几行（lines 为 nil 时现场重渲染）。
+func (m model) toolResultLines(ev domain.Event, lines []string) []string {
 	if lines == nil {
 		lines = m.toolCallLines(ev.Call)
 	}
 	out := withMark(lines, doneMark(ev.Status))
 	out[0] += callResultSuffix(ev)
+	return out
+}
+
+// takePending 把这次调用的那几行从"调用中"列表里摘出来，还没出结果的调用保持不动
+func (m *model) takePending(call domain.ToolCall) []string {
+	for i, p := range m.pending {
+		if p.id == call.Id {
+			m.pending = append(m.pending[:i], m.pending[i+1:]...)
+			return p.lines
+		}
+	}
+	return nil
+}
+
+// pendingLines 把所有还在跑的调用拼成一串行，底部一起转圈
+func (m model) pendingLines() []string {
+	var out []string
+	for _, p := range m.pending {
+		out = append(out, p.lines...)
+	}
 	return out
 }
 
@@ -325,6 +760,62 @@ func bashCallLines(call domain.ToolCall) ([]string, bool) {
 	return out, true
 }
 
+// curSuggest 把选中项夹进候选范围：输入变过之后旧下标可能已经越界
+func (m model) curSuggest(specs []commandSpec) int {
+	if m.suggestIdx < 0 || m.suggestIdx >= len(specs) {
+		return 0
+	}
+	return m.suggestIdx
+}
+
+// complete 把选中的命令填进输入框，末尾留一个空格，方便直接接参数
+func (m model) complete(specs []commandSpec) (tea.Model, tea.Cmd) {
+	m.input.SetValue(specs[m.curSuggest(specs)].name + " ")
+	m.suggestIdx = 0
+	return m, nil
+}
+
+// isCompleteKey 判断这个键算不算"接受补全"。
+// Tab 和 Ctrl+I 是同一个字节，有的终端配置下 Tab 会被解码成 ctrl+i 而不是 tab，
+// 两种都得认；Ctrl+Space（以及同一字节的 Ctrl+@）是 Tab 被终端接走时的备选键。
+func isCompleteKey(msg tea.KeyPressMsg) bool {
+	if msg.Code == tea.KeyTab {
+		return true
+	}
+	switch msg.String() {
+	case "ctrl+i", "ctrl+space", "ctrl+@":
+		return true
+	}
+	return false
+}
+
+// cursorAtEnd 判断光标是不是停在输入的末尾。只有这时 → 才算"接受补全"，
+// 光标停在中间时 → 还是照常右移一格。
+func (m model) cursorAtEnd() bool {
+	lines := strings.Split(m.input.Value(), "\n")
+	last := lines[len(lines)-1]
+	return m.input.Line() == len(lines)-1 && m.input.Column() == len([]rune(last))
+}
+
+// completionLines 是输入框上方的补全候选，选中的一行高亮
+func (m model) completionLines() []string {
+	specs := suggestCommands(m.input.Value())
+	if len(specs) == 0 {
+		return nil
+	}
+	cur := m.curSuggest(specs)
+	out := make([]string, 0, len(specs))
+	for i, spec := range specs {
+		name := fmt.Sprintf("%-9s", spec.name)
+		if i == cur {
+			out = append(out, promptStyle.Render("▸ "+name)+hintStyle.Render(spec.desc))
+			continue
+		}
+		out = append(out, hintStyle.Render("  "+name+spec.desc))
+	}
+	return out
+}
+
 // submit 处理一次回车：本地命令就地执行，普通输入交给模型
 func (m model) submit() (tea.Model, tea.Cmd) {
 	input := strings.TrimSpace(m.input.Value())
@@ -332,6 +823,7 @@ func (m model) submit() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.input.Reset()
+	m.suggestIdx = 0
 
 	switch parseCommand(input) {
 	case cmdExit:
@@ -345,9 +837,39 @@ func (m model) submit() (tea.Model, tea.Cmd) {
 			hintStyle.Render("，消息 "+fmt.Sprint(len(m.cur.Messages))+" 条"))
 	case cmdSession:
 		return m, tea.Println(sessionText(m.cur, m.store))
+	case cmdConfig:
+		return m.openConfig()
+	case cmdMode:
+		return m.switchMode(input)
 	}
 
 	return m.startRun(input)
+}
+
+// switchMode 处理 /mode：不带参数就报当前模式和可选项，带了就切过去并写回配置，
+// 下次启动还是这个模式。
+func (m model) switchMode(input string) (tea.Model, tea.Cmd) {
+	arg := ""
+	if fields := strings.Fields(input); len(fields) > 1 {
+		arg = strings.Join(fields[1:], " ")
+	}
+	if arg == "" {
+		return m, tea.Println(modeText(m.mode))
+	}
+
+	mode, err := domain.ParseMode(arg)
+	if err != nil {
+		return m, tea.Println(errStyle.Render("切换模式失败: " + err.Error()))
+	}
+	m.mode = mode
+
+	out := bannerStyle.Render("工作模式 ") + statusStyle.Render(mode.Label()) +
+		hintStyle.Render("  "+modeHint(mode))
+	// 写回配置失败不影响本次运行，说明一下就行
+	if err := config.SaveMode(m.cfgPath, mode.String()); err != nil {
+		out += "\n" + hintStyle.Render("（没能写回配置: "+err.Error()+"，本次运行仍然生效）")
+	}
+	return m, tea.Println(out)
 }
 
 // startRun 把提问丢给 core.Loop，用 goroutine + channel 把过程事件送回 UI
@@ -365,23 +887,36 @@ func (m model) startRun(prompt string) (tea.Model, tea.Cmd) {
 	m.state = stateRunning
 	m.status = "连接模型…"
 	m.pending = nil
+	m.approval = nil
+	m.usage = domain.ContextUsage{}
 	m.reasoning.Reset()
 	m.answer.Reset()
 	m.reasoningShown = false
 
 	cur, store, workdir := m.cur, m.store, m.workdir
+	limit := m.contextLimit
+	mode := m.mode
 
 	go func() {
 		defer close(r.ch)
 		r.err = core.Loop(domain.Ctx{
-			Prompt:   prompt,
-			Provider: p,
-			Tools:    tool.Tools,
-			Context:  ctx,
-			WorkDir:  workdir,
-			Shell:    tool.ShellName(),
-			Session:  cur,
-			Emit:     func(ev domain.Event) { r.ch <- ev },
+			Prompt:       prompt,
+			Provider:     p,
+			Tools:        tool.ForMode(mode),
+			Context:      ctx,
+			WorkDir:      workdir,
+			Shell:        tool.ShellName(),
+			Session:      cur,
+			ContextLimit: limit,
+			Mode:         mode,
+			// 被中断之后界面可能已经不再读这个 channel 了，
+			// 所以发事件也要认 ctx，不然这一轮会卡在发送上收不了尾
+			Emit: func(ev domain.Event) {
+				select {
+				case r.ch <- ev:
+				case <-ctx.Done():
+				}
+			},
 		})
 		// 出错也要落盘，前面几轮的工具调用不能白跑
 		if saveErr := store.Save(cur); saveErr != nil && r.err == nil {
@@ -407,6 +942,23 @@ func (m model) handleEvent(ev domain.Event) (tea.Model, tea.Cmd) {
 		if ev.Step > 1 {
 			m.status = fmt.Sprintf("第 %d 轮", ev.Step)
 		}
+
+	case domain.EventUsage:
+		m.usage = ev.Usage
+		// 事件里没带上限时（比如 core 没拿到配置）用界面自己知道的那个补上
+		if m.usage.ContextLimit <= 0 {
+			m.usage.ContextLimit = m.contextLimit
+		}
+
+	case domain.EventApproval:
+		// core 正停在这儿等回答，所以不能再 waitEvent，否则会一直读不到东西
+		m.status = "等待确认…"
+		m.state = stateApproval
+		m.approval = nil
+		if ev.Approval != nil {
+			m.approval = &approvalState{req: *ev.Approval, reply: ev.Reply}
+		}
+		return m, nil
 
 	case domain.EventReasoning:
 		m.reasoning.WriteString(ev.Text)
@@ -437,13 +989,16 @@ func (m model) handleEvent(ev domain.Event) (tea.Model, tea.Cmd) {
 	case domain.EventToolCall:
 		// 内容先挂到底部转圈，结果回来才带状态色打进历史区
 		m.status = "执行 " + ev.Call.Name + "…"
-		m.pending = m.toolCallLines(ev.Call)
+		m.pending = append(m.pending, pendingCall{id: ev.Call.Id, lines: m.toolCallLines(ev.Call)})
 
 	case domain.EventToolResult:
-		out = append(out, m.toolResultLines(ev)...)
-		m.pending = nil
+		out = append(out, m.toolResultLines(ev, m.takePending(ev.Call))...)
 		out = append(out, m.block("", toolResStyle, ev.Text, printToolResultLines)...)
-		m.status = "等模型继续…"
+		if len(m.pending) > 0 {
+			m.status = fmt.Sprintf("还有 %d 个工具在跑…", len(m.pending))
+		} else {
+			m.status = "等模型继续…"
+		}
 	}
 
 	cmds := []tea.Cmd{}
@@ -464,7 +1019,7 @@ func (m model) finish(err error) (tea.Model, tea.Cmd) {
 
 	// 工具跑到一半被打断，调用那几行还没打进历史区，补上并标成未完成
 	if len(m.pending) > 0 {
-		lines := withMark(m.pending, doneMark(domain.ToolStatusFailed))
+		lines := withMark(m.pendingLines(), doneMark(domain.ToolStatusFailed))
 		lines[0] += hintStyle.Render("  · 未完成")
 		out = append(out, lines...)
 		m.pending = nil
@@ -473,6 +1028,7 @@ func (m model) finish(err error) (tea.Model, tea.Cmd) {
 	m.state = stateIdle
 	m.cancel = nil
 	m.runner = nil
+	m.approval = nil
 	m.status = ""
 	m.reasoning.Reset()
 	m.answer.Reset()
@@ -494,13 +1050,83 @@ func (m model) finish(err error) (tea.Model, tea.Cmd) {
 	return m, tea.Sequence(cmds...)
 }
 
+// usageLine 是输入框上方常驻的上下文占用：总数来自上一轮响应的 usage，
+// 系统提示词/工具定义/对话消息三项是按本地估算的比例拆出来的，
+// 所以显示成百分比，不假装是精确到个位的分项用量。
+// 配了上下文窗口时还会带上"已用 x%"，让人一眼看出还剩多少余量。
+func (m model) usageLine() string {
+	u := m.usage
+	if u.PromptTokens <= 0 {
+		return ""
+	}
+	parts := []struct {
+		name  string
+		token int
+		style lipgloss.Style
+	}{
+		{"系统提示词", u.SystemTokens, usageSystemStyle},
+		{"工具定义", u.ToolTokens, usageToolStyle},
+		{"对话消息", u.MessageTokens, usageMsgStyle},
+	}
+	items := make([]string, 0, len(parts)+2)
+	total := hintStyle.Render("上下文 ") + statusStyle.Render(domain.FormatTokens(u.PromptTokens))
+	if limit := u.ContextLimit; limit > 0 {
+		total += hintStyle.Render(" / " + domain.FormatTokens(limit))
+	}
+	total += hintStyle.Render(" tokens")
+	if u.ContextLimit > 0 {
+		// 用超过八成就变色，免得一路跑到爆窗口才发现
+		used, style := u.LimitPercent(), statusStyle
+		if used >= 80 {
+			style = errStyle
+		}
+		total += hintStyle.Render(" · 已用 ") + style.Render(fmt.Sprintf("%d%%", used))
+	}
+	items = append(items, total)
+	for _, p := range parts {
+		items = append(items, p.style.Render(fmt.Sprintf("%s %s %d%%",
+			p.name, domain.FormatTokens(p.token), u.Percent(p.token))))
+	}
+	if u.CompletionTokens > 0 {
+		items = append(items, hintStyle.Render("本轮回复 "+domain.FormatTokens(u.CompletionTokens)))
+	}
+	return strings.Join(items, hintStyle.Render(" · "))
+}
+
 func (m model) View() tea.View {
 	if m.quitting {
 		return tea.NewView("")
 	}
 	var b strings.Builder
+	if m.state == stateConfig {
+		b.WriteString(strings.Join(m.fieldLines(), "\n"))
+		b.WriteString("\n")
+		b.WriteString(hintStyle.Render("↑↓ 选字段 · Enter 编辑 · Ctrl+S 保存 · Esc 返回"))
+		return tea.NewView(b.String())
+	}
+	if m.state == stateApproval {
+		// 确认框顶替输入框：这一刻只能回答 y / a / n
+		if line := m.usageLine(); line != "" {
+			b.WriteString(m.wrap(line))
+			b.WriteString("\n")
+		}
+		b.WriteString(m.approvalView())
+		b.WriteString("\n")
+		b.WriteString(hintStyle.Render("↑↓ 或 j k 选择 · Enter 确认 · 直接打字可以拒绝并说明"))
+		return tea.NewView(b.String())
+	}
 	if m.state == stateRunning {
 		b.WriteString(m.runningView())
+		b.WriteString("\n")
+	}
+	// 补全候选贴在输入框上方，紧挨着用户正在打的那行
+	if lines := m.completionLines(); len(lines) > 0 {
+		b.WriteString(strings.Join(lines, "\n"))
+		b.WriteString("\n")
+	}
+	// 上下文占用紧贴输入框上方，运行中也一直看得到
+	if line := m.usageLine(); line != "" {
+		b.WriteString(m.wrap(line))
 		b.WriteString("\n")
 	}
 	b.WriteString(boxStyle.Width(m.width - 4).Render(m.input.View()))
@@ -508,7 +1134,8 @@ func (m model) View() tea.View {
 	if m.state == stateRunning {
 		b.WriteString(hintStyle.Render("Ctrl+C 中断"))
 	} else {
-		b.WriteString(hintStyle.Render("Enter 发送 · Shift+Enter 换行 · Ctrl+C 退出"))
+		b.WriteString(hintStyle.Render("Enter 发送 · Shift+Enter 换行 · Ctrl+C 退出 · 模式 "))
+		b.WriteString(statusStyle.Render(m.mode.Label()))
 	}
 	return tea.NewView(b.String())
 }
@@ -518,7 +1145,7 @@ func (m model) View() tea.View {
 func (m model) runningView() string {
 	var b strings.Builder
 	if len(m.pending) > 0 {
-		b.WriteString(strings.Join(withMark(m.pending, m.spinMark()), "\n"))
+		b.WriteString(strings.Join(withMark(m.pendingLines(), m.spinMark()), "\n"))
 	} else {
 		b.WriteString(statusStyle.Render(m.spin.View() + " " + m.status))
 	}
@@ -580,6 +1207,16 @@ func waitEvent(r *runner) tea.Cmd {
 	}
 }
 
+// deepSeekConfig 从配置里解出 DeepSeek 这一段。解不出来时返回零值，
+// 让表单能打开、从头填，而不是直接报错退出界面。
+func deepSeekConfig(cfg config.GlobalConfig) config.DeepSeekConfig {
+	var dc config.DeepSeekConfig
+	if err := cfg.Provider.Decode(&dc); err != nil {
+		return config.DeepSeekConfig{}
+	}
+	return dc
+}
+
 // buildProvider 按配置里声明的类型造 provider
 func buildProvider(cfg config.GlobalConfig) (domain.Provider, error) {
 	var probe config.ProbeConfig
@@ -588,11 +1225,7 @@ func buildProvider(cfg config.GlobalConfig) (domain.Provider, error) {
 	}
 	switch probe.Type {
 	case "DeepSeek":
-		var dc config.DeepSeekConfig
-		if err := cfg.Provider.Decode(&dc); err != nil {
-			return nil, fmt.Errorf("provider 解析为 DeepSeekConfig 报错: %w", err)
-		}
-		p, err := provider.NewDeepSeek(dc)
+		p, err := provider.NewDeepSeek(deepSeekConfig(cfg))
 		if err != nil {
 			return nil, err
 		}

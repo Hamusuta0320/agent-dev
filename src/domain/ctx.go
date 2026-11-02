@@ -15,4 +15,8 @@ type Ctx struct {
 	Session *Session
 	// Emit 接收运行过程中的进度事件，CLI 层用它来渲染界面；为空时 core 直接往标准输出打纯文本
 	Emit EmitFunc
+	// ContextLimit 是模型的上下文窗口（token），只用来算"上下文已用百分比"；0 表示不知道
+	ContextLimit int
+	// Mode 是工作模式：只读时没有写类工具，编辑需授权时每次写操作都要先问用户
+	Mode Mode
 }

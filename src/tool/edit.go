@@ -1,6 +1,7 @@
 package tool
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,8 @@ import (
 	"regexp"
 	"strings"
 	"unicode/utf8"
+
+	"hamusuta/agent-dev/src/domain"
 )
 
 // maxEditFileBytes 单次编辑允许的最大文件大小，避免误改大文件
@@ -24,8 +27,11 @@ func (t EditTool) Name() string {
 	return "Edit"
 }
 
+// Mutating 是 true：会改动文件
+func (t EditTool) Mutating() bool { return true }
+
 func (t EditTool) Description() string {
-	return "把文件里的一段原文替换成新内容，返回替换的处数。" +
+	return "把文件里的一段原文替换成新内容，返回替换的处数，并回显改动位置前后的几行（去掉的行以 - 开头、加上的以 + 开头）。" +
 		"old_string 必须与文件内容逐字符一致（缩进、空格、换行都要一样），默认还要求它在文件中唯一，不唯一时请多带几行上下文，或设置 replace_all=true。" +
 		"可以直接从 Read 的结果里连着行号一起复制，行号前缀会被自动去掉；行尾空白有细微差异也能匹配上。" +
 		"改之前建议先用 Read 看一眼原文。"
@@ -63,7 +69,10 @@ type EditArgs struct {
 	ReplaceAll bool   `json:"replace_all"`
 }
 
-func (t EditTool) Execute(rawArgs json.RawMessage) (string, error) {
+func (t EditTool) Execute(ctx context.Context, rawArgs json.RawMessage) (string, error) {
+	if err := ctxOrBackground(ctx).Err(); err != nil {
+		return "", err
+	}
 	if len(rawArgs) == 0 {
 		return "", fmt.Errorf("缺少参数: path / old_string / new_string")
 	}
@@ -104,11 +113,17 @@ func (t EditTool) Execute(rawArgs json.RawMessage) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("读取 %s 失败: %w", args.Path, err)
 	}
-	if !utf8.Valid(data) {
-		return "", fmt.Errorf("%s 不是文本文件，无法编辑", args.Path)
-	}
 
 	text := string(data)
+	local := false
+	if !utf8.Valid(data) {
+		// GBK/GB18030 之类的本地编码：解码成 UTF-8 再匹配，写回时再编码回去
+		decoded, ok := decodeLocalLossless(data)
+		if !ok {
+			return "", fmt.Errorf("%s 不是文本文件，无法编辑", args.Path)
+		}
+		text, local = decoded, true
+	}
 
 	// 文件用 CRLF 而传入的是 LF 时先统一，避免"内容一模一样却匹配不上"
 	if !strings.Contains(oldStr, "\r\n") && strings.Contains(text, "\r\n") {
@@ -118,6 +133,7 @@ func (t EditTool) Execute(rawArgs json.RawMessage) (string, error) {
 	var updated string
 	replaced := 0
 	linewise := false
+	firstStart, firstEnd := -1, -1 // 第一处替换的位置，改完拿来回显
 
 	if n := strings.Count(text, oldStr); n > 0 {
 		if !args.ReplaceAll && n != 1 {
@@ -127,6 +143,9 @@ func (t EditTool) Execute(rawArgs json.RawMessage) (string, error) {
 		limit := -1
 		if !args.ReplaceAll {
 			replaced, limit = 1, 1
+		}
+		if at := strings.Index(text, oldStr); at >= 0 {
+			firstStart, firstEnd = at, at+len(oldStr)
 		}
 		updated = strings.Replace(text, oldStr, newStr, limit)
 	} else {
@@ -142,11 +161,20 @@ func (t EditTool) Execute(rawArgs json.RawMessage) (string, error) {
 			ranges = ranges[:1]
 		}
 		replaced = len(ranges)
+		firstStart, firstEnd = ranges[0][0], ranges[0][1]
 		updated = applyRanges(text, ranges, newStr)
 		linewise = true
 	}
 
-	if err := os.WriteFile(args.Path, []byte(updated), info.Mode().Perm()); err != nil {
+	out := []byte(updated)
+	if local {
+		enc, ok := encodeLocalLossless(updated)
+		if !ok {
+			return "", fmt.Errorf("修改后的内容里有本地编码（GB18030）表示不了的字符，已放弃写入 %s；请先去掉这些字符再改", args.Path)
+		}
+		out = enc
+	}
+	if err := os.WriteFile(args.Path, out, info.Mode().Perm()); err != nil {
 		return "", fmt.Errorf("写入 %s 失败: %w", args.Path, err)
 	}
 
@@ -154,7 +182,35 @@ func (t EditTool) Execute(rawArgs json.RawMessage) (string, error) {
 	if linewise {
 		how = "（按行匹配，忽略了行尾空白差异）"
 	}
-	return fmt.Sprintf("已修改 %s，替换 %d 处，文件现在 %d 字节%s", args.Path, replaced, len(updated), how), nil
+	if local {
+		how += "（文件是本地编码（GB18030/GBK），已保持原编码写回）"
+	}
+	msg := fmt.Sprintf("已修改 %s，替换 %d 处，文件现在 %d 字节%s", args.Path, replaced, len(out), how)
+	// 改完把改动前后几行回显出来，省得为了确认结果再 Read 一遍
+	if echo := editEcho(text, firstStart, firstEnd, newStr, replaced); echo != "" {
+		msg += "\n" + echo
+	}
+	return msg, nil
+}
+
+// Preview 是"编辑需授权"模式下给用户看的一句话摘要：改哪个文件、把几行换成几行
+func (t EditTool) Preview(rawArgs json.RawMessage) domain.ApprovalRequest {
+	req := domain.ApprovalRequest{Kind: domain.ApprovalWriteFile, Target: "（参数不完整）"}
+	var args EditArgs
+	if err := json.Unmarshal(rawArgs, &args); err != nil {
+		return req
+	}
+	if path := strings.TrimSpace(args.Path); path != "" {
+		req.Target = path
+	}
+	detail := fmt.Sprintf("%d 行换成 %d 行",
+		countLines(stripLineNumbers(args.OldString)), countLines(stripLineNumbers(args.NewString)))
+	if args.ReplaceAll {
+		detail += "，替换全部匹配处"
+	}
+	req.Detail = detail
+	req.Diff = newDiffPreview(args.OldString, args.NewString)
+	return req
 }
 
 // stripLineNumbers 如果整段里每一行都带 Read 的行号前缀（`    12→`），就整段去掉；
