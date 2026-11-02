@@ -260,6 +260,92 @@ func TestTaskRegistryEvictsFinished(t *testing.T) {
 	}
 }
 
+// 任务跑完要主动告诉模型一次，而且只报一次
+func TestTaskNotifications(t *testing.T) {
+	t.Cleanup(backgroundTasks.clear)
+
+	id := startTask(t, map[string]any{"command": "echo notify-me"})
+	task, ok := backgroundTasks.get(id)
+	if !ok {
+		t.Fatalf("任务 %s 应该登记着", id)
+	}
+	select {
+	case <-task.done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("任务没跑完")
+	}
+
+	notes := TaskNotifications()
+	if len(notes) != 1 {
+		t.Fatalf("应该有一条通知，实际 %d: %v", len(notes), notes)
+	}
+	for _, want := range []string{id, "已完成", "exit_code: 0", "echo notify-me"} {
+		if !strings.Contains(notes[0], want) {
+			t.Fatalf("通知里少了 %q: %s", want, notes[0])
+		}
+	}
+
+	// 报过就不再重复，免得每一轮都刷一遍
+	if again := TaskNotifications(); len(again) != 0 {
+		t.Fatalf("同一个任务不该通知两次: %v", again)
+	}
+}
+
+// 模型已经用 Task 主动看过的任务，不用再补一条通知
+func TestTaskNotificationsSkipsSeenTask(t *testing.T) {
+	t.Cleanup(backgroundTasks.clear)
+
+	id := startTask(t, map[string]any{"command": "echo seen"})
+	if _, err := runTask(t, map[string]any{"action": "wait", "task_id": id, "timeout_seconds": 20}); err != nil {
+		t.Fatalf("wait 失败: %v", err)
+	}
+	if notes := TaskNotifications(); len(notes) != 0 {
+		t.Fatalf("已经看过结果的任务不该再通知: %v", notes)
+	}
+
+	// 先 wait 到结束、再 output 一次，同样算看过
+	id = startTask(t, map[string]any{"command": "echo seen-2"})
+	time.Sleep(500 * time.Millisecond)
+	if _, err := runTask(t, map[string]any{"action": "output", "task_id": id}); err != nil {
+		t.Fatalf("output 失败: %v", err)
+	}
+	if notes := TaskNotifications(); len(notes) != 0 {
+		t.Fatalf("output 看过的任务不该再通知: %v", notes)
+	}
+}
+
+// 还在跑的任务不该被通知，等真结束了再报
+func TestTaskNotificationsSkipsRunning(t *testing.T) {
+	if runtime.GOOS == "windows" && activeShell().Name == "cmd" {
+		t.Skip("cmd 下没有统一的 sleep 命令，跳过")
+	}
+	t.Cleanup(backgroundTasks.clear)
+
+	startTask(t, map[string]any{"command": sleepCommand(3), "timeout_seconds": 60})
+	if notes := TaskNotifications(); len(notes) != 0 {
+		t.Fatalf("还在跑的任务不该通知: %v", notes)
+	}
+}
+
+// 被停掉、超时的任务也要有一条通知，里面带上原因
+func TestTaskNotificationsIncludeReason(t *testing.T) {
+	if runtime.GOOS == "windows" && activeShell().Name == "cmd" {
+		t.Skip("cmd 下没有统一的 sleep 命令，跳过")
+	}
+	t.Cleanup(backgroundTasks.clear)
+
+	id := startTask(t, map[string]any{"command": sleepCommand(30), "timeout_seconds": 60})
+	// 直接停掉，不走 Task 工具，这样通知还能留下来
+	task, _ := backgroundTasks.get(id)
+	task.cancel()
+	<-task.done
+
+	notes := TaskNotifications()
+	if len(notes) != 1 || !strings.Contains(notes[0], "已停止") {
+		t.Fatalf("被停掉的任务应该有一条通知并说明原因: %v", notes)
+	}
+}
+
 // timeout_seconds 越界要夹紧，别让模型传个天文数字把上限绕过去
 func TestBashTimeoutClamp(t *testing.T) {
 	if got := bashTimeout(0); got != defaultBashTimeout {

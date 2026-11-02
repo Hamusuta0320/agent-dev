@@ -43,3 +43,11 @@ func TestMakeMessages(t *testing.T) {
 		t.Fatalf("第二条应是用户输入: %+v", msgs[1])
 	}
 }
+
+// 没有后台任务要报时，提示词里不该多出一段空的通知，白占 token
+func TestSystemPromptNoTaskSection(t *testing.T) {
+	p := systemPrompt(domain.Ctx{WorkDir: `/tmp/demo`, Shell: "pwsh"})
+	if strings.Contains(p, "## 后台任务") || strings.Contains(p, "TaskNotifications") {
+		t.Fatalf("没有任务通知时不该有后台任务小节:\n%s", p)
+	}
+}

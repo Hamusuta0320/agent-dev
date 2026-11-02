@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"hamusuta/agent-dev/src/domain"
+	"hamusuta/agent-dev/src/tool"
 )
 
 // systemPrompt 告诉模型它是谁、在什么环境里干活，以及这个项目对工具使用的约定。
@@ -44,6 +45,24 @@ func systemPrompt(ctx domain.Ctx) string {
 - 不执行破坏性命令（rm -rf、git reset --hard、强推等），除非用户明确要求。
 - 结束后用一两句话说明改了什么、有没有跑过编译或测试；回答语言跟用户一致。
 `)
+	sb.WriteString(taskSection())
+	return sb.String()
+}
+
+// taskSection 把"后台任务已经跑完"的通知拼进提示词。
+// 通知是一次性的：报过一次的任务不会再出现在下一轮，模型也就不用自己去轮询。
+// 这里只放提示词、不往会话历史里插消息，历史里的工具调用配对不受影响。
+func taskSection() string {
+	notes := tool.TaskNotifications()
+	if len(notes) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("\n## 后台任务\n下面这些后台任务已经结束了，结果你还没看过：\n")
+	for _, n := range notes {
+		sb.WriteString(n + "\n")
+	}
+	sb.WriteString("要看输出用 Task action=output；不用的话直接把结论告诉用户，别为了确认结果再跑一遍同样的命令。\n")
 	return sb.String()
 }
 

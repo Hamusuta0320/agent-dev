@@ -115,9 +115,9 @@ func (t BashTool) Description() string {
 		"当前平台 %s/%s，shell 是 %s%s。"+
 		"调用时必须用 intent 写一句这次要做什么，界面上会连完整命令一起展示给用户。"+
 		"timeout_seconds 指定超时时间（默认 30 秒，最长 %s），构建、装依赖这类慢命令记得调大。"+
-		"background=true 让命令转到后台运行，立刻拿到任务 id，之后用 Task 工具看输出、等它结束或停掉它，"+
-		"适合 dev server、长时间构建这类不该卡住这一轮的命令。"+
-		"适合构建、测试、git、查看目录等；文件的读写和内容搜索请优先用 Read/Write/Edit/Grep。"+
+		"background=true 让命令转到后台运行，立刻拿到任务 id，之后用 Task 工具看输出、等它结束或停掉它"+
+		"（跑完会自动提醒你，不用轮询），适合 dev server、长时间构建这类不该卡住这一轮的命令。"+
+		"前台适合构建、测试、git、查看目录等；文件的读写和内容搜索请优先用 Read/Write/Edit/Grep。"+
 		"不要执行交互式命令（vim、more、read），它们会一直等输入。",
 		runtime.GOOS, runtime.GOARCH, s.Name, s.Hint, shortDuration(maxBashTimeout))
 }

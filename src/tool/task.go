@@ -51,7 +51,8 @@ func (s taskStatus) Label() string {
 }
 
 // bgTask 是一个后台任务：命令在单独的 goroutine 里跑，输出攒在内存里，
-// 结束状态（退出码 / 超时 / 被停掉）等模型用 Task 工具来查。
+// 结束状态（退出码 / 超时 / 被停掉）既可以用 Task 工具查，也会在结束时
+// 自动出现在下一轮的系统提示词里，省得模型干等着或者反复轮询。
 type bgTask struct {
 	ID        string
 	Command   string
@@ -68,6 +69,8 @@ type bgTask struct {
 	exitCode   int
 	reason     string
 	finishedAt time.Time
+	// announced 记着"结束这件事有没有告诉过模型"，保证同一个任务只提醒一次
+	announced bool
 }
 
 // finish 记下任务是怎么结束的，并叫醒在等的调用方
@@ -151,6 +154,50 @@ func (r *taskRegistry) add(t *bgTask) error {
 func (t *bgTask) state0() taskStatus {
 	s, _, _, _ := t.state()
 	return s
+}
+
+// markAnnounced 标记"结束这件事已经说过"，第一次标记时返回 true。
+// 任务还在跑时不算，等真结束了再报
+func (t *bgTask) markAnnounced() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.announced || t.status == taskRunning {
+		return false
+	}
+	t.announced = true
+	return true
+}
+
+// notification 是给模型看的一行提醒：任务结束了、退出码、耗时和命令
+func (t *bgTask) notification() string {
+	status, exitCode, reason, _ := t.state()
+	line := fmt.Sprintf("- %s %s（exit_code: %d，耗时 %s）：%s",
+		t.ID, status.Label(), exitCode, shortDuration(t.elapsed()), firstLine(t.Command))
+	if reason != "" {
+		line += "（" + reason + "）"
+	}
+	return line
+}
+
+// TaskNotifications 返回"已经结束、但还没告诉过模型"的后台任务，取过就不再重复。
+// core 每轮拼系统提示词时调它，模型不用轮询也能知道后台跑完了
+func TaskNotifications() []string {
+	return backgroundTasks.takeNotifications()
+}
+
+// takeNotifications 摘出待通知的任务并标记成已通知
+func (r *taskRegistry) takeNotifications() []string {
+	r.mu.Lock()
+	tasks := append([]*bgTask{}, r.tasks...)
+	r.mu.Unlock()
+
+	var out []string
+	for _, t := range tasks {
+		if t.markAnnounced() {
+			out = append(out, t.notification())
+		}
+	}
+	return out
 }
 
 func (r *taskRegistry) get(id string) (*bgTask, bool) {
@@ -270,7 +317,9 @@ func (t TaskTool) Description() string {
 	return "跟进 Bash 用 background=true 起的后台任务。" +
 		"action=list 列出所有任务；action=output 读某个任务的输出（tail_lines 只要最后几行）；" +
 		"action=wait 等任务跑完（最多 timeout_seconds 秒，默认 30，最长 120）；action=stop 把任务停掉。" +
-		"output/wait/stop 都要带 task_id。后台任务结束不会自动通知，别用 sleep 之类的去轮询，直接用 action=wait。"
+		"output/wait/stop 都要带 task_id。" +
+		"任务结束时会自动出现在下一轮的系统提示词里，所以只有现在就需要结果时才用 action=wait，" +
+		"别用 sleep 之类的方式反复轮询。"
 }
 
 func (t TaskTool) Schema() map[string]any {
@@ -332,14 +381,22 @@ func (t TaskTool) Execute(ctx context.Context, rawArgs json.RawMessage) (string,
 		return "", fmt.Errorf("没有这个任务: %q；先用 Task action=list 看看有哪些", args.TaskId)
 	}
 
+	// 模型主动来看过这个任务，就别再往系统提示词里补"它跑完了"。
+	// 要等这次操作做完再标：wait 期间任务才结束的，标记得落在结束之后才算数
+	var (
+		out string
+		err error
+	)
 	switch action {
 	case "stop":
-		return stopTask(task)
+		out, err = stopTask(task)
 	case "wait":
-		return waitTask(ctxOrBackground(ctx), task, args.TimeoutSeconds)
+		out, err = waitTask(ctxOrBackground(ctx), task, args.TimeoutSeconds)
 	default:
-		return taskOutput(task, args.TailLines)
+		out, err = taskOutput(task, args.TailLines)
 	}
+	task.markAnnounced()
+	return out, err
 }
 
 // listTasks 列出所有任务，没有任务时说清楚怎么起一个
