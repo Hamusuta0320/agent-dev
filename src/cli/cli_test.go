@@ -897,6 +897,54 @@ func tryAnswer(reply chan domain.ApprovalAnswer) (domain.ApprovalAnswer, bool) {
 	}
 }
 
+// 输入框上方那块（补全候选 / 运行进度）的高度必须恒定：它一变矮，Bubble Tea
+// 就会把腾出来的行空在屏幕底下，输入框立刻离了屏幕底边
+func TestActiveViewKeepsHeight(t *testing.T) {
+	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+	m.width, m.height = 80, 30
+
+	lines := func() int { return strings.Count(m.activeView(), "\n") + 1 }
+	if got := lines(); got != activeRows {
+		t.Fatalf("闲着时这块也应该是 %d 行，实际 %d 行", activeRows, got)
+	}
+	idle := m.viewLines()
+
+	// 补全候选占几行也不该改变这块的高度
+	m.input.SetValue("/")
+	if got := lines(); got != activeRows {
+		t.Fatalf("有补全候选时这块应该是 %d 行，实际 %d 行", activeRows, got)
+	}
+
+	// 跑任务时状态、思考和回答越长，这块也还是同样的高度
+	m.state = stateRunning
+	m.status = "思考中…"
+	m.reasoning.WriteString(strings.Repeat("想了很久\n", 40))
+	m.answer.WriteString(strings.Repeat("回答很长\n", 40))
+	if got := lines(); got != activeRows {
+		t.Fatalf("运行中这块应该是 %d 行，实际 %d 行", activeRows, got)
+	}
+	if got := m.viewLines(); got != idle {
+		t.Fatalf("跑起来之后界面总行数应该还是 %d 行，实际 %d 行", idle, got)
+	}
+	// 状态行不能被裁掉，够长的时候还要留出预览的尾巴
+	view := stripANSI(m.activeView())
+	if !strings.Contains(view, "思考中…") {
+		t.Fatalf("状态行不该被裁掉:\n%s", view)
+	}
+	if !strings.Contains(view, "回答很长") {
+		t.Fatalf("应该留出最新的预览:\n%s", view)
+	}
+
+	// 多个工具同时在跑也一样
+	m.pending = []pendingCall{
+		{id: "1", lines: m.toolCallLines(domain.ToolCall{Name: "Read", Arguments: `{"path":"a.go"}`})},
+		{id: "2", lines: m.toolCallLines(domain.ToolCall{Name: "Grep", Arguments: `{"pattern":"x"}`})},
+	}
+	if got := lines(); got != activeRows {
+		t.Fatalf("有工具在跑时这块应该是 %d 行，实际 %d 行", activeRows, got)
+	}
+}
+
 // 开场白要把输入框顶到屏幕底部：开场白 + 界面 + 空行正好铺满一屏
 func TestStartupTextFillsScreen(t *testing.T) {
 	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))

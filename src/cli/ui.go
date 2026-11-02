@@ -54,6 +54,11 @@ const (
 	toolMarkDone = "●"
 	// maxTaskChips 是后台任务栏里最多列几个任务，再多就折成一个"还有 N 个"
 	maxTaskChips = 3
+	// activeRows 是输入框上方那块会变的内容固定占几行：跑任务时是状态、工具调用
+	// 和预览的尾巴，闲着时是补全候选。行数必须恒定——Bubble Tea 在 inline 模式下
+	// 遇到帧变矮，会把腾出来的行空在屏幕底部，输入框就离了屏幕底边；宁可在上面
+	// 补空行。6 行正好放得下全部命令候选。
+	activeRows = 6
 )
 
 var (
@@ -1394,16 +1399,7 @@ func (m model) View() tea.View {
 		b.WriteString(hintStyle.Render("↑↓ 或 j k 选择 · Enter 确认 · 直接打字可以拒绝并说明"))
 		return tea.NewView(b.String())
 	}
-	if m.state == stateRunning {
-		b.WriteString(m.runningView())
-		b.WriteString("\n")
-	}
-	// 补全候选贴在输入框上方，紧挨着用户正在打的那行
-	if lines := m.completionLines(); len(lines) > 0 {
-		b.WriteString(strings.Join(lines, "\n"))
-		b.WriteString("\n")
-	}
-	// 后台任务和上下文占用一样常驻在输入框上方，运行中也一直看得到
+	// 后台任务和上下文占用常驻在输入框上方，运行中也一直看得到
 	if line := m.tasksLine(); line != "" {
 		b.WriteString(m.wrap(line))
 		b.WriteString("\n")
@@ -1412,6 +1408,9 @@ func (m model) View() tea.View {
 		b.WriteString(m.wrap(line))
 		b.WriteString("\n")
 	}
+	// 运行进度和补全候选共用这块固定行数的位置，紧挨着输入框
+	b.WriteString(m.activeView())
+	b.WriteString("\n")
 	b.WriteString(boxStyle.Width(m.width - 4).Render(m.input.View()))
 	b.WriteString("\n")
 	if m.state == stateRunning {
@@ -1423,8 +1422,39 @@ func (m model) View() tea.View {
 	return tea.NewView(b.String())
 }
 
+// activeLines 是输入框上方那块会变的内容：跑任务时是状态、工具调用和预览尾巴，
+// 闲着时是补全候选。行数不定，由 activeView 整理成固定行数。
+func (m model) activeLines() []string {
+	if m.state != stateRunning {
+		return m.completionLines()
+	}
+	return strings.Split(m.runningView(), "\n")
+}
+
+// activeView 把这块内容整理成固定的 activeRows 行，始终贴着输入框：
+// 跑任务时内容超了就先砍中间（留下第一行的状态或工具标题，以及最新的几行预览），
+// 闲着时按顺序留着前面的候选；都不够就在顶上补空行。
+// 这块的高度一旦跟着内容上下变，Bubble Tea 就会在屏幕底部留白，输入框立刻离地，
+// 所以这里必须恒定。
+func (m model) activeView() string {
+	lines := m.activeLines()
+	if len(lines) > activeRows {
+		if m.state == stateRunning {
+			kept := make([]string, 0, activeRows)
+			kept = append(kept, lines[0])
+			kept = append(kept, lines[len(lines)-(activeRows-1):]...)
+			lines = kept
+		} else {
+			lines = lines[:activeRows]
+		}
+	}
+	pad := make([]string, activeRows-len(lines))
+	return strings.Join(append(pad, lines...), "\n")
+}
+
 // runningView 是跑任务时贴在底部的那几行：状态 + 思考和回答的尾巴。
 // 有工具在跑的时候，第一行换成这次调用本身，圆圈的位置转圈。
+// 这里不限制行数，超了由 activeView 裁到固定槽位里。
 func (m model) runningView() string {
 	var b strings.Builder
 	if len(m.pending) > 0 {
