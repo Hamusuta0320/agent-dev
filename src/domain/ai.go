@@ -31,4 +31,17 @@ type AIChatMessage struct {
 type ChatResult struct {
 	Content   string
 	ToolCalls []ToolCall
+	Reasoning string
+}
+
+type StreamEventKind int
+
+const (
+	StreamContent StreamEventKind = iota
+	StreamReasoning
+)
+
+type StreamEvent struct {
+	Kind StreamEventKind
+	Text string
 }

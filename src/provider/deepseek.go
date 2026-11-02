@@ -80,7 +80,7 @@ func buildMessages(messages []domain.AIChatMessage) []openai.AIChatMessage {
 	return result
 }
 
-func (p DeepSeekProvider) Chat(ctx context.Context, messages []domain.AIChatMessage, tools []domain.ToolSpec, onDelta func(string)) (domain.ChatResult, error) {
+func (p DeepSeekProvider) Chat(ctx context.Context, messages []domain.AIChatMessage, tools []domain.ToolSpec, onDelta func(domain.StreamEvent)) (domain.ChatResult, error) {
 	var chatResult = domain.ChatResult{
 		Content:   "",
 		ToolCalls: nil,
@@ -98,7 +98,7 @@ func (p DeepSeekProvider) Chat(ctx context.Context, messages []domain.AIChatMess
 	req, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodPost,
-		strings.TrimRight(p.Cfg.ApiUrl, "/") + "/chat/completions",
+		strings.TrimRight(p.Cfg.ApiUrl, "/")+"/chat/completions",
 		bytes.NewReader(reqBody),
 	)
 
@@ -120,7 +120,7 @@ func (p DeepSeekProvider) Chat(ctx context.Context, messages []domain.AIChatMess
 		return chatResult, fmt.Errorf("deepseek 返回 %d: %s", resp.StatusCode, body)
 	}
 
-	var content strings.Builder
+	var content, reasoning strings.Builder
 	var calls []domain.ToolCall
 
 	scanner := bufio.NewScanner(resp.Body)
@@ -149,10 +149,16 @@ func (p DeepSeekProvider) Chat(ctx context.Context, messages []domain.AIChatMess
 			continue
 		}
 		delta := chunk.Choices[0].Delta
+		if delta.ReasoningContent != "" {
+			reasoning.WriteString(delta.ReasoningContent)
+			if onDelta != nil {
+				onDelta(domain.StreamEvent{Kind: domain.StreamReasoning, Text: delta.ReasoningContent})
+			}
+		}
 		if delta.Content != "" {
 			content.WriteString(delta.Content)
 			if onDelta != nil {
-				onDelta(delta.Content)
+				onDelta(domain.StreamEvent{Kind: domain.StreamContent, Text: delta.Content})
 			}
 		}
 		for _, tc := range delta.ToolCalls {
@@ -174,6 +180,7 @@ func (p DeepSeekProvider) Chat(ctx context.Context, messages []domain.AIChatMess
 	}
 
 	chatResult.Content = content.String()
+	chatResult.Reasoning = reasoning.String()
 	filtered := calls[:0]
 	for _, c := range calls {
 		if c.Name != "" || c.Id != "" {
