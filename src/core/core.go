@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"hamusuta/agent-dev/src/domain"
 	"strings"
+	"time"
 )
 
 // Loop 跑完一次用户提问：先把输入记进会话，再和模型来回，直到它不再调用工具
@@ -59,21 +60,43 @@ func Run(ctx domain.Ctx, session *domain.Session) (string, error) {
 			return res.Content, nil
 		}
 		for _, call := range res.ToolCalls {
-			emit(domain.Event{Kind: domain.EventToolCall, Call: call})
-			out := ""
-			t, ok := ctx.Tools[call.Name]
-			if !ok {
-				out = "错误: 不存在的工具 " + call.Name
-			} else if result, err := t.Execute(json.RawMessage(call.Arguments)); err != nil {
-				out = "执行失败: " + err.Error()
-			} else {
-				out = result
-			}
-			emit(domain.Event{Kind: domain.EventToolResult, Text: out, Call: call})
+			// 先上报"调用中"，执行完再上报结果和耗时，界面靠这两步更新状态
+			started := time.Now()
+			emit(domain.Event{
+				Kind:      domain.EventToolCall,
+				Call:      call,
+				Status:    domain.ToolStatusRunning,
+				StartedAt: started,
+			})
+			out, status, reason := executeTool(ctx.Tools, call)
+			emit(domain.Event{
+				Kind:      domain.EventToolResult,
+				Text:      out,
+				Call:      call,
+				Status:    status,
+				Err:       reason,
+				StartedAt: started,
+				Elapsed:   time.Since(started),
+			})
 			session.AppendToolResult(call, out)
 		}
 	}
 	return "", fmt.Errorf("工具调用超过 %d 轮, 疑似死循环", maxSteps)
+}
+
+// executeTool 执行一次工具调用，返回给模型的输出、调用状态和失败原因。
+// 输出里也带上失败原因，模型看到才知道下一步该怎么改。
+func executeTool(tools map[string]domain.Tool, call domain.ToolCall) (string, domain.ToolStatus, string) {
+	t, ok := tools[call.Name]
+	if !ok {
+		reason := "不存在的工具 " + call.Name
+		return "错误: " + reason, domain.ToolStatusFailed, reason
+	}
+	result, err := t.Execute(json.RawMessage(call.Arguments))
+	if err != nil {
+		return "执行失败: " + err.Error(), domain.ToolStatusFailed, err.Error()
+	}
+	return result, domain.ToolStatusSuccess, ""
 }
 
 // buildMessages 每次请求都重新拼：系统提示词在前（环境可能变），后面是会话历史
@@ -129,9 +152,19 @@ func consoleEmit() domain.EmitFunc {
 				fmt.Println()
 				midLine = false
 			}
-			fmt.Printf("[工具] %s %s\n", ev.Call.Name, truncate(ev.Call.Arguments, 160))
+			fmt.Printf("[工具] %s %s · %s · %s\n",
+				ev.Call.Name,
+				truncate(ev.Call.Arguments, 160),
+				ev.StartedAt.Format("15:04:05"),
+				ev.Status.Label())
 		case domain.EventToolResult:
-			fmt.Printf("[结果] %s\n", truncate(ev.Text, 400))
+			if ev.Status == domain.ToolStatusFailed {
+				fmt.Printf("[结果] %s · 耗时 %s · 原因: %s\n",
+					ev.Status.Label(), ev.ElapsedLabel(), truncate(ev.Err, 200))
+			} else {
+				fmt.Printf("[结果] %s · 耗时 %s\n", ev.Status.Label(), ev.ElapsedLabel())
+			}
+			fmt.Printf("  %s\n", truncate(ev.Text, 400))
 		}
 	}
 }

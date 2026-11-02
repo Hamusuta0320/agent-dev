@@ -1,14 +1,19 @@
 package main
 
 import (
+	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"hamusuta/agent-dev/src/config"
 	"hamusuta/agent-dev/src/domain"
 
 	tea "charm.land/bubbletea/v2"
 )
+
+// ansiRe 匹配着色的转义序列，断言文案前要先剥掉
+var ansiRe = regexp.MustCompile("\x1b\\[[0-9;]*m")
 
 func TestParseCommand(t *testing.T) {
 	cases := map[string]command{
@@ -123,6 +128,70 @@ func TestEnterKeys(t *testing.T) {
 	if v := sent.input.Value(); v != "" {
 		t.Fatalf("Enter 应该发送并清空输入框: %q", v)
 	}
+}
+
+// 工具调用要把状态贴到标题行，成功/失败和耗时打在结果前面
+func TestToolStatusLines(t *testing.T) {
+	ok := stripANSI(strings.Join(toolStatusLines(domain.Event{
+		Kind:    domain.EventToolResult,
+		Status:  domain.ToolStatusSuccess,
+		Elapsed: 1200 * time.Millisecond,
+	}), "\n"))
+	for _, want := range []string{"调用成功", "耗时 1.20s"} {
+		if !strings.Contains(ok, want) {
+			t.Fatalf("成功状态少了 %q:\n%s", want, ok)
+		}
+	}
+
+	fail := stripANSI(strings.Join(toolStatusLines(domain.Event{
+		Kind:    domain.EventToolResult,
+		Status:  domain.ToolStatusFailed,
+		Err:     "打开文件失败\n: a.go",
+		Elapsed: 3 * time.Millisecond,
+	}), "\n"))
+	for _, want := range []string{"调用失败", "耗时 3ms", "原因: 打开文件失败 : a.go"} {
+		if !strings.Contains(fail, want) {
+			t.Fatalf("失败状态少了 %q:\n%s", want, fail)
+		}
+	}
+
+	// 失败没带原因时也不能空着，长原因要压成一行
+	noReason := stripANSI(strings.Join(toolStatusLines(domain.Event{
+		Status: domain.ToolStatusFailed,
+	}), "\n"))
+	if !strings.Contains(noReason, "未提供失败原因") {
+		t.Fatalf("缺少原因的兜底文案:\n%s", noReason)
+	}
+	long := stripANSI(strings.Join(toolStatusLines(domain.Event{
+		Status: domain.ToolStatusFailed,
+		Err:    strings.Repeat("很", toolErrRunes+50),
+	}), "\n"))
+	if strings.Contains(long, "\n") || !strings.Contains(long, "…") {
+		t.Fatalf("长原因应该压成一行并截断:\n%s", long)
+	}
+}
+
+// 状态文案只贴在标题行，原来的调用内容不能动
+func TestWithCallSuffix(t *testing.T) {
+	lines := []string{"⏺ Bash", "  $ ls"}
+	got := withCallSuffix(lines, "  · 12:03:22 · 调用中")
+	if len(got) != 2 || !strings.HasSuffix(stripANSI(got[0]), "12:03:22 · 调用中") || got[1] != "  $ ls" {
+		t.Fatalf("状态没贴对: %q", got)
+	}
+	if !strings.HasPrefix(stripANSI(got[0]), "⏺ Bash") {
+		t.Fatalf("标题行不能被动到: %q", got[0])
+	}
+	if lines[0] != "⏺ Bash" {
+		t.Fatalf("不该改动传进来的切片: %q", lines)
+	}
+	if got := withCallSuffix(lines, ""); got[0] != "⏺ Bash" {
+		t.Fatalf("没有状态时不该加内容: %q", got)
+	}
+}
+
+// stripANSI 去掉着色用的转义序列，测试只关心文案本身
+func stripANSI(s string) string {
+	return ansiRe.ReplaceAllString(s, "")
 }
 
 // Bash 调用要能显示意图和完整命令，多行命令不截断

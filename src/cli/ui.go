@@ -39,6 +39,8 @@ const (
 	printToolResultLines  = 12
 	// toolArgRunes 是一行工具参数摘要最多保留的字符数
 	toolArgRunes = 80
+	// toolErrRunes 是失败原因最多保留的字符数
+	toolErrRunes = 200
 )
 
 var (
@@ -47,6 +49,7 @@ var (
 	statusStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("212"))
 	thinkStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
 	toolStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("111"))
+	toolOKStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("114"))
 	toolResStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	errStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
 	hintStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
@@ -209,11 +212,39 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 // toolCallLines 渲染一次工具调用。Bash 会把意图和完整命令都摊开，
 // 其余工具没有专门的格式，压成一行摘要就够了。
 func (m model) toolCallLines(call domain.ToolCall) []string {
-	if lines, ok := bashCallLines(call); ok {
+	lines, ok := bashCallLines(call)
+	if ok {
 		return lines
 	}
 	return []string{toolStyle.Render("⏺ "+call.Name) +
 		hintStyle.Render(" "+firstLines(call.Arguments, toolArgRunes))}
+}
+
+// withCallSuffix 把状态文案（时间 + 调用中）贴到工具调用标题行的末尾。
+// 标题行可能已经被着色，所以只追加一段，不动原来的内容。
+func withCallSuffix(lines []string, suffix string) []string {
+	if suffix == "" || len(lines) == 0 {
+		return lines
+	}
+	out := append([]string{}, lines...)
+	out[0] += hintStyle.Render(suffix)
+	return out
+}
+
+// toolStatusLines 渲染工具调用结束后的状态行：成功/失败和耗时；
+// 失败时把原因也摊在同一行，太长的原因压成一行再截断。
+func toolStatusLines(ev domain.Event) []string {
+	if ev.Status != domain.ToolStatusFailed {
+		return []string{"  " + toolOKStyle.Render("✓ "+ev.Status.Label()) +
+			hintStyle.Render(" · 耗时 "+ev.ElapsedLabel())}
+	}
+	reason := firstLines(ev.Err, toolErrRunes)
+	if strings.TrimSpace(reason) == "" {
+		reason = "未提供失败原因"
+	}
+	return []string{"  " + errStyle.Render("✗ "+ev.Status.Label()) +
+		hintStyle.Render(" · 耗时 "+ev.ElapsedLabel()+" · 原因: ") +
+		errStyle.Render(reason)}
 }
 
 // bashCallLines 把 Bash 调用渲染成"意图 + 完整命令"：命令不截断，
@@ -357,10 +388,12 @@ func (m model) handleEvent(ev domain.Event) (tea.Model, tea.Cmd) {
 		m.reasoningShown = false
 
 	case domain.EventToolCall:
-		m.status = "执行 " + ev.Call.Name + "…"
-		out = append(out, m.toolCallLines(ev.Call)...)
+		m.status = "执行 " + ev.Call.Name + "…（" + ev.Status.Label() + "）"
+		suffix := "  · " + ev.StartedAt.Format("15:04:05") + " · " + ev.Status.Label()
+		out = append(out, withCallSuffix(m.toolCallLines(ev.Call), suffix)...)
 
 	case domain.EventToolResult:
+		out = append(out, toolStatusLines(ev)...)
 		out = append(out, m.block("", toolResStyle, ev.Text, printToolResultLines)...)
 		m.status = "等模型继续…"
 	}
