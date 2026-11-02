@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -11,6 +12,7 @@ import (
 
 	"hamusuta/agent-dev/src/config"
 	"hamusuta/agent-dev/src/domain"
+	"hamusuta/agent-dev/src/tool"
 
 	tea "charm.land/bubbletea/v2"
 )
@@ -823,6 +825,124 @@ func tryAnswer(reply chan domain.ApprovalAnswer) (domain.ApprovalAnswer, bool) {
 		return ans, true
 	default:
 		return domain.ApprovalAnswer{}, false
+	}
+}
+
+// 开场白要把输入框顶到屏幕底部：开场白 + 界面 + 空行正好铺满一屏
+func TestStartupTextFillsScreen(t *testing.T) {
+	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+	got, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = got.(model)
+
+	text := m.startupText()
+	// 数一下开场白一共占几行：tea.Println 按换行切行，行数就是 \n 的个数 + 1
+	printed := strings.Count(text, "\n") + 1
+	if total := printed + m.viewLines(); total != m.height {
+		t.Fatalf("开场白 + 界面应该正好铺满 %d 行，实际 %d 行（开场白 %d + 界面 %d）",
+			m.height, total, printed, m.viewLines())
+	}
+	// 开场白本身还得在，不能被算没了
+	if !strings.Contains(stripANSI(text), "agent-dev") {
+		t.Fatalf("开场白丢了:\n%s", text)
+	}
+}
+
+// 终端太矮塞不下开场白时不要倒贴空行
+func TestStartupTextTinyTerminal(t *testing.T) {
+	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+	m.width, m.height = 80, 3
+	if text := m.startupText(); strings.Contains(text, "\n\n") {
+		t.Fatalf("矮终端不该补空行: %q", text)
+	}
+}
+
+// 后台任务栏：没有任务就不占行，有任务时显示状态和耗时
+func TestTasksLine(t *testing.T) {
+	if line := tasksLine(nil); line != "" {
+		t.Fatalf("没有任务时不该有任务栏: %q", line)
+	}
+
+	line := stripANSI(tasksLine([]tool.TaskSnapshot{
+		{ID: "task_1", Status: "运行中", Running: true, Elapsed: 3 * time.Second, Command: "npm run dev"},
+		{ID: "task_2", Status: "已完成", Elapsed: 2 * time.Second, Command: "go build ./..."},
+	}))
+	for _, want := range []string{"后台任务", "1 个运行中", "1 个已结束", "task_1 运行中 3 秒", "task_2 已完成"} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("任务栏里少了 %q: %q", want, line)
+		}
+	}
+
+	// 全都跑完了就别再说"运行中"
+	line = stripANSI(tasksLine([]tool.TaskSnapshot{
+		{ID: "task_1", Status: "已完成"},
+	}))
+	if !strings.Contains(line, "1 个已结束") || strings.Contains(line, "运行中") {
+		t.Fatalf("都结束了不该提运行中: %q", line)
+	}
+
+	// 任务太多时只列前面几个
+	many := make([]tool.TaskSnapshot, 0, maxTaskChips+2)
+	for i := 0; i < maxTaskChips+2; i++ {
+		many = append(many, tool.TaskSnapshot{ID: "task_" + strconv.Itoa(i+1), Status: "已完成"})
+	}
+	line = stripANSI(tasksLine(many))
+	if !strings.Contains(line, "…还有 2 个") {
+		t.Fatalf("任务多时要收起来: %q", line)
+	}
+}
+
+// 真的起了后台任务之后，任务栏要出现在界面里，不用等模型再动一下
+func TestTasksLineInView(t *testing.T) {
+	t.Cleanup(tool.StopAllTasks)
+
+	if line := stripANSI(newModel(config.GlobalConfig{}, nil, ".", domain.NewSession(".")).tasksLine()); line != "" {
+		t.Fatalf("一开始不该有任务栏: %q", line)
+	}
+
+	raw := []byte(`{"command":"echo hi","background":true}`)
+	if _, err := (tool.BashTool{}).Execute(nil, raw); err != nil {
+		t.Fatalf("起后台任务失败: %v", err)
+	}
+
+	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+	m.width = 80
+	if line := stripANSI(m.tasksLine()); !strings.Contains(line, "task_1") {
+		t.Fatalf("任务栏里应该有刚起的任务: %q", line)
+	}
+	if view := stripANSI(m.View().Content); !strings.Contains(view, "后台任务") {
+		t.Fatalf("界面里没显示后台任务:\n%s", view)
+	}
+}
+
+// 有任务在跑时界面要自己续上定时刷新，跑完之后别再空转
+func TestTaskTickerRearms(t *testing.T) {
+	if runtime.GOOS == "windows" && tool.ShellName() == "cmd" {
+		t.Skip("cmd 下没有统一的 sleep 命令，跳过")
+	}
+	t.Cleanup(tool.StopAllTasks)
+
+	// 没有任务时不该起定时器
+	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+	if got, cmd := m.Update(taskTickMsg{}); cmd != nil || got.(model).tasksTicking {
+		t.Fatal("没有后台任务时不该定时刷新")
+	}
+
+	// 起一个还在跑的任务，刷新一拍之后要自己续上下一拍
+	sleep := "sleep 30"
+	if runtime.GOOS == "windows" {
+		sleep = "Start-Sleep -Seconds 30"
+	}
+	raw := []byte(`{"command":"` + sleep + `","timeout_seconds":60,"background":true}`)
+	if _, err := (tool.BashTool{}).Execute(nil, raw); err != nil {
+		t.Fatalf("起后台任务失败: %v", err)
+	}
+
+	got, cmd := m.Update(taskTickMsg{})
+	if cmd == nil {
+		t.Fatal("还有任务在跑时应该继续定时刷新")
+	}
+	if !got.(model).tasksTicking {
+		t.Fatal("继续刷新时要记着定时器已经起来了，别重复起")
 	}
 }
 

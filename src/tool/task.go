@@ -185,6 +185,48 @@ func TaskNotifications() []string {
 	return backgroundTasks.takeNotifications()
 }
 
+// TaskSnapshot 是给界面看的一份后台任务快照，只读，不参与调度
+type TaskSnapshot struct {
+	ID      string
+	Status  string // 状态文案，例如"运行中"、"已完成"
+	Running bool
+	Elapsed time.Duration
+	Command string
+}
+
+// TaskSnapshots 返回当前所有后台任务的快照，界面用它在底部常驻显示
+func TaskSnapshots() []TaskSnapshot {
+	tasks := backgroundTasks.list()
+	out := make([]TaskSnapshot, 0, len(tasks))
+	for _, t := range tasks {
+		status, _, _, _ := t.state()
+		out = append(out, TaskSnapshot{
+			ID:      t.ID,
+			Status:  status.Label(),
+			Running: status == taskRunning,
+			Elapsed: t.elapsed(),
+			Command: firstLine(t.Command),
+		})
+	}
+	return out
+}
+
+// RunningTaskCount 返回还在跑的后台任务数，界面靠它决定要不要定时刷新
+func RunningTaskCount() int {
+	n := 0
+	for _, t := range backgroundTasks.list() {
+		if t.state0() == taskRunning {
+			n++
+		}
+	}
+	return n
+}
+
+// FormatDuration 把时长写成界面上好读的样子，和工具结果里的写法保持一致
+func FormatDuration(d time.Duration) string {
+	return shortDuration(d)
+}
+
 // takeNotifications 摘出待通知的任务并标记成已通知
 func (r *taskRegistry) takeNotifications() []string {
 	r.mu.Lock()

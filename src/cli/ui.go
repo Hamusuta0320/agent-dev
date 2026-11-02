@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"hamusuta/agent-dev/src/config"
 	"hamusuta/agent-dev/src/core"
@@ -51,6 +52,8 @@ const (
 	toolErrRunes = 200
 	// toolMarkDone 是工具调用结束后贴在标题行最前面的圆圈，颜色表示成败
 	toolMarkDone = "●"
+	// maxTaskChips 是后台任务栏里最多列几个任务，再多就折成一个"还有 N 个"
+	maxTaskChips = 3
 )
 
 var (
@@ -79,6 +82,9 @@ type eventMsg domain.Event
 
 // doneMsg 表示这一轮跑完了
 type doneMsg struct{ err error }
+
+// taskTickMsg 只用来让界面自己动一下：后台任务在跑的时候，耗时那栏每秒得刷新
+type taskTickMsg struct{}
 
 // runner 在后台跑一轮 core.Loop，把过程事件通过 channel 送给 UI。
 // err 要在 close(ch) 之前写好，UI 读到 channel 关闭时才有确定的 err。
@@ -164,6 +170,13 @@ type model struct {
 	// contextLimit 是配置里的上下文窗口大小，用来算已用百分比
 	contextLimit int
 
+	// height 是终端高度，开场时靠它把输入框顶到屏幕底部
+	height int
+	// started 表示开场白已经打过了：得等知道窗口高度才能算要补多少空行
+	started bool
+	// tasksTicking 表示"后台任务耗时"的定时刷新已经转起来了，避免重复起定时器
+	tasksTicking bool
+
 	// mode 是当前工作模式，决定给模型哪些工具、写操作要不要问
 	mode domain.Mode
 	// approval 是正在等用户确认的那项写操作，为 nil 表示没有在等
@@ -227,6 +240,13 @@ func newModel(cfg config.GlobalConfig, store *session.Store, workdir string, cur
 }
 
 func (m model) Init() tea.Cmd {
+	// 开场白要等拿到窗口高度再打：顺手补一段空行，把输入框顶到屏幕底部，
+	// 之后会话再长，输入框也一直贴着底边
+	return textarea.Blink
+}
+
+// bannerLines 是开场那几行
+func (m model) bannerLines() []string {
 	lines := []string{
 		bannerStyle.Render("agent-dev") + hintStyle.Render("  会话 "+m.cur.Id),
 		hintStyle.Render("模式 ") + statusStyle.Render(m.mode.Label()) +
@@ -237,8 +257,24 @@ func (m model) Init() tea.Cmd {
 		lines = append(lines, hintStyle.Render(
 			"提示：VS Code 终端里 Tab 可能被接走，补全请用 Ctrl+Space 或 →"))
 	}
-	banner := strings.Join(lines, "\n")
-	return tea.Sequence(tea.Println(banner), textarea.Blink)
+	return lines
+}
+
+// startupText 是开场白加上一段空行。空行的数量按"开场白 + 界面 + 空行 = 终端高度"算，
+// 这样界面正好落在屏幕最后几行，输入框就贴底了。
+func (m model) startupText() string {
+	lines := m.bannerLines()
+	text := strings.Join(lines, "\n")
+	// 界面本身占几行（输入框边框、上下文占用、提示行……），不足就往上补空行
+	if pad := m.height - len(lines) - m.viewLines(); pad > 0 {
+		text += strings.Repeat("\n", pad)
+	}
+	return text
+}
+
+// viewLines 数当前界面占几行，用来算开场要补多少空行
+func (m model) viewLines() int {
+	return strings.Count(m.View().Content, "\n") + 1
 }
 
 // inVSCodeTerminal 判断是不是跑在 VS Code 的集成终端里
@@ -247,11 +283,51 @@ func inVSCodeTerminal() bool {
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	next, cmd := m.update(msg)
+	// 后台任务在跑的时候，耗时要自己走起来；停下来之后就别再空转
+	mm, ok := next.(model)
+	if !ok {
+		return next, cmd
+	}
+	return mm.withTaskTicker(cmd)
+}
+
+// withTaskTicker 保证"有任务在跑就有定时器、没任务就没有"，避免重复起定时器
+func (m model) withTaskTicker(cmd tea.Cmd) (tea.Model, tea.Cmd) {
+	running := tool.RunningTaskCount() > 0
+	if !running {
+		m.tasksTicking = false
+		return m, cmd
+	}
+	if !m.tasksTicking {
+		m.tasksTicking = true
+		return m, tea.Batch(cmd, taskTick())
+	}
+	return m, cmd
+}
+
+// taskTick 每秒叫醒一次界面，好让后台任务的耗时那栏跟着变
+func taskTick() tea.Cmd {
+	return tea.Tick(time.Second, func(time.Time) tea.Msg { return taskTickMsg{} })
+}
+
+func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = max(msg.Width, 24)
+		m.height = max(msg.Height, 10)
 		m.input.SetWidth(m.width - 4)
 		m.resizeForm()
+		if !m.started {
+			// 第一次知道窗口多大：这时候打开场白，才算得准要补多少空行
+			m.started = true
+			return m, tea.Sequence(tea.Println(m.startupText()), textarea.Blink)
+		}
+		return m, nil
+
+	case taskTickMsg:
+		// 这一拍用掉了，交给外层的 withTaskTicker 决定要不要再续一拍
+		m.tasksTicking = false
 		return m, nil
 
 	case tea.KeyPressMsg:
@@ -1097,6 +1173,69 @@ func (m model) usageLine() string {
 	return strings.Join(items, hintStyle.Render(" · "))
 }
 
+// tasksLine 是输入框上方常驻的后台任务栏：和上下文占用并排，
+// 有任务就显示，没有就整行不出现。运行中的任务带上已跑时长，一眼看出卡没卡住。
+func (m model) tasksLine() string {
+	return tasksLine(tool.TaskSnapshots())
+}
+
+// tasksLine 把任务快照渲染成一行，纯函数，方便直接拿造的数据测
+func tasksLine(snapshots []tool.TaskSnapshot) string {
+	if len(snapshots) == 0 {
+		return ""
+	}
+	running := 0
+	for _, s := range snapshots {
+		if s.Running {
+			running++
+		}
+	}
+
+	head := hintStyle.Render("后台任务 ")
+	if running > 0 {
+		head += statusStyle.Render(fmt.Sprintf("%d 个运行中", running))
+		if done := len(snapshots) - running; done > 0 {
+			head += hintStyle.Render(fmt.Sprintf(" · %d 个已结束", done))
+		}
+	} else {
+		head += hintStyle.Render(fmt.Sprintf("%d 个已结束", len(snapshots)))
+	}
+
+	items := []string{head}
+	// 运行中的排前面，任务多的时候被"还有 N 个"折叠掉的总是已经结束的那些
+	ordered := make([]tool.TaskSnapshot, 0, len(snapshots))
+	for _, s := range snapshots {
+		if s.Running {
+			ordered = append(ordered, s)
+		}
+	}
+	for _, s := range snapshots {
+		if !s.Running {
+			ordered = append(ordered, s)
+		}
+	}
+	shown := ordered
+	if len(shown) > maxTaskChips {
+		shown = shown[:maxTaskChips]
+	}
+	for _, s := range shown {
+		// 运行中的用状态色、结束的用暗色，扫一眼就知道哪个还在跑
+		style := hintStyle
+		if s.Running {
+			style = toolStyle
+		}
+		chip := s.ID + " " + s.Status
+		if s.Running {
+			chip += " " + tool.FormatDuration(s.Elapsed)
+		}
+		items = append(items, style.Render(chip))
+	}
+	if rest := len(snapshots) - len(shown); rest > 0 {
+		items = append(items, hintStyle.Render(fmt.Sprintf("…还有 %d 个", rest)))
+	}
+	return strings.Join(items, hintStyle.Render(" · "))
+}
+
 func (m model) View() tea.View {
 	if m.quitting {
 		return tea.NewView("")
@@ -1110,6 +1249,10 @@ func (m model) View() tea.View {
 	}
 	if m.state == stateApproval {
 		// 确认框顶替输入框：这一刻只能回答 y / a / n
+		if line := m.tasksLine(); line != "" {
+			b.WriteString(m.wrap(line))
+			b.WriteString("\n")
+		}
 		if line := m.usageLine(); line != "" {
 			b.WriteString(m.wrap(line))
 			b.WriteString("\n")
@@ -1128,7 +1271,11 @@ func (m model) View() tea.View {
 		b.WriteString(strings.Join(lines, "\n"))
 		b.WriteString("\n")
 	}
-	// 上下文占用紧贴输入框上方，运行中也一直看得到
+	// 后台任务和上下文占用一样常驻在输入框上方，运行中也一直看得到
+	if line := m.tasksLine(); line != "" {
+		b.WriteString(m.wrap(line))
+		b.WriteString("\n")
+	}
 	if line := m.usageLine(); line != "" {
 		b.WriteString(m.wrap(line))
 		b.WriteString("\n")
