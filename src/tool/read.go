@@ -39,6 +39,7 @@ func (t ReadTool) Mutating() bool { return false }
 
 func (t ReadTool) Description() string {
 	return "读取文本文件，按行返回，默认每行前面带行号（格式 `    12→代码`）。" +
+		"intent 写一句这次读取要看什么，会显示在界面上。" +
 		"默认从第 1 行开始、最多读 2000 行；文件更长时返回末尾会提示下一次该用的 offset。" +
 		"不是 UTF-8 的文件（例如 GBK 或 GB18030 编码）会自动按本地编码解码后显示。" +
 		"不要用它读目录或二进制文件；搜文件内容用 Grep，新建/覆盖文件用 Write，只改一小段用 Edit。"
@@ -48,6 +49,7 @@ func (t ReadTool) Schema() map[string]any {
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
+			"intent": intentProp(),
 			"path": map[string]any{
 				"type":        "string",
 				"description": "要读取的文件路径",
@@ -65,11 +67,12 @@ func (t ReadTool) Schema() map[string]any {
 				"description": "是否显示行号，默认 true；需要原样复制内容做 Edit 时可以关掉",
 			},
 		},
-		"required": []string{"path"},
+		"required": []string{"intent", "path"},
 	}
 }
 
 type ReadArgs struct {
+	Intent      string `json:"intent"`
 	Path        string `json:"path"`
 	Offset      int    `json:"offset"`
 	Lines       int    `json:"lines"`

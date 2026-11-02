@@ -357,6 +357,7 @@ func (t TaskTool) Mutating() bool { return false }
 
 func (t TaskTool) Description() string {
 	return "跟进 Bash 用 background=true 起的后台任务。" +
+		"intent 写一句这次要看什么，会显示在界面上。" +
 		"action=list 列出所有任务；action=output 读某个任务的输出（tail_lines 只要最后几行）；" +
 		"action=wait 等任务跑完（最多 timeout_seconds 秒，默认 30，最长 120）；action=stop 把任务停掉。" +
 		"output/wait/stop 都要带 task_id。" +
@@ -368,6 +369,7 @@ func (t TaskTool) Schema() map[string]any {
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
+			"intent": intentProp(),
 			"action": map[string]any{
 				"type":        "string",
 				"enum":        []string{"list", "output", "wait", "stop"},
@@ -386,11 +388,12 @@ func (t TaskTool) Schema() map[string]any {
 				"description": fmt.Sprintf("action=wait 最多等几秒，默认 %d，最长 %d", int(defaultTaskWait.Seconds()), int(maxTaskWait.Seconds())),
 			},
 		},
-		"required": []string{"action"},
+		"required": []string{"intent", "action"},
 	}
 }
 
 type TaskArgs struct {
+	Intent         string `json:"intent"`
 	Action         string `json:"action"`
 	TaskId         string `json:"task_id"`
 	TailLines      int    `json:"tail_lines"`

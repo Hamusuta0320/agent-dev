@@ -2,9 +2,38 @@ package tool
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 
 	"hamusuta/agent-dev/src/domain"
 )
+
+// intentDesc 是所有工具共用的 intent 参数说明：让模型一句话交代"这次要干什么"，
+// 界面把它显示在工具名后面，用户扫一眼就知道这一串调用在忙什么
+const intentDesc = "这次调用的意图，一句话说明要做什么（比如\"读一下登录相关的代码\"），只用于展示给用户"
+
+// intentProp 是各工具 schema 里通用的 intent 字段
+func intentProp() map[string]any {
+	return map[string]any{
+		"type":        "string",
+		"description": intentDesc,
+	}
+}
+
+// ToolIntent 是所有工具参数里共有的 intent 字段。
+// 界面不认各工具自己的参数结构，只从这个形状里取意图
+type ToolIntent struct {
+	Intent string `json:"intent"`
+}
+
+// CallIntent 从一次调用的原始参数里取出 intent，取不到（参数坏了或没传）就返回空串
+func CallIntent(rawArgs string) string {
+	var v ToolIntent
+	if err := json.Unmarshal([]byte(rawArgs), &v); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(v.Intent)
+}
 
 // ctxOrBackground 兜住没传 ctx 的调用方（测试、控制台直调），
 // 免得每个工具都得先判一次 nil 才能用 ctx

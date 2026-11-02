@@ -10,7 +10,8 @@ import (
 
 func TestSystemPromptContainsEnv(t *testing.T) {
 	p := systemPrompt(domain.Ctx{WorkDir: `/tmp/demo`, Shell: "pwsh"})
-	for _, want := range []string{"/tmp/demo", "pwsh", "Read", "Grep", "Edit", "Write", "Bash"} {
+	// 每个工具都要用 intent 交代意图，提示词里得说清楚
+	for _, want := range []string{"/tmp/demo", "pwsh", "Read", "Grep", "Edit", "Write", "Bash", "intent"} {
 		if !strings.Contains(p, want) {
 			t.Fatalf("系统提示词里缺少 %q:\n%s", want, p)
 		}

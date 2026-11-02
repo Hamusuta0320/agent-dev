@@ -436,15 +436,15 @@ func stripANSI(s string) string {
 
 // Bash 调用要能显示意图和完整命令，多行命令不截断
 func TestBashCallLines(t *testing.T) {
+	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+	m.width = 80
+
 	call := domain.ToolCall{
 		Name:      "Bash",
 		Arguments: `{"intent":"跑测试","command":"go test ./...\ngo vet ./..."}`,
 	}
-	lines, ok := bashCallLines(call)
-	if !ok {
-		t.Fatal("Bash 调用应该走专门的分支")
-	}
-	got := strings.Join(lines, "\n")
+	lines := m.toolCallLines(call)
+	got := stripANSI(strings.Join(lines, "\n"))
 	for _, want := range []string{"Bash", "跑测试", "go test ./...", "go vet ./..."} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("少了 %q:\n%s", want, got)
@@ -453,26 +453,95 @@ func TestBashCallLines(t *testing.T) {
 
 	// 长命令不能被截断
 	long := strings.Repeat("a", 300)
-	lines, _ = bashCallLines(domain.ToolCall{Name: "Bash", Arguments: `{"command":"` + long + `"}`})
+	lines = m.toolCallLines(domain.ToolCall{Name: "Bash", Arguments: `{"command":"` + long + `"}`})
 	if !strings.Contains(strings.Join(lines, "\n"), long) {
 		t.Fatal("命令被截断了")
 	}
 
-	// 参数坏的、或者不是 Bash，就不要走这个分支
-	if _, ok := bashCallLines(domain.ToolCall{Name: "Read", Arguments: `{"file_path":"a"}`}); ok {
-		t.Fatal("Read 不该走 Bash 分支")
-	}
-	if _, ok := bashCallLines(domain.ToolCall{Name: "Bash", Arguments: `not json`}); ok {
-		t.Fatal("坏参数应该退回摘要")
+	// 参数坏了也只剩标题行，不能崩
+	if lines := m.toolCallLines(domain.ToolCall{Name: "Bash", Arguments: `not json`}); len(lines) != 1 {
+		t.Fatalf("坏参数应该只留标题行: %q", lines)
 	}
 
 	// 后台命令不会等结果，标题上要标出来
-	lines, _ = bashCallLines(domain.ToolCall{
+	lines = m.toolCallLines(domain.ToolCall{
 		Name:      "Bash",
 		Arguments: `{"intent":"起个 dev server","command":"npm run dev","background":true}`,
 	})
 	if !strings.Contains(stripANSI(lines[0]), "后台") {
 		t.Fatalf("后台调用要标出来: %q", lines[0])
+	}
+}
+
+// 每个工具都要显示意图，并按各自的参数补一行细节
+func TestToolCallLinesShowIntent(t *testing.T) {
+	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+	m.width = 120
+
+	cases := []struct {
+		name  string
+		args  string
+		wants []string
+	}{
+		{"Read", `{"intent":"看看登录逻辑","path":"auth/login.go","offset":10,"lines":20}`, []string{"Read", "看看登录逻辑", "auth/login.go", "第 10 行起", "最多 20 行"}},
+		{"Write", `{"intent":"补一个测试","path":"auth/login_test.go","content":"package auth\n"}`, []string{"Write", "补一个测试", "auth/login_test.go", "写入 13 字节"}},
+		{"Edit", `{"intent":"修掉越界","path":"auth/login.go","old_string":"a","new_string":"b","replace_all":true}`, []string{"Edit", "修掉越界", "auth/login.go", "替换全部匹配"}},
+		{"Grep", `{"intent":"找一下这个函数","pattern":"func Login","glob":"*.go","case_insensitive":true}`, []string{"Grep", "找一下这个函数", "func Login", "*.go", "忽略大小写"}},
+		{"Glob", `{"intent":"看看有哪些测试","pattern":"**/*_test.go"}`, []string{"Glob", "看看有哪些测试", "**/*_test.go"}},
+		{"Task", `{"intent":"等等构建","action":"wait","task_id":"task_1"}`, []string{"Task", "等等构建", "wait task_1"}},
+	}
+	for _, c := range cases {
+		lines := m.toolCallLines(domain.ToolCall{Name: c.name, Arguments: c.args})
+		got := stripANSI(strings.Join(lines, "\n"))
+		for _, want := range c.wants {
+			if !strings.Contains(got, want) {
+				t.Fatalf("%s 的调用行里少了 %q:\n%s", c.name, want, got)
+			}
+		}
+		// 标题行最前面是工具名，后面紧跟意图
+		if !strings.HasPrefix(stripANSI(lines[0]), c.name) {
+			t.Fatalf("%s 的标题行不对: %q", c.name, lines[0])
+		}
+	}
+
+	// 没传 intent（老会话里的调用）也要能显示，不能空着
+	lines := m.toolCallLines(domain.ToolCall{Name: "Read", Arguments: `{"path":"a.go"}`})
+	if !strings.Contains(stripANSI(strings.Join(lines, "\n")), "a.go") {
+		t.Fatalf("没给 intent 时也要显示细节: %q", lines)
+	}
+
+	// 认不出的工具退回参数摘要
+	lines = m.toolCallLines(domain.ToolCall{Name: "Future", Arguments: `{"x":1}`})
+	if len(lines) != 2 || !strings.Contains(stripANSI(lines[1]), `"x":1`) {
+		t.Fatalf("未知工具应该退回参数摘要: %q", lines)
+	}
+}
+
+// 每个工具的 schema 里都要有 intent，而且模型不给就算缺参数
+func TestEveryToolHasIntent(t *testing.T) {
+	for name, tl := range tool.Tools {
+		schema := tl.Schema()
+		props, ok := schema["properties"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s 的 schema 没有 properties", name)
+		}
+		if _, ok := props["intent"]; !ok {
+			t.Fatalf("%s 的 schema 里没有 intent: %v", name, props)
+		}
+		required, _ := schema["required"].([]string)
+		found := false
+		for _, r := range required {
+			if r == "intent" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("%s 应该把 intent 列进 required: %v", name, required)
+		}
+		// 描述里也要提一句，模型才知道这个字段是干嘛的
+		if !strings.Contains(tl.Description(), "intent") {
+			t.Fatalf("%s 的描述里没提 intent", name)
+		}
 	}
 }
 

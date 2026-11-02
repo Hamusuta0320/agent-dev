@@ -31,6 +31,7 @@ func (t WriteTool) Mutating() bool { return true }
 
 func (t WriteTool) Description() string {
 	return "创建或整体覆盖一个文本文件（父目录不存在会自动创建），返回写入的字节数和行数。" +
+		"intent 写一句这次要写什么，会显示在界面上。" +
 		"覆盖已有文件前会先把原内容备份到 <工作目录>/.agent/backups/ 下，结果里会说明备份位置。" +
 		"内容按原样写入，不做换行转换。只想改文件里的一小段请用 Edit，不要拿 Write 覆盖整个文件。"
 }
@@ -39,6 +40,7 @@ func (t WriteTool) Schema() map[string]any {
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
+			"intent": intentProp(),
 			"path": map[string]any{
 				"type":        "string",
 				"description": "要写入的文件路径",
@@ -48,11 +50,12 @@ func (t WriteTool) Schema() map[string]any {
 				"description": "文件的完整内容，允许为空字符串（用于创建空文件）",
 			},
 		},
-		"required": []string{"path", "content"},
+		"required": []string{"intent", "path", "content"},
 	}
 }
 
 type WriteArgs struct {
+	Intent  string  `json:"intent"`
 	Path    string  `json:"path"`
 	Content *string `json:"content"`
 }
@@ -195,9 +198,10 @@ func (t WriteTool) Preview(rawArgs json.RawMessage) domain.ApprovalRequest {
 		lines, size = countLines(*args.Content), len(*args.Content)
 	}
 	if info, err := os.Stat(req.Target); err == nil && info.Mode().IsRegular() {
-		req.Detail = fmt.Sprintf("覆盖已有文件（原来 %s），写入 %d 行 / %d 字节", humanBytes(info.Size()), lines, size)
+		req.Detail = withIntent(args.Intent,
+			fmt.Sprintf("覆盖已有文件（原来 %s），写入 %d 行 / %d 字节", humanBytes(info.Size()), lines, size))
 	} else {
-		req.Detail = fmt.Sprintf("新建文件，写入 %d 行 / %d 字节", lines, size)
+		req.Detail = withIntent(args.Intent, fmt.Sprintf("新建文件，写入 %d 行 / %d 字节", lines, size))
 	}
 	if args.Content != nil {
 		req.Diff = newDiffPreview("", *args.Content)

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hamusuta/agent-dev/src/domain"
+	"hamusuta/agent-dev/src/tool"
 	"io"
 	"os"
 	"strings"
@@ -356,9 +357,14 @@ func ConsoleEmit(in io.Reader, out io.Writer) domain.EmitFunc {
 				fmt.Fprintln(out)
 				midLine = false
 			}
+			// 有意图就显示意图，没有（老会话或参数坏了）就退回参数摘要
+			label := tool.CallIntent(ev.Call.Arguments)
+			if label == "" {
+				label = truncate(ev.Call.Arguments, 160)
+			}
 			fmt.Fprintf(out, "[工具] %s %s · %s · %s\n",
 				ev.Call.Name,
-				truncate(ev.Call.Arguments, 160),
+				label,
 				ev.StartedAt.Format("15:04:05"),
 				ev.Status.Label())
 		case domain.EventToolResult:

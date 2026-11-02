@@ -33,6 +33,7 @@ func systemPrompt(ctx domain.Ctx) string {
 
 	sb.WriteString(`
 ## 工具使用
+- 每次调用工具都要用 intent 写一句这次要做什么（比如"读一下登录逻辑"），界面上会显示在工具名后面。
 - 看代码用 Read（带行号）和 Grep（正则搜内容）；列目录、找文件用 Glob（pattern 默认 * 就是列一层，**/*.go 递归）。
 - 互不依赖的只读操作（Read / Glob / Grep）可以在同一条消息里一起发出来，它们会并行执行，快一些；会改磁盘的工具仍然一个一个跑。
 - 改代码用 Edit（改一小段）或 Write（新建/整体覆盖），不要用 shell 的 sed / echo > 文件去改。

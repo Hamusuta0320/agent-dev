@@ -53,6 +53,7 @@ func (t GrepTool) Mutating() bool { return false }
 
 func (t GrepTool) Description() string {
 	return "按正则表达式搜索文件内容，输出格式 `路径:行号:内容`。" +
+		"intent 写一句这次要找什么，会显示在界面上。" +
 		"默认在当前目录递归搜索，自动跳过 .git / node_modules / vendor / dist / build 等目录、二进制文件和超过 10MB 的文件。" +
 		"不是 UTF-8 的文件（例如 GBK / GB18030 编码）会先按本地编码解码再匹配，pattern 请照常写 UTF-8。" +
 		"path 可以指定文件或目录；glob 限定文件类型（如 *.go，多个用逗号分隔）；" +
@@ -66,6 +67,7 @@ func (t GrepTool) Schema() map[string]any {
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
+			"intent": intentProp(),
 			"pattern": map[string]any{
 				"type":        "string",
 				"description": "要搜索的正则表达式（Go / RE2 语法）",
@@ -91,11 +93,12 @@ func (t GrepTool) Schema() map[string]any {
 				"description": "每处匹配前后各显示多少行上下文，默认 0（只显示命中行），最多 10",
 			},
 		},
-		"required": []string{"pattern"},
+		"required": []string{"intent", "pattern"},
 	}
 }
 
 type GrepArgs struct {
+	Intent          string `json:"intent"`
 	Pattern         string `json:"pattern"`
 	Path            string `json:"path"`
 	Glob            string `json:"glob"`

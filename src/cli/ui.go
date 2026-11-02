@@ -723,15 +723,155 @@ type pendingCall struct {
 }
 
 // toolCallLines 渲染一次工具调用的内容，不含最前面的圆圈（圆圈要按状态上色，
-// 得等结果出来才知道）。Bash 会把意图和完整命令都摊开，
-// 其余工具没有专门的格式，压成一行摘要就够了。
+// 得等结果出来才知道）。标题行统一是"工具名 + 意图"，下面按工具补一行关键细节，
+// 这样不用看 JSON 也知道这次在改哪个文件、搜什么词。
 func (m model) toolCallLines(call domain.ToolCall) []string {
-	lines, ok := bashCallLines(call)
-	if ok {
-		return lines
+	title := toolStyle.Render(call.Name)
+	if intent := tool.CallIntent(call.Arguments); intent != "" {
+		title += hintStyle.Render("  " + intent)
 	}
-	return []string{toolStyle.Render(call.Name) +
-		hintStyle.Render(" "+firstLines(call.Arguments, toolArgRunes))}
+	if badge := callBadge(call); badge != "" {
+		title += hintStyle.Render("  · " + badge)
+	}
+	return append([]string{title}, callDetailLines(call)...)
+}
+
+// callBadge 是标题行末尾的小标记，目前只有"后台运行的 Bash"需要
+func callBadge(call domain.ToolCall) string {
+	if call.Name != (tool.BashTool{}).Name() {
+		return ""
+	}
+	var args tool.BashArgs
+	if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil {
+		return ""
+	}
+	if args.Background {
+		return "后台"
+	}
+	return ""
+}
+
+// callDetailLines 按工具给出"这次到底做什么"的细节行（已经缩进好、上好色）。
+// 参数解析不出来就不给细节，至少标题行还在，不至于把界面搞崩。
+func callDetailLines(call domain.ToolCall) []string {
+	switch call.Name {
+	case "Bash":
+		return bashDetailLines(call)
+	case "Read":
+		var args tool.ReadArgs
+		if json.Unmarshal([]byte(call.Arguments), &args) != nil || strings.TrimSpace(args.Path) == "" {
+			return nil
+		}
+		return []string{hintStyle.Render("  " + readRangeLabel(args))}
+	case "Write":
+		var args tool.WriteArgs
+		if json.Unmarshal([]byte(call.Arguments), &args) != nil || strings.TrimSpace(args.Path) == "" {
+			return nil
+		}
+		detail := args.Path
+		if args.Content != nil {
+			detail += fmt.Sprintf(" · 写入 %d 字节", len(*args.Content))
+		}
+		return []string{hintStyle.Render("  " + detail)}
+	case "Edit":
+		var args tool.EditArgs
+		if json.Unmarshal([]byte(call.Arguments), &args) != nil || strings.TrimSpace(args.Path) == "" {
+			return nil
+		}
+		detail := args.Path
+		if args.ReplaceAll {
+			detail += " · 替换全部匹配"
+		}
+		return []string{hintStyle.Render("  " + detail)}
+	case "Grep":
+		var args tool.GrepArgs
+		if json.Unmarshal([]byte(call.Arguments), &args) != nil {
+			return nil
+		}
+		return []string{hintStyle.Render("  " + grepLabel(args))}
+	case "Glob":
+		var args tool.GlobArgs
+		if json.Unmarshal([]byte(call.Arguments), &args) != nil {
+			return nil
+		}
+		return []string{hintStyle.Render("  " + globLabel(args))}
+	case "Task":
+		var args tool.TaskArgs
+		if json.Unmarshal([]byte(call.Arguments), &args) != nil {
+			return nil
+		}
+		return []string{hintStyle.Render("  " + taskLabel(args))}
+	}
+	// 认不出的工具（将来加的）退回参数摘要，总比什么都不显示强
+	return []string{hintStyle.Render(" " + firstLines(call.Arguments, toolArgRunes))}
+}
+
+// readRangeLabel 是 Read 的细节：读哪个文件、读哪几行
+func readRangeLabel(args tool.ReadArgs) string {
+	label := args.Path
+	offset := args.Offset
+	if offset <= 0 {
+		offset = 1
+	}
+	if offset > 1 || args.Lines > 0 {
+		label += fmt.Sprintf(" · 第 %d 行起", offset)
+		if args.Lines > 0 {
+			label += fmt.Sprintf("，最多 %d 行", args.Lines)
+		}
+	}
+	if args.LineNumbers != nil && !*args.LineNumbers {
+		label += " · 不带行号"
+	}
+	return label
+}
+
+// grepLabel 是 Grep 的细节：搜什么词、限定哪些文件、要不要忽略大小写
+func grepLabel(args tool.GrepArgs) string {
+	pattern := strings.TrimSpace(args.Pattern)
+	if pattern == "" {
+		pattern = "（空）"
+	}
+	label := "搜索 " + truncateGrepLabel(pattern)
+	if glob := strings.TrimSpace(args.Glob); glob != "" {
+		label += " · " + glob
+	}
+	if args.Path != "" && args.Path != "." {
+		label += " · 在 " + args.Path
+	}
+	if args.CaseInsensitive {
+		label += " · 忽略大小写"
+	}
+	return label
+}
+
+// globLabel 是 Glob 的细节：找什么通配符、从哪个目录起
+func globLabel(args tool.GlobArgs) string {
+	pattern := strings.TrimSpace(args.Pattern)
+	if pattern == "" {
+		pattern = "*"
+	}
+	label := "列出 " + truncateGrepLabel(pattern)
+	if path := strings.TrimSpace(args.Path); path != "" && path != "." {
+		label += " · 在 " + path
+	}
+	return label
+}
+
+// taskLabel 是 Task 的细节：对哪个任务做什么
+func taskLabel(args tool.TaskArgs) string {
+	label := strings.TrimSpace(args.Action)
+	if label == "" {
+		label = "list"
+	}
+	if id := strings.TrimSpace(args.TaskId); id != "" {
+		label += " " + id
+	}
+	return label
+}
+
+// truncateGrepLabel 把可能很长的一行（正则、通配符）压短，免得把界面撑爆
+func truncateGrepLabel(s string) string {
+	return firstLines(s, toolArgRunes)
 }
 
 // withMark 把圆圈贴到标题行最前面。标题行可能已经被着色，所以只在前面加一段，
@@ -803,30 +943,22 @@ func (m model) pendingLines() []string {
 	return out
 }
 
-// bashCallLines 把 Bash 调用渲染成"意图 + 完整命令"：命令不截断，
-// 多行命令（&&、管道拆行写的）按原样保留。参数不完整时返回 false，让调用方退回摘要。
-func bashCallLines(call domain.ToolCall) ([]string, bool) {
+// bashDetailLines 把 Bash 调用渲染成"目录 + 完整命令"：命令不截断，
+// 多行命令（&&、管道拆行写的）按原样保留。参数不完整时返回 nil，只留标题行。
+func bashDetailLines(call domain.ToolCall) []string {
 	if call.Name != (tool.BashTool{}).Name() {
-		return nil, false
+		return nil
 	}
 	var args tool.BashArgs
 	if err := json.Unmarshal([]byte(call.Arguments), &args); err != nil {
-		return nil, false
+		return nil
 	}
 	command := strings.TrimRight(args.Command, "\r\n")
 	if strings.TrimSpace(command) == "" {
-		return nil, false
+		return nil
 	}
 
-	title := toolStyle.Render(call.Name)
-	if intent := strings.TrimSpace(args.Intent); intent != "" {
-		title += hintStyle.Render("  " + intent)
-	}
-	if args.Background {
-		// 后台命令不会等结果，标题上标一下，免得以为是卡住了
-		title += hintStyle.Render("  · 后台")
-	}
-	out := []string{title}
+	var out []string
 	if wd := strings.TrimSpace(args.Workdir); wd != "" {
 		out = append(out, hintStyle.Render("  目录 "+wd))
 	}
@@ -837,7 +969,7 @@ func bashCallLines(call domain.ToolCall) ([]string, bool) {
 		}
 		out = append(out, strings.Repeat(" ", 4)+strings.TrimRight(line, "\r"))
 	}
-	return out, true
+	return out
 }
 
 // curSuggest 把选中项夹进候选范围：输入变过之后旧下标可能已经越界

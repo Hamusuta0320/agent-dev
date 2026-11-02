@@ -32,6 +32,7 @@ func (t EditTool) Mutating() bool { return true }
 
 func (t EditTool) Description() string {
 	return "把文件里的一段原文替换成新内容，返回替换的处数，并回显改动位置前后的几行（去掉的行以 - 开头、加上的以 + 开头）。" +
+		"intent 写一句这次要改什么，会显示在界面上。" +
 		"old_string 必须与文件内容逐字符一致（缩进、空格、换行都要一样），默认还要求它在文件中唯一，不唯一时请多带几行上下文，或设置 replace_all=true。" +
 		"可以直接从 Read 的结果里连着行号一起复制，行号前缀会被自动去掉；行尾空白有细微差异也能匹配上。" +
 		"改之前建议先用 Read 看一眼原文。"
@@ -41,6 +42,7 @@ func (t EditTool) Schema() map[string]any {
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
+			"intent": intentProp(),
 			"path": map[string]any{
 				"type":        "string",
 				"description": "要修改的文件路径",
@@ -58,11 +60,12 @@ func (t EditTool) Schema() map[string]any {
 				"description": "是否替换全部匹配项，默认 false（要求 old_string 唯一）",
 			},
 		},
-		"required": []string{"path", "old_string", "new_string"},
+		"required": []string{"intent", "path", "old_string", "new_string"},
 	}
 }
 
 type EditArgs struct {
+	Intent     string `json:"intent"`
 	Path       string `json:"path"`
 	OldString  string `json:"old_string"`
 	NewString  string `json:"new_string"`
@@ -208,9 +211,21 @@ func (t EditTool) Preview(rawArgs json.RawMessage) domain.ApprovalRequest {
 	if args.ReplaceAll {
 		detail += "，替换全部匹配处"
 	}
-	req.Detail = detail
+	req.Detail = withIntent(args.Intent, detail)
 	req.Diff = newDiffPreview(args.OldString, args.NewString)
 	return req
+}
+
+// withIntent 把意图放在确认摘要最前面：用户先看"为什么要改"，再看"改什么"
+func withIntent(intent, detail string) string {
+	intent = strings.TrimSpace(intent)
+	if intent == "" {
+		return detail
+	}
+	if detail == "" {
+		return intent
+	}
+	return intent + " · " + detail
 }
 
 // stripLineNumbers 如果整段里每一行都带 Read 的行号前缀（`    12→`），就整段去掉；

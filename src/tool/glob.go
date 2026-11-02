@@ -34,6 +34,7 @@ func (t GlobTool) Mutating() bool { return false }
 
 func (t GlobTool) Description() string {
 	return "按通配符列出文件或目录，输出相对起点的路径（目录以 / 结尾），按路径排序。" +
+		"intent 写一句这次要找什么，会显示在界面上。" +
 		"pattern 里不含 / 时只列起点目录这一层，pattern 写 * 就是列目录；" +
 		"要递归就用 **，例如 **/*.go 找所有 Go 文件、**/*_test.go 找测试、src/**/*.go 限定在 src 下。" +
 		"支持 * ? [abc] 这几种通配符，** 表示任意层目录。" +
@@ -45,6 +46,7 @@ func (t GlobTool) Schema() map[string]any {
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
+			"intent": intentProp(),
 			"pattern": map[string]any{
 				"type":        "string",
 				"description": "通配符，默认 *（只列起点目录这一层）；** 表示递归任意层，如 **/*.go。不含 / 时只匹配名字，不做递归",
@@ -58,10 +60,12 @@ func (t GlobTool) Schema() map[string]any {
 				"description": "最多返回多少项，默认 200",
 			},
 		},
+		"required": []string{"intent"},
 	}
 }
 
 type GlobArgs struct {
+	Intent     string `json:"intent"`
 	Pattern    string `json:"pattern"`
 	Path       string `json:"path"`
 	MaxResults int    `json:"max_results"`
