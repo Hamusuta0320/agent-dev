@@ -18,7 +18,8 @@ import (
 
 const (
 	defaultBashTimeout = 30 * time.Second
-	maxBashTimeout     = 120 * time.Second
+	// maxBashTimeout 允许模型给慢命令（构建、装依赖）多留点时间，再长就该用后台任务了
+	maxBashTimeout = 10 * time.Minute
 	// maxBashOutput 是 stdout+stderr 合并后保留的字节数，超出时开头和结尾各留一半
 	maxBashOutput = 64 * 1024
 	// psUTF8Prefix 让 PowerShell 按 UTF-8 解码原生命令的输出、也按 UTF-8 写出去。
@@ -113,9 +114,12 @@ func (t BashTool) Description() string {
 	return fmt.Sprintf("在指定工作目录执行 shell 命令，返回 exit_code 和 stdout/stderr 合并输出。"+
 		"当前平台 %s/%s，shell 是 %s%s。"+
 		"调用时必须用 intent 写一句这次要做什么，界面上会连完整命令一起展示给用户。"+
+		"timeout_seconds 指定超时时间（默认 30 秒，最长 %s），构建、装依赖这类慢命令记得调大。"+
+		"background=true 让命令转到后台运行，立刻拿到任务 id，之后用 Task 工具看输出、等它结束或停掉它，"+
+		"适合 dev server、长时间构建这类不该卡住这一轮的命令。"+
 		"适合构建、测试、git、查看目录等；文件的读写和内容搜索请优先用 Read/Write/Edit/Grep。"+
-		"不要执行交互式命令（vim、more、read）或长期运行的服务（npm start），它们会超时。",
-		runtime.GOOS, runtime.GOARCH, s.Name, s.Hint)
+		"不要执行交互式命令（vim、more、read），它们会一直等输入。",
+		runtime.GOOS, runtime.GOARCH, s.Name, s.Hint, shortDuration(maxBashTimeout))
 }
 
 func (t BashTool) Schema() map[string]any {
@@ -136,7 +140,11 @@ func (t BashTool) Schema() map[string]any {
 			},
 			"timeout_seconds": map[string]any{
 				"type":        "integer",
-				"description": "超时秒数，默认30，最大120",
+				"description": fmt.Sprintf("超时秒数，默认 %d，最长 %d；后台任务到点也会被停掉", int(defaultBashTimeout.Seconds()), int(maxBashTimeout.Seconds())),
+			},
+			"background": map[string]any{
+				"type":        "boolean",
+				"description": "是否放到后台运行，默认 false。为 true 时立刻返回任务 id，用 Task 工具跟进（看输出/等结束/停掉）",
 			},
 		},
 		"required": []string{"intent", "command"},
@@ -149,6 +157,7 @@ type BashArgs struct {
 	Command        string `json:"command"`
 	Workdir        string `json:"workdir"`
 	TimeoutSeconds int    `json:"timeout_seconds"`
+	Background     bool   `json:"background"`
 }
 
 // Preview 是"编辑需授权"模式下给用户看的一句话摘要：要跑的命令原样摊开，
@@ -171,6 +180,12 @@ func (t BashTool) Preview(rawArgs json.RawMessage) domain.ApprovalRequest {
 	if wd := strings.TrimSpace(args.Workdir); wd != "" {
 		detail = append(detail, "目录 "+wd)
 	}
+	if args.Background {
+		detail = append(detail, "后台运行")
+	}
+	if args.TimeoutSeconds > 0 {
+		detail = append(detail, "超时 "+shortDuration(bashTimeout(args.TimeoutSeconds)))
+	}
 	req.Detail = strings.Join(detail, " · ")
 	return req
 }
@@ -187,25 +202,20 @@ func (t BashTool) Execute(ctx context.Context, rawArgs json.RawMessage) (string,
 	if strings.TrimSpace(args.Command) == "" {
 		return "", fmt.Errorf("command 不能为空")
 	}
-
-	timeout := defaultBashTimeout
-	if args.TimeoutSeconds > 0 {
-		timeout = time.Duration(args.TimeoutSeconds) * time.Second
-		if timeout > maxBashTimeout {
-			timeout = maxBashTimeout
-		}
+	if err := checkWorkdir(args.Workdir); err != nil {
+		return "", err
 	}
+	timeout := bashTimeout(args.TimeoutSeconds)
 
-	// 先把工作目录的问题报清楚，别让 shell 启动失败的信息糊成一团
-	workdir := strings.TrimSpace(args.Workdir)
-	if workdir != "" {
-		info, err := os.Stat(workdir)
+	// 后台任务不跟着这一轮走：这一轮结束或用户按 Ctrl+C 都不该把它带走，
+	// 要停就明确用 Task action=stop
+	if args.Background {
+		task, err := startBackgroundTask(args, timeout)
 		if err != nil {
-			return "", fmt.Errorf("工作目录不可用 %s: %w", workdir, err)
+			return "", err
 		}
-		if !info.IsDir() {
-			return "", fmt.Errorf("工作目录 %s 不是目录", workdir)
-		}
+		return fmt.Sprintf("已在后台启动 %s（%s，超时 %s）\n命令: %s\n用 Task action=output/wait/stop 跟进，task_id=%s",
+			task.ID, describeWorkdir(task.Workdir), shortDuration(timeout), firstLine(task.Command), task.ID), nil
 	}
 
 	// 已经中断了就别启动子进程；没中断时把 ctx 当成父级，
@@ -217,39 +227,22 @@ func (t BashTool) Execute(ctx context.Context, rawArgs json.RawMessage) (string,
 	runCtx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
-	// 命令作为独立参数传给 shell，避免 cmd 再做一次引号解析
 	sh := activeShell()
-	command := args.Command
-	if sh.UTF8Prefix != "" {
-		command = sh.UTF8Prefix + command
+	cmd, err := shellCommand(runCtx, args)
+	if err != nil {
+		return "", err
 	}
-	shArgs := append(append([]string{}, sh.Args...), command)
-	cmd := exec.CommandContext(runCtx, sh.Path, shArgs...)
-	// 超时或用户中断时除了子进程本身，还要把它拉起来的进程一起收拾，
-	// 否则 Windows 上 npm / go test 这类会留下孤儿进程继续跑
-	cmd.Cancel = func() error {
-		killTree(cmd.Process)
-		return nil
-	}
-	if workdir != "" {
-		cmd.Dir = workdir
-	}
-	// 不接 stdin，防止交互式命令一直等输入
-	cmd.Stdin = nil
-	// 关掉分页器、强制 git 非交互
-	cmd.Env = append(os.Environ(),
-		"GIT_PAGER=cat", "PAGER=cat", "TERM=dumb", "GIT_TERMINAL_PROMPT=0", "NO_COLOR=1",
-	)
 
 	out := newOutputBuffer(maxBashOutput)
 	cmd.Stdout = out
 	cmd.Stderr = out // 同一个 Writer，exec 内部会串行写，安全
 
-	err := cmd.Run()
+	err = cmd.Run()
 
 	switch {
 	case errors.Is(runCtx.Err(), context.DeadlineExceeded):
-		return fmt.Sprintf("命令超时（%s），已终止\nshell: %s\nexit_code: -1\n%s", timeout, sh.Name, orNoOutput(out.String())), nil
+		return fmt.Sprintf("命令超时（%s），已终止；慢命令可以调大 timeout_seconds（最长 %s），或者改用 background=true\nshell: %s\nexit_code: -1\n%s",
+			shortDuration(timeout), shortDuration(maxBashTimeout), sh.Name, orNoOutput(out.String())), nil
 	case runCtx.Err() != nil:
 		// 父 Context 被取消：用户按了 Ctrl+C，进程树已经在 Cancel 里杀掉了
 		return fmt.Sprintf("命令被中断，已终止\nshell: %s\nexit_code: -1\n%s", sh.Name, orNoOutput(out.String())), nil
@@ -265,6 +258,102 @@ func (t BashTool) Execute(ctx context.Context, rawArgs json.RawMessage) (string,
 		}
 	}
 	return fmt.Sprintf("exit_code: %d\n%s", exitCode, orNoOutput(out.String())), nil
+}
+
+// bashTimeout 把模型给的秒数换成实际超时：没给或给的不对用默认值，超上限的夹到上限
+func bashTimeout(seconds int) time.Duration {
+	if seconds <= 0 {
+		return defaultBashTimeout
+	}
+	timeout := time.Duration(seconds) * time.Second
+	if timeout > maxBashTimeout {
+		timeout = maxBashTimeout
+	}
+	return timeout
+}
+
+// checkWorkdir 先把工作目录的问题报清楚，别让 shell 启动失败的信息糊成一团
+func checkWorkdir(workdir string) error {
+	workdir = strings.TrimSpace(workdir)
+	if workdir == "" {
+		return nil
+	}
+	info, err := os.Stat(workdir)
+	if err != nil {
+		return fmt.Errorf("工作目录不可用 %s: %w", workdir, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("工作目录 %s 不是目录", workdir)
+	}
+	return nil
+}
+
+// shellCommand 组装一次 shell 调用：命令、环境、工作目录都在这儿统一处理。
+// 超时或用户中断时除了子进程本身，还要把它拉起来的进程一起收拾，
+// 否则 Windows 上 npm / go test 这类会留下孤儿进程继续跑。
+func shellCommand(ctx context.Context, args BashArgs) (*exec.Cmd, error) {
+	// 命令作为独立参数传给 shell，避免 cmd 再做一次引号解析
+	sh := activeShell()
+	command := args.Command
+	if sh.UTF8Prefix != "" {
+		command = sh.UTF8Prefix + command
+	}
+	shArgs := append(append([]string{}, sh.Args...), command)
+	cmd := exec.CommandContext(ctx, sh.Path, shArgs...)
+	cmd.Cancel = func() error {
+		killTree(cmd.Process)
+		return nil
+	}
+	if workdir := strings.TrimSpace(args.Workdir); workdir != "" {
+		cmd.Dir = workdir
+	}
+	// 不接 stdin，防止交互式命令一直等输入
+	cmd.Stdin = nil
+	// 关掉分页器、强制 git 非交互
+	cmd.Env = append(os.Environ(),
+		"GIT_PAGER=cat", "PAGER=cat", "TERM=dumb", "GIT_TERMINAL_PROMPT=0", "NO_COLOR=1",
+	)
+	return cmd, nil
+}
+
+// shortDuration 把时长写成给人看的样子，工具描述和结果里都用它
+func shortDuration(d time.Duration) string {
+	switch {
+	case d < time.Second:
+		if d <= 0 {
+			return "0 秒"
+		}
+		if ms := d.Milliseconds(); ms > 0 {
+			return fmt.Sprintf("%d ms", ms)
+		}
+		return "<1 ms"
+	case d >= time.Minute && d%time.Minute == 0:
+		return fmt.Sprintf("%d 分钟", int(d.Minutes()))
+	case d > time.Minute:
+		return fmt.Sprintf("%d 分 %d 秒", int(d.Minutes()), int(d.Seconds())%60)
+	default:
+		if d%time.Second == 0 {
+			return fmt.Sprintf("%d 秒", int(d.Seconds()))
+		}
+		return fmt.Sprintf("%.1f 秒", d.Seconds())
+	}
+}
+
+// firstLine 取文本的第一行，用在任务摘要里
+func firstLine(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	return truncateGrepLine(s, maxGrepDisplayBytes)
+}
+
+// describeWorkdir 在工作目录摘要里区分"用了哪个目录"和"沿用当前目录"
+func describeWorkdir(workdir string) string {
+	if wd := strings.TrimSpace(workdir); wd != "" {
+		return "目录 " + wd
+	}
+	return "当前目录"
 }
 
 // killTree 把子进程一起干掉，否则 Windows 上 npm / go test 这类会留下孤儿进程。
@@ -288,7 +377,9 @@ func orNoOutput(s string) string {
 
 // outputBuffer 限制累计输出，超过上限时保留开头和结尾，中间只计数。
 // 这样既不会把内存打爆（yes、大日志），又不会丢掉最有用的末尾报错。
+// 后台任务里子进程写、模型来读是并发的，所以自带一把锁。
 type outputBuffer struct {
+	mu      sync.Mutex
 	head    []byte
 	tail    []byte
 	headMax int
@@ -304,6 +395,8 @@ func newOutputBuffer(max int) *outputBuffer {
 }
 
 func (o *outputBuffer) Write(p []byte) (int, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	n := len(p)
 	o.total += n
 	if len(o.head) < o.headMax {
@@ -324,6 +417,8 @@ func (o *outputBuffer) Write(p []byte) (int, error) {
 }
 
 func (o *outputBuffer) String() string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	if o.total <= o.headMax+o.tailMax {
 		return decodeOutput(o.head) + decodeOutput(o.tail)
 	}

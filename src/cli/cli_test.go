@@ -463,6 +463,15 @@ func TestBashCallLines(t *testing.T) {
 	if _, ok := bashCallLines(domain.ToolCall{Name: "Bash", Arguments: `not json`}); ok {
 		t.Fatal("坏参数应该退回摘要")
 	}
+
+	// 后台命令不会等结果，标题上要标出来
+	lines, _ = bashCallLines(domain.ToolCall{
+		Name:      "Bash",
+		Arguments: `{"intent":"起个 dev server","command":"npm run dev","background":true}`,
+	})
+	if !strings.Contains(stripANSI(lines[0]), "后台") {
+		t.Fatalf("后台调用要标出来: %q", lines[0])
+	}
 }
 
 // 上下文占用贴在输入框上方：总数照抄响应里的 usage，三项分项显示占比，

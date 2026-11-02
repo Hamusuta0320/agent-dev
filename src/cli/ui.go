@@ -746,6 +746,10 @@ func bashCallLines(call domain.ToolCall) ([]string, bool) {
 	if intent := strings.TrimSpace(args.Intent); intent != "" {
 		title += hintStyle.Render("  " + intent)
 	}
+	if args.Background {
+		// 后台命令不会等结果，标题上标一下，免得以为是卡住了
+		title += hintStyle.Render("  · 后台")
+	}
 	out := []string{title}
 	if wd := strings.TrimSpace(args.Workdir); wd != "" {
 		out = append(out, hintStyle.Render("  目录 "+wd))

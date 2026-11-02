@@ -8,6 +8,7 @@ import (
 	"hamusuta/agent-dev/src/config"
 	"hamusuta/agent-dev/src/domain"
 	"hamusuta/agent-dev/src/session"
+	"hamusuta/agent-dev/src/tool"
 	"hamusuta/agent-dev/src/util"
 
 	tea "charm.land/bubbletea/v2"
@@ -32,6 +33,8 @@ func main() {
 		fmt.Fprintln(os.Stderr, "界面启动失败", err)
 		os.Exit(1)
 	}
+	// 退出时把还没跑完的后台任务一起收掉，别留一堆看不见的进程
+	tool.StopAllTasks()
 }
 
 // loadConfig 确保 config.yaml 存在并解析成配置，返回工作目录和配置

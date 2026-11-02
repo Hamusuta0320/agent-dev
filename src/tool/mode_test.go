@@ -11,7 +11,8 @@ import (
 // 只读模式不给会改动磁盘的工具，其它模式全给
 func TestForMode(t *testing.T) {
 	readOnly := ForMode(domain.ModeReadOnly)
-	for _, name := range []string{"Read", "Grep", "Glob"} {
+	// Task 只跟进后台任务、自己不碰磁盘，只读模式下也留着
+	for _, name := range []string{"Read", "Grep", "Glob", "Task"} {
 		if _, ok := readOnly[name]; !ok {
 			t.Fatalf("只读模式应该有 %s: %v", name, names(readOnly))
 		}
@@ -35,7 +36,10 @@ func TestForMode(t *testing.T) {
 
 // 每个工具都要老实交代自己改不改磁盘，授权流程全靠它
 func TestMutatingFlags(t *testing.T) {
-	want := map[string]bool{"Read": false, "Grep": false, "Glob": false, "Write": true, "Edit": true, "Bash": true}
+	want := map[string]bool{
+		"Read": false, "Grep": false, "Glob": false, "Task": false,
+		"Write": true, "Edit": true, "Bash": true,
+	}
 	for name, mutating := range want {
 		tool, ok := Tools[name]
 		if !ok {
@@ -44,6 +48,9 @@ func TestMutatingFlags(t *testing.T) {
 		if got := tool.Mutating(); got != mutating {
 			t.Fatalf("%s 的 Mutating 是 %v，应该是 %v", name, got, mutating)
 		}
+	}
+	if len(Tools) != len(want) {
+		t.Fatalf("有工具没在表里交代清楚，注册了 %v", names(Tools))
 	}
 }
 

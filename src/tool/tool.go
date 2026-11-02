@@ -21,6 +21,7 @@ var editTool EditTool
 var writeTool WriteTool
 var grepTool GrepTool
 var globTool GlobTool
+var taskTool TaskTool
 
 var Tools map[string]domain.Tool = map[string]domain.Tool{
 	readTool.Name():  readTool,
@@ -29,6 +30,7 @@ var Tools map[string]domain.Tool = map[string]domain.Tool{
 	grepTool.Name():  grepTool,
 	globTool.Name():  globTool,
 	bashTool.Name():  bashTool,
+	taskTool.Name():  taskTool,
 }
 
 // ForMode 返回当前工作模式下该交给模型的工具：只读模式把会改动磁盘的
