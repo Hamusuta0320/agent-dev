@@ -19,4 +19,7 @@ type Ctx struct {
 	ContextLimit int
 	// Mode 是工作模式：只读时没有写类工具，编辑需授权时每次写操作都要先问用户
 	Mode Mode
+	// MaxSteps 是一次提问里最多跑多少轮工具调用，用来给模型死循环刹车；
+	// 0 表示用 config.DefaultMaxSteps
+	MaxSteps int
 }

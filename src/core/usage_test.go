@@ -102,6 +102,35 @@ func TestUsageFallsBackToEstimate(t *testing.T) {
 	t.Fatal("没收到上下文占用事件")
 }
 
+// 增量维护的消息估算必须和"把历史整段数一遍"对得上，
+// 否则聊得越久，界面上那个上下文占用就越偏
+func TestUsageTrackerMatchesFullEstimate(t *testing.T) {
+	session := domain.NewSession("/tmp/demo")
+	session.AppendUser("看看代码")
+	specs := []domain.ToolSpec{{Name: "Read", Description: "读文件", Parameters: map[string]any{"type": "object"}}}
+	tracker := newUsageTracker(specs, session)
+
+	call := domain.ToolCall{Id: "call_1", Name: "Read", Arguments: `{"path":"a.go","intent":"读一下"}`}
+	session.AppendAssistant("我先看看", "思考一下", []domain.ToolCall{call})
+	tracker.trackAssistant("我先看看", []domain.ToolCall{call})
+
+	session.AppendToolResult(call, "package a\n")
+	tracker.trackToolResult(call, "package a\n")
+
+	// 既没正文也没工具调用的回答不会发给模型，两边都该跳过
+	session.AppendAssistant("", "", nil)
+	tracker.trackAssistant("", nil)
+
+	if want := estimateMessages(session.History()); tracker.messageTokens != want {
+		t.Fatalf("增量估算是 %d，整段重算是 %d，对不上", tracker.messageTokens, want)
+	}
+
+	// 工具定义只算一次，和当场重算的结果也要一致
+	if want := estimateToolSpecs(specs); tracker.toolTokens != want {
+		t.Fatalf("工具定义估算是 %d，重算是 %d", tracker.toolTokens, want)
+	}
+}
+
 // splitByWeight 要把零头分干净，各份加起来正好是总数
 func TestSplitByWeight(t *testing.T) {
 	cases := []struct {

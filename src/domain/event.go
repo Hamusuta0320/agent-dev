@@ -26,6 +26,9 @@ const (
 	// EventApproval 表示有一项写操作在等用户确认：Run 发出它之后就停在那儿，
 	// 直到 Reply 收到回答（或这一轮被中断）
 	EventApproval
+	// EventRetry 表示连模型失败了、正在重试，Text 是给用户看的说明。
+	// 它只用来告知和展示，不改变 Run 的流程
+	EventRetry
 )
 
 // ToolStatus 是一次工具调用的执行状态
@@ -58,6 +61,7 @@ func (s ToolStatus) Label() string {
 type Event struct {
 	Kind EventKind
 	Step int
+	// Text 是事件带的内容：流式增量、回答全文、工具结果、后台任务的提醒文字
 	Text string
 	Call ToolCall
 	// Status 是工具调用的状态，只有 EventToolCall 和 EventToolResult 会带

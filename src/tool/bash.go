@@ -408,10 +408,17 @@ func (o *outputBuffer) Write(p []byte) (int, error) {
 		p = p[k:]
 	}
 	if len(p) > 0 {
-		o.tail = append(o.tail, p...)
-		if len(o.tail) > o.tailMax {
-			o.tail = o.tail[len(o.tail)-o.tailMax:]
+		// 尾巴只留最后 tailMax 字节。超出时把剩下的往前挪，而不是重新切片：
+		// 写成 o.tail = o.tail[len(o.tail)-o.tailMax:] 的话，底层数组只会越来越靠后，
+		// 之后每次 append 都要重新分配再整段复制一遍，dev server 那种一直刷日志的任务会白烧 CPU
+		if len(p) >= o.tailMax {
+			o.tail = append(o.tail[:0], p[len(p)-o.tailMax:]...)
+			return n, nil
 		}
+		if drop := len(o.tail) + len(p) - o.tailMax; drop > 0 {
+			o.tail = append(o.tail[:0], o.tail[drop:]...)
+		}
+		o.tail = append(o.tail, p...)
 	}
 	return n, nil
 }

@@ -172,6 +172,9 @@ type model struct {
 	reasoning      *strings.Builder
 	answer         *strings.Builder
 	reasoningShown bool
+	// lastAnswer 是上一轮回答的原文：闲着时输入框上方那块槽位拿它的尾巴填上，
+	// 免得空一大片。answer 每轮结束就 Reset 了，所以单独留一份
+	lastAnswer string
 
 	// usage 是最后一次请求的上下文占用（总数来自响应里的 usage），
 	// 贴在输入框上方常驻显示，新一轮开始时清零
@@ -1060,6 +1063,7 @@ func (m model) submit() (tea.Model, tea.Cmd) {
 		return m, m.print(helpText())
 	case cmdNew:
 		m.cur = domain.NewSession(m.workdir)
+		m.lastAnswer = "" // 新会话，槽位里不该还挂着上个会话的回答
 		return m, m.print(bannerStyle.Render("新会话 "+m.cur.Id) +
 			hintStyle.Render("，消息 "+fmt.Sprint(len(m.cur.Messages))+" 条"))
 	case cmdResume:
@@ -1132,6 +1136,8 @@ func (m model) resume(input string) (tea.Model, tea.Cmd) {
 		next.Id = id
 	}
 	m.cur = next
+	// 换会话了，旧回答的尾巴不该还挂在槽位里
+	m.lastAnswer = ""
 	out := bannerStyle.Render("已恢复会话 "+next.Id) +
 		hintStyle.Render(fmt.Sprintf("，共 %d 条消息，目录 %s", len(next.Messages), m.store.Dir))
 	// 别的目录里开的会话也照样能接着聊，只是工具仍按当前目录跑，提一句免得误会
@@ -1227,6 +1233,7 @@ func (m model) startRun(prompt string) (tea.Model, tea.Cmd) {
 	cur, store, workdir := m.cur, m.store, m.workdir
 	limit := m.contextLimit
 	mode := m.mode
+	maxSteps := m.cfg.Steps()
 
 	go func() {
 		defer close(r.ch)
@@ -1240,6 +1247,7 @@ func (m model) startRun(prompt string) (tea.Model, tea.Cmd) {
 			Session:      cur,
 			ContextLimit: limit,
 			Mode:         mode,
+			MaxSteps:     maxSteps,
 			// 被中断之后界面可能已经不再读这个 channel 了，
 			// 所以发事件也要认 ctx，不然这一轮会卡在发送上收不了尾
 			Emit: func(ev domain.Event) {
@@ -1305,6 +1313,12 @@ func (m model) handleEvent(ev domain.Event) (tea.Model, tea.Cmd) {
 		m.answer.WriteString(ev.Text)
 		m.status = "回答中…"
 
+	// 连模型失败、正在重连：把原因和重试次数打进历史区，
+	// 否则界面只会停在"连接模型…"，分不清是慢还是断了
+	case domain.EventRetry:
+		m.status = "连接失败，正在重试…"
+		out = append(out, errStyle.Render("⚠ "+ev.Text))
+
 	case domain.EventAnswerEnd:
 		if !m.reasoningShown {
 			out = append(out, m.block("思考", thinkStyle, m.reasoning.String(), printReasoningLines)...)
@@ -1313,6 +1327,9 @@ func (m model) handleEvent(ev domain.Event) (tea.Model, tea.Cmd) {
 		answer := m.answer.String()
 		if strings.TrimSpace(answer) == "" {
 			answer = ev.Text // provider 没走流式时用整段兜底
+		}
+		if strings.TrimSpace(answer) != "" {
+			m.lastAnswer = answer
 		}
 		out = append(out, m.block("", answerStyle(), answer, 0)...)
 		m.answer.Reset()
@@ -1349,6 +1366,10 @@ func (m model) finish(err error) (tea.Model, tea.Cmd) {
 		out = append(out, m.block("思考", thinkStyle, m.reasoning.String(), printReasoningLines)...)
 	}
 	out = append(out, m.block("", answerStyle(), m.answer.String(), 0)...)
+	if text := m.answer.String(); strings.TrimSpace(text) != "" {
+		// 打断得早的话 EventAnswerEnd 还没来过，这里补记一份给空闲槽位用
+		m.lastAnswer = text
+	}
 
 	// 工具跑到一半被打断，调用那几行还没打进历史区，补上并标成未完成
 	if len(m.pending) > 0 {
@@ -1456,17 +1477,7 @@ func tasksLine(snapshots []tool.TaskSnapshot) string {
 
 	items := []string{head}
 	// 运行中的排前面，任务多的时候被"还有 N 个"折叠掉的总是已经结束的那些
-	ordered := make([]tool.TaskSnapshot, 0, len(snapshots))
-	for _, s := range snapshots {
-		if s.Running {
-			ordered = append(ordered, s)
-		}
-	}
-	for _, s := range snapshots {
-		if !s.Running {
-			ordered = append(ordered, s)
-		}
-	}
+	ordered := orderTasks(snapshots)
 	shown := ordered
 	if len(shown) > maxTaskChips {
 		shown = shown[:maxTaskChips]
@@ -1487,6 +1498,92 @@ func tasksLine(snapshots []tool.TaskSnapshot) string {
 		items = append(items, hintStyle.Render(fmt.Sprintf("…还有 %d 个", rest)))
 	}
 	return strings.Join(items, hintStyle.Render(" · "))
+}
+
+// orderTasks 把运行中的任务排到前面，任务多的时候被折叠掉的总是已经结束的那些
+func orderTasks(snapshots []tool.TaskSnapshot) []tool.TaskSnapshot {
+	out := make([]tool.TaskSnapshot, 0, len(snapshots))
+	for _, s := range snapshots {
+		if s.Running {
+			out = append(out, s)
+		}
+	}
+	for _, s := range snapshots {
+		if !s.Running {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// taskDetailLines 把后台任务摊成一行一个，带上完整命令——上面那行标签只有 id 和状态，
+// 任务一多就分不清哪个是哪个。放不下的先折叠，再交给 activeView 裁。
+func (m model) taskDetailLines() []string {
+	snapshots := tool.TaskSnapshots()
+	if len(snapshots) == 0 {
+		return nil
+	}
+	ordered := orderTasks(snapshots)
+	out := make([]string, 0, len(ordered))
+	for _, s := range ordered {
+		style := hintStyle
+		mark := "○"
+		if s.Running {
+			style, mark = toolStyle, "●"
+		}
+		line := style.Render(mark+" "+s.ID) + hintStyle.Render(" "+s.Status)
+		if s.Running {
+			line += hintStyle.Render(" " + tool.FormatDuration(s.Elapsed))
+		}
+		if cmd := firstLines(s.Command, 48); cmd != "" {
+			line += hintStyle.Render("  $ " + cmd)
+		}
+		out = append(out, line)
+	}
+	// 槽位只放得下 activeRows 行，多出来的折成一句，别让人以为任务就这几个
+	if len(out) > activeRows {
+		kept := append([]string{}, out[:activeRows-1]...)
+		kept = append(kept, hintStyle.Render(fmt.Sprintf("…还有 %d 个任务", len(out)-(activeRows-1))))
+		out = kept
+	}
+	return out
+}
+
+// lastAnswerLines 把上一轮回答的尾巴放进这块槽位：历史区里的回答会越推越高，
+// 想再看一眼刚才说到哪，扫这儿最快。用暗色，跟真正的回答区分开。
+func (m model) lastAnswerLines() []string {
+	text := strings.TrimSpace(m.lastAnswer)
+	if text == "" {
+		return nil
+	}
+	lines := strings.Split(text, "\n")
+	// 先折行再取尾巴，免得一条超长行折出来把槽位撑破
+	if limit := m.width - 3; limit > 0 {
+		wrapped := make([]string, 0, len(lines))
+		for _, line := range lines {
+			wrapped = append(wrapped, strings.Split(
+				ansi.Wrap(strings.TrimRight(line, "\r"), limit, ""), "\n")...)
+		}
+		lines = wrapped
+	}
+	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
+		lines = lines[:len(lines)-1]
+	}
+	if len(lines) == 0 {
+		return nil
+	}
+
+	title := "上一轮回答"
+	if body := activeRows - 1; len(lines) > body {
+		lines = lines[len(lines)-body:]
+		title = "上一轮回答（结尾）"
+	}
+	out := make([]string, 0, len(lines)+1)
+	out = append(out, hintStyle.Render(title))
+	for _, line := range lines {
+		out = append(out, hintStyle.Render("  "+line))
+	}
+	return out
 }
 
 func (m model) View() tea.View {
@@ -1539,12 +1636,25 @@ func (m model) View() tea.View {
 }
 
 // activeLines 是输入框上方那块会变的内容：跑任务时是状态、工具调用和预览尾巴，
-// 闲着时是补全候选。行数不定，由 activeView 整理成固定行数。
+// 闲着时是补全候选或别的常驻信息。行数不定，由 activeView 整理成固定行数。
 func (m model) activeLines() []string {
-	if m.state != stateRunning {
-		return m.completionLines()
+	if m.state == stateRunning {
+		return strings.Split(m.runningView(), "\n")
 	}
-	return strings.Split(m.runningView(), "\n")
+	return m.idleLines()
+}
+
+// idleLines 是闲着时这块槽位放什么。这块高度恒定（见 activeRows）却又不能空着，
+// 就按"最有用"的顺序挑一样填：补全候选最要紧，其次是把后台任务摊开看，
+// 都没有就把上一轮回答的尾巴挂着，随时能瞄一眼刚才说到哪。
+func (m model) idleLines() []string {
+	if lines := m.completionLines(); len(lines) > 0 {
+		return lines
+	}
+	if lines := m.taskDetailLines(); len(lines) > 0 {
+		return lines
+	}
+	return m.lastAnswerLines()
 }
 
 // activeView 把这块内容整理成固定的 activeRows 行，始终贴着输入框：

@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hamusuta/agent-dev/src/config"
 	"hamusuta/agent-dev/src/domain"
 	"hamusuta/agent-dev/src/tool"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -23,8 +25,10 @@ func Loop(ctx domain.Ctx) error {
 	return err
 }
 
+// buildSpecs 把工具整理成发给模型的定义。顺序按名字排好：Go 的 map 遍历是随机的，
+// 而请求体前缀每次都一样才能命中接口侧的上下文缓存，顺序一乱命中率就掉了
 func buildSpecs(tools map[string]domain.Tool) []domain.ToolSpec {
-	toolSpecs := []domain.ToolSpec{}
+	toolSpecs := make([]domain.ToolSpec, 0, len(tools))
 	for _, tool := range tools {
 		toolSpecs = append(toolSpecs, domain.ToolSpec{
 			Name:        tool.Name(),
@@ -32,6 +36,7 @@ func buildSpecs(tools map[string]domain.Tool) []domain.ToolSpec {
 			Parameters:  tool.Schema(),
 		})
 	}
+	sort.Slice(toolSpecs, func(i, j int) bool { return toolSpecs[i].Name < toolSpecs[j].Name })
 	return toolSpecs
 }
 
@@ -39,8 +44,14 @@ func buildSpecs(tools map[string]domain.Tool) []domain.ToolSpec {
 // 每一轮都按 session 重新拼 messages，所以会话历史就是上下文。
 // 过程进度通过 ctx.Emit 上报，没设置时走默认的控制台打印。
 func Run(ctx domain.Ctx, session *domain.Session) (string, error) {
-	const maxSteps = 1200
+	maxSteps := ctx.MaxSteps
+	if maxSteps <= 0 {
+		maxSteps = config.DefaultMaxSteps
+	}
 	specs := buildSpecs(ctx.Tools)
+	// 上下文占用的估算：工具定义整轮不变只算一次，对话消息每追加一条累加一条，
+	// 不用每次请求都把整段历史从头数一遍
+	usage := newUsageTracker(specs, session)
 	emit := ctx.Emit
 	if emit == nil {
 		emit = consoleEmit()
@@ -57,8 +68,12 @@ func Run(ctx domain.Ctx, session *domain.Session) (string, error) {
 		emit(domain.Event{Kind: domain.EventStep, Step: step + 1})
 		onDelta := func(ev domain.StreamEvent) {
 			kind := domain.EventContent
-			if ev.Kind == domain.StreamReasoning {
+			switch ev.Kind {
+			case domain.StreamReasoning:
 				kind = domain.EventReasoning
+			case domain.StreamRetry:
+				// provider 在重连，把原因和次数如实报给界面
+				kind = domain.EventRetry
 			}
 			emit(domain.Event{Kind: kind, Text: ev.Text})
 		}
@@ -71,10 +86,11 @@ func Run(ctx domain.Ctx, session *domain.Session) (string, error) {
 		emit(domain.Event{
 			Kind:  domain.EventUsage,
 			Step:  step + 1,
-			Usage: newContextUsage(messages[0].Content, messages[1:], specs, res.Usage, ctx.ContextLimit),
+			Usage: newContextUsage(messages[0].Content, usage.toolTokens, usage.messageTokens, res.Usage, ctx.ContextLimit),
 		})
 		emit(domain.Event{Kind: domain.EventAnswerEnd, Step: step + 1, Text: res.Content})
 		session.AppendAssistant(res.Content, res.Reasoning, res.ToolCalls)
+		usage.trackAssistant(res.Content, res.ToolCalls)
 		if len(res.ToolCalls) == 0 {
 			return res.Content, nil
 		}
@@ -116,6 +132,7 @@ func Run(ctx domain.Ctx, session *domain.Session) (string, error) {
 					Elapsed:   outcomes[k].elapsed,
 				})
 				session.AppendToolResult(call, outcomes[k].out)
+				usage.trackToolResult(call, outcomes[k].out)
 			}
 			i += len(batch)
 
@@ -124,6 +141,7 @@ func Run(ctx domain.Ctx, session *domain.Session) (string, error) {
 			if err := cancelErr(ctx.Context); err != nil {
 				for _, rest := range res.ToolCalls[i:] {
 					session.AppendToolResult(rest, "错误: "+interruptedReason)
+					usage.trackToolResult(rest, "错误: "+interruptedReason)
 				}
 				return "", err
 			}
@@ -320,6 +338,13 @@ func ConsoleEmit(in io.Reader, out io.Writer) domain.EmitFunc {
 			}
 			fmt.Fprint(out, ev.Text)
 			midLine = true
+		// 连模型失败、正在重试：控制台这边也得说一声，否则用户只看到界面卡住
+		case domain.EventRetry:
+			if midLine {
+				fmt.Fprintln(out)
+				midLine = false
+			}
+			fmt.Fprintf(out, "[重试] %s\n", ev.Text)
 		// 流式输出不带换行，这一轮结束要收个尾，否则下一轮的标题会粘在后面
 		case domain.EventAnswerEnd:
 			if midLine {

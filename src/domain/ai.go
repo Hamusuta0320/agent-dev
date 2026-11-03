@@ -57,6 +57,10 @@ type StreamEventKind int
 const (
 	StreamContent StreamEventKind = iota
 	StreamReasoning
+	// StreamRetry 表示这次请求失败了、正在重试，Text 是给用户看的说明。
+	// provider 只在这一轮还没吐出任何内容时才重试（已经出过字就没法撤回了），
+	// 所以收到它的一方不用清空什么
+	StreamRetry
 )
 
 type StreamEvent struct {

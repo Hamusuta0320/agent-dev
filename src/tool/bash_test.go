@@ -159,6 +159,37 @@ func TestOutputBufferKeepsHeadAndTail(t *testing.T) {
 	}
 }
 
+// 分很多小段写入时（一直刷日志的后台任务就是这样），尾巴要始终是最后 tailMax 字节，
+// 而且不能越写越占内存
+func TestOutputBufferManyWritesKeepsLastBytes(t *testing.T) {
+	const size = 16
+	buf := newOutputBuffer(size)
+	// 每段 3 字节，写 100 段，内容是一串递增的字母方便核对位置
+	var all strings.Builder
+	for i := 0; i < 100; i++ {
+		chunk := string(rune('a' + i%26))
+		chunk = strings.Repeat(chunk, 3)
+		all.WriteString(chunk)
+		if _, err := buf.Write([]byte(chunk)); err != nil {
+			t.Fatalf("写入失败: %v", err)
+		}
+	}
+
+	out := buf.String()
+	want := all.String()
+	tail := want[len(want)-size/2:]
+	if !strings.HasSuffix(out, tail) {
+		t.Fatalf("结尾应该是最后 %d 字节 %q，实际 %q", size/2, tail, out)
+	}
+	if !strings.HasPrefix(out, want[:size/2]) {
+		t.Fatalf("开头应该是前 %d 字节 %q，实际 %q", size/2, want[:size/2], out)
+	}
+	// 尾巴的底层数组不该随写入次数一直长下去
+	if cap(buf.tail) > size {
+		t.Fatalf("尾巴缓冲的容量 %d 不该超过上限 %d", cap(buf.tail), size)
+	}
+}
+
 func TestOutputBufferSmallOutputVerbatim(t *testing.T) {
 	buf := newOutputBuffer(64)
 	if _, err := buf.Write([]byte("hello\n")); err != nil {

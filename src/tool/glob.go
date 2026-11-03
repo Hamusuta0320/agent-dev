@@ -257,12 +257,33 @@ func parseGlobPattern(raw string) (pattern string, segs []string, deep bool, err
 // globMatchSegments 按 / 分段匹配通配符，** 匹配零到任意多段。
 // 不用 filepath.Match：它不支持 **，而且在 Windows 上把 \ 当分隔符。
 func globMatchSegments(pat, name []string) bool {
+	// 只有一层 ** 时朴素递归最多线性回溯；有两层以上才会指数爆炸
+	//（**/**/**/x 这种），那时才换上记忆化
+	if countRecursiveSegs(pat) < 2 {
+		return globMatchSimple(pat, name)
+	}
+	return globMatchMemo(pat, name)
+}
+
+// countRecursiveSegs 数 pattern 里有几段 **
+func countRecursiveSegs(pat []string) int {
+	n := 0
+	for _, seg := range pat {
+		if seg == globRecursiveSeg {
+			n++
+		}
+	}
+	return n
+}
+
+// globMatchSimple 是一次到位的递归匹配
+func globMatchSimple(pat, name []string) bool {
 	if len(pat) == 0 {
 		return len(name) == 0
 	}
 	if pat[0] == globRecursiveSeg {
 		for i := 0; i <= len(name); i++ {
-			if globMatchSegments(pat[1:], name[i:]) {
+			if globMatchSimple(pat[1:], name[i:]) {
 				return true
 			}
 		}
@@ -275,5 +296,39 @@ func globMatchSegments(pat, name []string) bool {
 	if err != nil || !ok {
 		return false
 	}
-	return globMatchSegments(pat[1:], name[1:])
+	return globMatchSimple(pat[1:], name[1:])
+}
+
+// globMatchMemo 是同一个匹配加上记忆化：** 的分支会重复走到同样的
+// （pattern 段下标, 名字段下标）组合，算过一遍就不再算
+func globMatchMemo(pat, name []string) bool {
+	type state struct{ pat, name int }
+	memo := make(map[state]bool, (len(pat)+1)*(len(name)+1))
+
+	var match func(p, n int) bool
+	match = func(p, n int) bool {
+		k := state{pat: p, name: n}
+		if v, ok := memo[k]; ok {
+			return v
+		}
+		result := false
+		switch {
+		case p == len(pat):
+			result = n == len(name)
+		case pat[p] == globRecursiveSeg:
+			for i := n; i <= len(name); i++ {
+				if match(p+1, i) {
+					result = true
+					break
+				}
+			}
+		case n < len(name):
+			if ok, err := path.Match(pat[p], name[n]); err == nil && ok {
+				result = match(p+1, n+1)
+			}
+		}
+		memo[k] = result
+		return result
+	}
+	return match(0, 0)
 }

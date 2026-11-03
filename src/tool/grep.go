@@ -312,18 +312,21 @@ func grepInFile(file string, re *regexp.Regexp, max, ctxLines int) ([]grepMatch,
 	if max <= 0 {
 		return nil, grepFileOK, false
 	}
-	info, err := os.Stat(file)
+	// 先开文件再 f.Stat()：WalkDir 给的 DirEntry 在 Windows 上不缓存文件信息，
+	// 之前那次 os.Stat 只是为了拿大小，白多一次系统调用；大小从已打开的文件句柄问就行
+	f, err := os.Open(file)
+	if err != nil {
+		return nil, grepFileUnreadable, false
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
 	if err != nil || !info.Mode().IsRegular() {
 		return nil, grepFileUnreadable, false
 	}
 	if info.Size() > maxGrepFileBytes {
 		return nil, grepFileTooLarge, false
 	}
-	f, err := os.Open(file)
-	if err != nil {
-		return nil, grepFileUnreadable, false
-	}
-	defer f.Close()
 
 	head := make([]byte, grepBinarySniff)
 	n, _ := io.ReadFull(f, head)

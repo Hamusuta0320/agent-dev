@@ -212,6 +212,12 @@ func TestGlobMatchSegments(t *testing.T) {
 		{"*", "a", true},
 		{"a?c", "abc", true},
 		{"[ab].go", "b.go", true},
+		// 多层 ** 走的是记忆化那条路，结果得和无记忆化时一样
+		{"**/**/a.go", "x/y/a.go", true},
+		{"**/**/a.go", "a.go", true},
+		{"**/**/a.go", "x/y/b.go", false},
+		{"src/**/**/*.go", "src/a/b/c.go", true},
+		{"src/**/**/*.go", "lib/a/b/c.go", false},
 	}
 	for _, c := range cases {
 		got := globMatchSegments(strings.Split(c.pattern, "/"), strings.Split(c.name, "/"))

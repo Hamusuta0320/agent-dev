@@ -984,6 +984,43 @@ func TestActiveViewKeepsHeight(t *testing.T) {
 	}
 }
 
+// 闲着时这块不能空着：上一轮回答的尾巴挂在这儿，高度还是恒定的
+func TestIdleSlotShowsLastAnswer(t *testing.T) {
+	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+	m.width, m.height = 80, 30
+
+	if got := m.activeLines(); len(got) != 0 {
+		t.Fatalf("还没回答过时这块该是空的，实际 %d 行", len(got))
+	}
+
+	m.lastAnswer = "第一行\n" + strings.Repeat("中间这段会被挤掉\n", 20) + "最后一行"
+	if got := strings.Count(m.activeView(), "\n") + 1; got != activeRows {
+		t.Fatalf("这块应该恒定 %d 行，实际 %d 行", activeRows, got)
+	}
+	view := stripANSI(m.activeView())
+	if !strings.Contains(view, "上一轮回答（结尾）") {
+		t.Fatalf("放不下时该说明只显示了结尾:\n%s", view)
+	}
+	if !strings.Contains(view, "最后一行") {
+		t.Fatalf("应该留着回答的尾巴:\n%s", view)
+	}
+	if strings.Contains(view, "第一行") {
+		t.Fatalf("开头那几行应该被挤掉:\n%s", view)
+	}
+
+	// 输入 / 之后补全候选优先，别让回答尾巴占着位置
+	m.input.SetValue("/")
+	if view := stripANSI(m.activeView()); strings.Contains(view, "上一轮回答") {
+		t.Fatalf("有补全候选时不该再显示回答尾巴:\n%s", view)
+	}
+	// 超长的一行要折好，不能把槽位撑破
+	m.input.SetValue("")
+	m.lastAnswer = strings.Repeat("很长的一句话", 40)
+	if got := strings.Count(m.activeView(), "\n") + 1; got != activeRows {
+		t.Fatalf("长行折行后这块还是 %d 行，实际 %d 行", activeRows, got)
+	}
+}
+
 // 开场白要把输入框顶到屏幕底部：开场白 + 界面 + 空行正好铺满一屏
 func TestStartupTextFillsScreen(t *testing.T) {
 	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
@@ -1067,6 +1104,13 @@ func TestTasksLineInView(t *testing.T) {
 	}
 	if view := stripANSI(m.View().Content); !strings.Contains(view, "后台任务") {
 		t.Fatalf("界面里没显示后台任务:\n%s", view)
+	}
+	// 闲着时上方槽位把任务摊开，带上命令，就不空着也不至于认不出是哪个任务
+	if view := stripANSI(m.activeView()); !strings.Contains(view, "echo hi") {
+		t.Fatalf("闲时槽位里该能看到任务的命令:\n%s", view)
+	}
+	if got := strings.Count(m.activeView(), "\n") + 1; got != activeRows {
+		t.Fatalf("有任务时这块也该恒定 %d 行，实际 %d 行", activeRows, got)
 	}
 }
 
