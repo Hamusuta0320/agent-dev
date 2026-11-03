@@ -584,11 +584,12 @@ func TestEveryToolHasIntent(t *testing.T) {
 	}
 }
 
-// 上下文占用贴在输入框上方：总数照抄响应里的 usage，三项分项显示占比，
+// 上下文占用贴在输入框下面：总数照抄响应里的 usage，三项分项显示占比，
 // 配了上下文窗口时还要显示上限和已用百分比
 func TestUsageLine(t *testing.T) {
 	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
-	m.width = 80
+	// 给足宽度：这一行放不下时会把尾巴上的分项丢掉，那样就测不到分项了
+	m.width = 200
 	m.state = stateRunning
 
 	// 还没拿到 usage 时不该多出一行
@@ -637,9 +638,30 @@ func TestUsageLine(t *testing.T) {
 		}
 	}
 
-	// 这一行要真的出现在界面里，紧挨着输入框
-	if view := stripANSI(m.View().Content); !strings.Contains(view, "已用 50%") {
+	// 这一行要真的出现在界面里，而且贴着输入框的下边框、在底部提示行上面
+	m.state = stateIdle // 回到闲着的样子，底部提示行就是"Enter 发送 …"
+	view := stripANSI(m.View().Content)
+	if !strings.Contains(view, "已用 50%") {
 		t.Fatalf("界面里没显示上下文占用:\n%s", view)
+	}
+	usageAt, boxAt, hintAt := -1, -1, -1
+	for i, line := range strings.Split(view, "\n") {
+		switch {
+		case strings.Contains(line, "已用 50%"):
+			usageAt = i
+		case strings.Contains(line, "╰"):
+			boxAt = i // 输入框的下边框
+		case strings.Contains(line, "Enter 发送"):
+			hintAt = i
+		}
+	}
+	if boxAt < 0 || usageAt <= boxAt {
+		t.Fatalf("上下文占用应该贴在输入框下面（输入框底边在第 %d 行，占用行在第 %d 行）:\n%s",
+			boxAt, usageAt, view)
+	}
+	if hintAt < 0 || usageAt >= hintAt {
+		t.Fatalf("上下文占用应该在底部提示行上面（占用行在第 %d 行，提示行在第 %d 行）:\n%s",
+			usageAt, hintAt, view)
 	}
 }
 
@@ -989,8 +1011,9 @@ func TestIdleSlotShowsLastAnswer(t *testing.T) {
 	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
 	m.width, m.height = 80, 30
 
-	if got := m.activeLines(); len(got) != 0 {
-		t.Fatalf("还没回答过时这块该是空的，实际 %d 行", len(got))
+	// 还没回答过时这块摆的是提示，不该真的空着
+	if view := stripANSI(m.activeView()); !strings.Contains(view, "/help") {
+		t.Fatalf("还没回答过时该摆提示:\n%s", view)
 	}
 
 	m.lastAnswer = "第一行\n" + strings.Repeat("中间这段会被挤掉\n", 20) + "最后一行"
@@ -1018,6 +1041,35 @@ func TestIdleSlotShowsLastAnswer(t *testing.T) {
 	m.lastAnswer = strings.Repeat("很长的一句话", 40)
 	if got := strings.Count(m.activeView(), "\n") + 1; got != activeRows {
 		t.Fatalf("长行折行后这块还是 %d 行，实际 %d 行", activeRows, got)
+	}
+}
+
+// 槽位没别的东西可放时摆一份提示：常用命令、按键。工具说明不在这儿列
+func TestIdleSlotShowsHints(t *testing.T) {
+	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+	m.width, m.height = 80, 30
+
+	if got := strings.Count(m.activeView(), "\n") + 1; got != activeRows {
+		t.Fatalf("摆提示时这块也该恒定 %d 行，实际 %d 行", activeRows, got)
+	}
+	view := stripANSI(m.activeView())
+	for _, want := range []string{"/help", "/config", "/mode", "Enter 发送", "Ctrl+V 贴图"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("提示里该提到 %q:\n%s", want, view)
+		}
+	}
+
+	// 工具说明不再摆在这块，换模式也不该把工具名列出来
+	m.mode = domain.ModeReadOnly
+	if view := stripANSI(m.activeView()); strings.Contains(view, "Bash") || strings.Contains(view, "读文件") {
+		t.Fatalf("提示里不该再列工具:\n%s", view)
+	}
+
+	// 有上一轮回答时先显示回答，提示让位
+	m.mode = domain.ModeAsk
+	m.lastAnswer = "刚才说到这儿"
+	if view := stripANSI(m.activeView()); strings.Contains(view, "/config") {
+		t.Fatalf("有回答时不该再占位置摆提示:\n%s", view)
 	}
 }
 
@@ -1051,14 +1103,14 @@ func TestStartupTextTinyTerminal(t *testing.T) {
 
 // 后台任务栏：没有任务就不占行，有任务时显示状态和耗时
 func TestTasksLine(t *testing.T) {
-	if line := tasksLine(nil); line != "" {
+	if line := tasksLine(nil, 0); line != "" {
 		t.Fatalf("没有任务时不该有任务栏: %q", line)
 	}
 
 	line := stripANSI(tasksLine([]tool.TaskSnapshot{
 		{ID: "task_1", Status: "运行中", Running: true, Elapsed: 3 * time.Second, Command: "npm run dev"},
 		{ID: "task_2", Status: "已完成", Elapsed: 2 * time.Second, Command: "go build ./..."},
-	}))
+	}, 0))
 	for _, want := range []string{"后台任务", "1 个运行中", "1 个已结束", "task_1 运行中 3 秒", "task_2 已完成"} {
 		if !strings.Contains(line, want) {
 			t.Fatalf("任务栏里少了 %q: %q", want, line)
@@ -1068,7 +1120,7 @@ func TestTasksLine(t *testing.T) {
 	// 全都跑完了就别再说"运行中"
 	line = stripANSI(tasksLine([]tool.TaskSnapshot{
 		{ID: "task_1", Status: "已完成"},
-	}))
+	}, 0))
 	if !strings.Contains(line, "1 个已结束") || strings.Contains(line, "运行中") {
 		t.Fatalf("都结束了不该提运行中: %q", line)
 	}
@@ -1078,9 +1130,17 @@ func TestTasksLine(t *testing.T) {
 	for i := 0; i < maxTaskChips+2; i++ {
 		many = append(many, tool.TaskSnapshot{ID: "task_" + strconv.Itoa(i+1), Status: "已完成"})
 	}
-	line = stripANSI(tasksLine(many))
+	line = stripANSI(tasksLine(many, 0))
 	if !strings.Contains(line, "…还有 2 个") {
 		t.Fatalf("任务多时要收起来: %q", line)
+	}
+
+	// 窄终端里少列几个，绝不能超过给的宽度（折行会把界面高度顶乱）
+	for limit := 20; limit <= 80; limit += 5 {
+		got := tasksLine(many, limit)
+		if w := lipgloss.Width(got); limit >= 30 && w > limit {
+			t.Fatalf("限宽 %d 时任务栏宽 %d，超了: %q", limit, w, stripANSI(got))
+		}
 	}
 }
 
@@ -1106,11 +1166,70 @@ func TestTasksLineInView(t *testing.T) {
 		t.Fatalf("界面里没显示后台任务:\n%s", view)
 	}
 	// 闲着时上方槽位把任务摊开，带上命令，就不空着也不至于认不出是哪个任务
-	if view := stripANSI(m.activeView()); !strings.Contains(view, "echo hi") {
-		t.Fatalf("闲时槽位里该能看到任务的命令:\n%s", view)
+	idleView := stripANSI(m.activeView())
+	if !strings.Contains(idleView, "echo hi") {
+		t.Fatalf("闲时槽位里该能看到任务的命令:\n%s", idleView)
+	}
+	// 每个任务都带上状态和时长：跑着的看已跑多久，结束的看总耗时
+	if !strings.Contains(idleView, "task_1") ||
+		(!strings.Contains(idleView, "已跑") && !strings.Contains(idleView, "耗时")) {
+		t.Fatalf("闲时槽位里该有任务 id 和时长:\n%s", idleView)
 	}
 	if got := strings.Count(m.activeView(), "\n") + 1; got != activeRows {
 		t.Fatalf("有任务时这块也该恒定 %d 行，实际 %d 行", activeRows, got)
+	}
+}
+
+// 界面高度必须恒定：上下文占用、后台任务栏有内容没内容都占同一行。
+// 行数一变，Bubble Tea 的 inline 渲染就会错位，屏幕上留着上一帧的残影
+func TestViewHeightStable(t *testing.T) {
+	t.Cleanup(tool.StopAllTasks)
+
+	// 窄终端也跑一遍：这一行放不下时只能裁内容，不能折成两行
+	for _, width := range []int{50, 80, 100} {
+		m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+		m.width, m.height = width, 30
+		want := m.viewLines()
+
+		check := func(what string) {
+			t.Helper()
+			if got := m.viewLines(); got != want {
+				t.Fatalf("宽 %d %s：界面该还是 %d 行，实际 %d 行", width, what, want, got)
+			}
+			for i, line := range strings.Split(m.View().Content, "\n") {
+				if w := lipgloss.Width(line); w >= m.width {
+					t.Fatalf("宽 %d %s：第 %d 行宽 %d，超过终端宽度（终端会自己折行，界面从此错位）: %q",
+						width, what, i, w, stripANSI(line))
+				}
+			}
+		}
+
+		check("刚打开")
+
+		// 加上上下文占用：仍然一行，放不下就裁分项
+		m.usage = domain.ContextUsage{
+			PromptTokens: 45000, ContextLimit: 1_000_000,
+			SystemTokens: 8700, ToolTokens: 2600, MessageTokens: 25000,
+			CompletionTokens: 364,
+		}
+		check("有上下文占用")
+
+		// 起个后台任务：任务栏冒出来，行数还是不变
+		if _, err := (tool.BashTool{}).Execute(nil, []byte(`{"command":"echo hi","background":true}`)); err != nil {
+			t.Fatalf("起后台任务失败: %v", err)
+		}
+		check("有后台任务")
+
+		// 跑任务时也一样：长命令、长状态都不能把某一行顶出终端
+		m.state = stateRunning
+		m.status = "等待模型响应（这一轮挺长的，得看看会不会把状态行顶出去）"
+		m.pending = []pendingCall{{
+			id:    "1",
+			lines: m.toolCallLines(domain.ToolCall{Name: "Bash", Arguments: `{"intent":"跑一个很长的命令看看行宽","command":"` + strings.Repeat("a", 200) + `"}`}),
+		}}
+		check("跑任务")
+
+		tool.StopAllTasks()
 	}
 }
 

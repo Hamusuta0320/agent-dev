@@ -180,7 +180,7 @@ type model struct {
 	attachments []imageAttachment
 
 	// usage 是最后一次请求的上下文占用（总数来自响应里的 usage），
-	// 贴在输入框上方常驻显示，新一轮开始时清零
+	// 贴在输入框下面常驻显示，新一轮开始时清零
 	usage domain.ContextUsage
 	// contextLimit 是配置里的上下文窗口大小，用来算已用百分比
 	contextLimit int
@@ -1140,7 +1140,7 @@ func (m *model) takeAttachments() []domain.Image {
 }
 
 // attachmentsLine 是输入框上方那行"这条提问带了哪些图"：贴进来就看得见，
-// 发送、Esc 或者切会话之后消失
+// 发送、Esc 或者切会话之后消失。宽度不够时舍掉尾巴上的细节，保证只占一行。
 func (m model) attachmentsLine() string {
 	if len(m.attachments) == 0 {
 		return ""
@@ -1149,8 +1149,8 @@ func (m model) attachmentsLine() string {
 	for _, a := range m.attachments {
 		items = append(items, hintStyle.Render(fmt.Sprintf("%s %s", sizeText(int64(a.img.Size())), a.img.Kind())))
 	}
-	items = append(items, hintStyle.Render("· Esc 清空 · Enter 发送"))
-	return strings.Join(items, hintStyle.Render(" · "))
+	items = append(items, hintStyle.Render("Esc 清空 · Enter 发送"))
+	return fitItems(items, m.width-4)
 }
 
 // imagePrompt 是只贴了图片、一个字没写时替用户说的话：请求里总得有一段文字，
@@ -1536,10 +1536,12 @@ func (m model) finish(err error) (tea.Model, tea.Cmd) {
 	return m, tea.Sequence(cmds...)
 }
 
-// usageLine 是输入框上方常驻的上下文占用：总数来自上一轮响应的 usage，
+// usageLine 是输入框下面常驻的上下文占用（紧贴着输入框底边）：总数来自上一轮响应的 usage，
 // 系统提示词/工具定义/对话消息三项是按本地估算的比例拆出来的，
 // 所以显示成百分比，不假装是精确到个位的分项用量。
 // 配了上下文窗口时还会带上"已用 x%"，让人一眼看出还剩多少余量。
+// 这一行恒定只占一行：终端窄就整项丢掉尾巴，绝不折行——折出来的第二行会让界面
+// 高度变来变去，inline 模式下屏幕就会错位、留下上一帧的残影。
 func (m model) usageLine() string {
 	u := m.usage
 	if u.PromptTokens <= 0 {
@@ -1576,17 +1578,38 @@ func (m model) usageLine() string {
 	if u.CompletionTokens > 0 {
 		items = append(items, hintStyle.Render("本轮回复 "+domain.FormatTokens(u.CompletionTokens)))
 	}
-	return strings.Join(items, hintStyle.Render(" · "))
+	return fitItems(items, m.width-4)
 }
 
-// tasksLine 是输入框上方常驻的后台任务栏：和上下文占用并排，
-// 有任务就显示，没有就整行不出现。运行中的任务带上已跑时长，一眼看出卡没卡住。
+// fitItems 用 " · " 把各项接成一行，宽度不够就从尾部整项丢掉。
+// 界面这几行的高度必须恒定，所以宁可少显示一项也不折行——折出来的第二行
+// 会让整个界面跟着错位。limit <= 0 表示不限宽。
+func fitItems(items []string, limit int) string {
+	if len(items) == 0 {
+		return ""
+	}
+	sep := hintStyle.Render(" · ")
+	out := items[0]
+	for _, it := range items[1:] {
+		next := out + sep + it
+		if limit > 0 && lipgloss.Width(next) > limit {
+			break
+		}
+		out = next
+	}
+	return out
+}
+
+// tasksLine 是输入框上方常驻的后台任务栏，
+// 有任务就显示，没有就整行空着（行数恒定，见 View）。运行中的任务带上已跑时长，
+// 一眼看出卡没卡住。
 func (m model) tasksLine() string {
-	return tasksLine(tool.TaskSnapshots())
+	return tasksLine(tool.TaskSnapshots(), m.width-4)
 }
 
-// tasksLine 把任务快照渲染成一行，纯函数，方便直接拿造的数据测
-func tasksLine(snapshots []tool.TaskSnapshot) string {
+// tasksLine 把任务快照渲染成一行，纯函数，方便直接拿造的数据测。
+// limit > 0 时保证不超过这么宽：列不下就少列几个任务，折行会把界面高度顶乱。
+func tasksLine(snapshots []tool.TaskSnapshot, limit int) string {
 	if len(snapshots) == 0 {
 		return ""
 	}
@@ -1607,14 +1630,13 @@ func tasksLine(snapshots []tool.TaskSnapshot) string {
 		head += hintStyle.Render(fmt.Sprintf("%d 个已结束", len(snapshots)))
 	}
 
-	items := []string{head}
-	// 运行中的排前面，任务多的时候被"还有 N 个"折叠掉的总是已经结束的那些
+	// 运行中的排前面，任务多的时候被折叠掉的总是已经结束的那些
 	ordered := orderTasks(snapshots)
-	shown := ordered
-	if len(shown) > maxTaskChips {
-		shown = shown[:maxTaskChips]
+	if len(ordered) > maxTaskChips {
+		ordered = ordered[:maxTaskChips]
 	}
-	for _, s := range shown {
+	chips := make([]string, 0, len(ordered))
+	for _, s := range ordered {
 		// 运行中的用状态色、结束的用暗色，扫一眼就知道哪个还在跑
 		style := hintStyle
 		if s.Running {
@@ -1624,12 +1646,31 @@ func tasksLine(snapshots []tool.TaskSnapshot) string {
 		if s.Running {
 			chip += " " + tool.FormatDuration(s.Elapsed)
 		}
-		items = append(items, style.Render(chip))
+		chips = append(chips, style.Render(chip))
 	}
-	if rest := len(snapshots) - len(shown); rest > 0 {
-		items = append(items, hintStyle.Render(fmt.Sprintf("…还有 %d 个", rest)))
+
+	sep := hintStyle.Render(" · ")
+	out := head
+	shown := 0
+	for _, chip := range chips {
+		next := out + sep + chip
+		// 给"还有 N 个"留出位置，免得到最后才发现交代不下
+		tail := ""
+		if rest := len(snapshots) - shown - 1; rest > 0 {
+			tail = sep + hintStyle.Render(fmt.Sprintf("…还有 %d 个", rest))
+		}
+		if limit > 0 && lipgloss.Width(next+tail) > limit {
+			break
+		}
+		out, shown = next, shown+1
 	}
-	return strings.Join(items, hintStyle.Render(" · "))
+	if rest := len(snapshots) - shown; rest > 0 {
+		tail := hintStyle.Render(fmt.Sprintf("…还有 %d 个", rest))
+		if limit <= 0 || lipgloss.Width(out+sep+tail) <= limit {
+			out += sep + tail
+		}
+	}
+	return out
 }
 
 // orderTasks 把运行中的任务排到前面，任务多的时候被折叠掉的总是已经结束的那些
@@ -1649,7 +1690,8 @@ func orderTasks(snapshots []tool.TaskSnapshot) []tool.TaskSnapshot {
 }
 
 // taskDetailLines 把后台任务摊成一行一个，带上完整命令——上面那行标签只有 id 和状态，
-// 任务一多就分不清哪个是哪个。放不下的先折叠，再交给 activeView 裁。
+// 任务一多就分不清哪个是哪个。运行中的标明已跑了多久，结束的标明总耗时。
+// 放不下的先折叠，再交给 activeView 裁。
 func (m model) taskDetailLines() []string {
 	snapshots := tool.TaskSnapshots()
 	if len(snapshots) == 0 {
@@ -1664,8 +1706,12 @@ func (m model) taskDetailLines() []string {
 			style, mark = toolStyle, "●"
 		}
 		line := style.Render(mark+" "+s.ID) + hintStyle.Render(" "+s.Status)
-		if s.Running {
-			line += hintStyle.Render(" " + tool.FormatDuration(s.Elapsed))
+		if s.Elapsed > 0 {
+			label := "耗时 "
+			if s.Running {
+				label = "已跑 "
+			}
+			line += hintStyle.Render(" " + label + tool.FormatDuration(s.Elapsed))
 		}
 		if cmd := firstLines(s.Command, 48); cmd != "" {
 			line += hintStyle.Render("  $ " + cmd)
@@ -1679,6 +1725,20 @@ func (m model) taskDetailLines() []string {
 		out = kept
 	}
 	return out
+}
+
+// footerLine 是输入框最下面那行按键提示，恒定占一行：终端窄就少显示几项，
+// 折行会把整个界面的高度顶乱。
+func (m model) footerLine() string {
+	if m.state == stateRunning {
+		return hintStyle.Render("Ctrl+C 中断")
+	}
+	return fitItems([]string{
+		hintStyle.Render("Enter 发送"),
+		hintStyle.Render("Shift+Enter 换行"),
+		hintStyle.Render("Ctrl+C 退出"),
+		hintStyle.Render("模式 ") + statusStyle.Render(m.mode.Label()),
+	}, m.width-1)
 }
 
 // lastAnswerLines 把上一轮回答的尾巴放进这块槽位：历史区里的回答会越推越高，
@@ -1735,40 +1795,33 @@ func (m model) View() tea.View {
 			b.WriteString(m.wrap(line))
 			b.WriteString("\n")
 		}
+		b.WriteString(m.approvalView())
+		b.WriteString("\n")
+		// 上下文占用照旧挂在下面，确认框顶掉输入框时也不让它跳到别处
 		if line := m.usageLine(); line != "" {
 			b.WriteString(m.wrap(line))
 			b.WriteString("\n")
 		}
-		b.WriteString(m.approvalView())
-		b.WriteString("\n")
 		b.WriteString(hintStyle.Render("↑↓ 或 j k 选择 · Enter 确认 · 直接打字可以拒绝并说明"))
 		return tea.NewView(b.String())
 	}
-	// 后台任务和上下文占用常驻在输入框上方，运行中也一直看得到
-	if line := m.tasksLine(); line != "" {
-		b.WriteString(m.wrap(line))
-		b.WriteString("\n")
-	}
-	if line := m.usageLine(); line != "" {
-		b.WriteString(m.wrap(line))
-		b.WriteString("\n")
-	}
+	// 后台任务常驻在输入框上方，运行中也一直看得到。
+	// 下面这三行（任务栏、附图、上下文占用）有没有内容都占着一行：界面行数一旦
+	// 跟着内容变，Bubble Tea 的 inline 渲染就会错位，屏幕上留下上一帧的残影。
+	b.WriteString(m.tasksLine())
+	b.WriteString("\n")
 	// 运行进度和补全候选共用这块固定行数的位置，紧挨着输入框
 	b.WriteString(m.activeView())
 	b.WriteString("\n")
 	// 附图那行贴着输入框：贴进来、挂在下一条提问上的图就在这儿，一眼看得见
-	if line := m.attachmentsLine(); line != "" {
-		b.WriteString(m.wrap(line))
-		b.WriteString("\n")
-	}
+	b.WriteString(m.attachmentsLine())
+	b.WriteString("\n")
 	b.WriteString(boxStyle.Width(m.width - 4).Render(m.input.View()))
 	b.WriteString("\n")
-	if m.state == stateRunning {
-		b.WriteString(hintStyle.Render("Ctrl+C 中断"))
-	} else {
-		b.WriteString(hintStyle.Render("Enter 发送 · Shift+Enter 换行 · Ctrl+C 退出 · 模式 "))
-		b.WriteString(statusStyle.Render(m.mode.Label()))
-	}
+	// 上下文占用挂在输入框下面：紧挨着输入框看得见，又不占上面那块常驻槽位
+	b.WriteString(m.usageLine())
+	b.WriteString("\n")
+	b.WriteString(m.footerLine())
 	return tea.NewView(b.String())
 }
 
@@ -1783,7 +1836,7 @@ func (m model) activeLines() []string {
 
 // idleLines 是闲着时这块槽位放什么。这块高度恒定（见 activeRows）却又不能空着，
 // 就按"最有用"的顺序挑一样填：补全候选最要紧，其次是把后台任务摊开看，
-// 都没有就把上一轮回答的尾巴挂着，随时能瞄一眼刚才说到哪。
+// 再其次是上一轮回答的尾巴，实在什么都没有就摆一份提示。
 func (m model) idleLines() []string {
 	if lines := m.completionLines(); len(lines) > 0 {
 		return lines
@@ -1791,16 +1844,49 @@ func (m model) idleLines() []string {
 	if lines := m.taskDetailLines(); len(lines) > 0 {
 		return lines
 	}
-	return m.lastAnswerLines()
+	if lines := m.lastAnswerLines(); len(lines) > 0 {
+		return lines
+	}
+	return m.hintLines()
+}
+
+// hintLines 是槽位实在没别的东西可放时的提示：有哪些命令、键盘怎么用。
+// 工具清单不在这儿占地方，真要查就看 /help。
+// 开场那会儿槽位本来是空的，宁可摆这几行，也别留一大片空白。
+func (m model) hintLines() []string {
+	raw := []string{
+		"命令  /help 全部说明 · /config 配模型",
+		"      /mode 切换模式 · /resume 恢复会话 · /new 新会话",
+		"",
+		"输入  Enter 发送 · Shift+Enter 换行 · Tab 补全 · Ctrl+V 贴图",
+	}
+	// 窄终端里长行要折，折出来多余的行由 activeView 裁掉，槽位高度仍然恒定
+	limit := m.width - 3
+	out := make([]string, 0, len(raw))
+	for _, line := range raw {
+		if strings.TrimSpace(line) == "" {
+			out = append(out, "")
+			continue
+		}
+		if limit > 0 {
+			for _, part := range strings.Split(ansi.Wrap(line, limit, ""), "\n") {
+				out = append(out, hintStyle.Render(part))
+			}
+			continue
+		}
+		out = append(out, hintStyle.Render(line))
+	}
+	return out
 }
 
 // activeView 把这块内容整理成固定的 activeRows 行，始终贴着输入框：
 // 跑任务时内容超了就先砍中间（留下第一行的状态或工具标题，以及最新的几行预览），
 // 闲着时按顺序留着前面的候选；都不够就在顶上补空行。
 // 这块的高度一旦跟着内容上下变，Bubble Tea 就会在屏幕底部留白，输入框立刻离地，
-// 所以这里必须恒定。
+// 所以这里必须恒定。单行也不能比终端还宽——超了终端会自己折行，实际用的行数
+// 就比这里记的多，屏幕从那一行起全错位。
 func (m model) activeView() string {
-	lines := m.activeLines()
+	lines := m.foldLines(m.activeLines())
 	if len(lines) > activeRows {
 		if m.state == stateRunning {
 			kept := make([]string, 0, activeRows)
@@ -1813,6 +1899,25 @@ func (m model) activeView() string {
 	}
 	pad := make([]string, activeRows-len(lines))
 	return strings.Join(append(pad, lines...), "\n")
+}
+
+// foldLines 把超宽的行就地折成多行，宽度未知时原样返回。
+// 折出来的行数变化由 activeView 裁到固定行数兜住。
+func (m model) foldLines(lines []string) []string {
+	limit := m.width - 1
+	if limit <= 0 {
+		return lines
+	}
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if lipgloss.Width(line) <= limit {
+			out = append(out, line)
+			continue
+		}
+		out = append(out, strings.Split(
+			ansi.Wrap(strings.TrimRight(line, "\r"), limit, ""), "\n")...)
+	}
+	return out
 }
 
 // runningView 是跑任务时贴在底部的那几行：状态 + 思考和回答的尾巴。
