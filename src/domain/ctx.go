@@ -3,7 +3,9 @@ package domain
 import "context"
 
 type Ctx struct {
-	Prompt   string
+	Prompt string
+	// Images 是这次提问附上的图片，Loop 会连图片一起记进会话，再发给模型
+	Images   []Image
 	Provider Provider
 	Tools    map[string]Tool
 	Context  context.Context

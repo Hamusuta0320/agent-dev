@@ -1354,3 +1354,189 @@ func TestOpenStoreUsesWorkspaceDir(t *testing.T) {
 		t.Fatalf("别的工作区不该看到这里的会话: %v %v", infos, err)
 	}
 }
+
+// writeTestImage 在临时目录里造一张假 PNG：认图片只看文件头，内容不用是真图
+func writeTestImage(t *testing.T, name string, size int) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, name)
+	raw := append([]byte("\x89PNG\r\n\x1a\n"), make([]byte, max(size-8, 0))...)
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatalf("造图片失败: %v", err)
+	}
+	return path
+}
+
+// 把图片文件拖进终端（终端贴进来的是路径）就当成附图，别当文字塞进输入框
+func TestPasteImagePath(t *testing.T) {
+	path := writeTestImage(t, "shot.png", 2048)
+	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+
+	got, _ := m.Update(tea.PasteMsg{Content: path})
+	after := got.(model)
+	if len(after.attachments) != 1 {
+		t.Fatalf("应该挂上一张图，实际 %d 张", len(after.attachments))
+	}
+	if after.input.Value() != "" {
+		t.Fatalf("图片路径不该变成输入框里的文字: %q", after.input.Value())
+	}
+	if after.attachments[0].label != "shot.png" {
+		t.Fatalf("名字应该用文件名，实际 %q", after.attachments[0].label)
+	}
+	if after.attachments[0].img.Size() != 2048 {
+		t.Fatalf("图片大小不对: %d", after.attachments[0].img.Size())
+	}
+
+	// 输入框上方那行要能看出带了几张
+	if view := stripANSI(after.View().Content); !strings.Contains(view, "附图") {
+		t.Fatalf("界面上该显示附图那行:\n%s", view)
+	}
+}
+
+// 普通文字照旧贴进输入框；带引号的路径、file:// 地址也要认得出
+func TestPasteTextAndQuotedPaths(t *testing.T) {
+	path := writeTestImage(t, "我的 截图.png", 512)
+
+	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+	got, _ := m.Update(tea.PasteMsg{Content: "帮我看下这段代码"})
+	after := got.(model)
+	if len(after.attachments) != 0 {
+		t.Fatalf("普通文字不该变成附图: %+v", after.attachments)
+	}
+	if !strings.Contains(after.input.Value(), "帮我看下这段代码") {
+		t.Fatalf("文字该贴进输入框: %q", after.input.Value())
+	}
+
+	// 路径带空格时终端会加引号
+	if atts, _ := imagesFromPaste(`"` + path + `"`); len(atts) != 1 {
+		t.Fatalf("带引号的路径应该认得出来: %+v", atts)
+	}
+	// 有的终端给的是 file:// 地址
+	if atts, _ := imagesFromPaste("file://" + filepath.ToSlash(path)); len(atts) != 1 {
+		t.Fatalf("file:// 地址应该认得出来: %+v", atts)
+	}
+	// 存在但压根不是图片的路径：还是当文字
+	notImage := filepath.Join(t.TempDir(), "main.go")
+	if err := os.WriteFile(notImage, []byte("package main"), 0o644); err != nil {
+		t.Fatalf("准备文件失败: %v", err)
+	}
+	if atts, problem := imagesFromPaste(notImage); len(atts) != 0 || problem != "" {
+		t.Fatalf("不是图片就别当附图: %+v %q", atts, problem)
+	}
+	// 认得出是图片、但太大读不了：要说一句，不能默默当成文字贴进输入框
+	huge := writeTestImage(t, "huge.png", domain.MaxImageBytes+1)
+	if atts, problem := imagesFromPaste(huge); len(atts) != 0 || !strings.Contains(problem, "太大") {
+		t.Fatalf("太大的图片该提示一句: %+v %q", atts, problem)
+	}
+}
+
+// 附图之后按 Esc 清空，免得下一句提问莫名带上一张图
+func TestEscapeClearsAttachments(t *testing.T) {
+	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+	got, _ := m.Update(tea.PasteMsg{Content: writeTestImage(t, "a.png", 64)})
+	m = got.(model)
+	if len(m.attachments) != 1 {
+		t.Fatalf("还没挂上: %+v", m.attachments)
+	}
+
+	got, _ = m.handleKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyEsc}))
+	if after := got.(model); len(after.attachments) != 0 {
+		t.Fatalf("Esc 之后该清空: %+v", after.attachments)
+	}
+	if view := stripANSI(got.(model).View().Content); strings.Contains(view, "附图") {
+		t.Fatalf("清空之后界面上不该还挂着附图那行:\n%s", view)
+	}
+}
+
+// 只贴图不写字也能发：替用户说一句"看看这张图"，图片跟着提问一起走
+func TestSubmitImageOnly(t *testing.T) {
+	if got := imagePrompt(1); !strings.Contains(got, "这张图") {
+		t.Fatalf("一张图的说法不对: %q", got)
+	}
+	if got := imagePrompt(3); !strings.Contains(got, "3 张图") {
+		t.Fatalf("多张图的说法不对: %q", got)
+	}
+
+	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+	got, _ := m.Update(tea.PasteMsg{Content: writeTestImage(t, "a.png", 64)})
+	m = got.(model)
+
+	// 配置是空的，provider 建不起来：这里只关心"图片被取走了、不会再跟着下一句"
+	got, _ = m.submit()
+	after := got.(model)
+	if len(after.attachments) != 0 {
+		t.Fatalf("发出去之后附件该清空: %+v", after.attachments)
+	}
+	if after.input.Value() != "" {
+		t.Fatalf("输入框该是空的: %q", after.input.Value())
+	}
+}
+
+// 一张提问最多带 maxAttachments 张，到上限要提示，不是默默攒着
+func TestAttachmentLimit(t *testing.T) {
+	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+	atts := make([]imageAttachment, 0, maxAttachments+1)
+	for i := 0; i <= maxAttachments; i++ {
+		img, err := domain.NewImage([]byte("\x89PNG\r\n\x1a\n")) // 零字节的图不要
+		if err != nil {
+			t.Fatalf("造图片失败: %v", err)
+		}
+		atts = append(atts, imageAttachment{label: strconv.Itoa(i) + ".png", img: img})
+	}
+
+	got, cmd := m.attachImages(atts)
+	if n := len(got.(model).attachments); n != maxAttachments {
+		t.Fatalf("应该收到 %d 张，实际 %d 张", maxAttachments, n)
+	}
+	if cmd == nil {
+		t.Fatal("到上限该提示一句")
+	}
+}
+
+// Ctrl+V / Alt+V 交到我们手里时去剪贴板取一次。终端自己接走 Ctrl+V 时这个键根本到不了，
+// 所以这里只验"按下去会去取"，真去读剪贴板是另一个 goroutine 的事
+func TestClipboardKeysAskForImage(t *testing.T) {
+	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+	for _, mod := range []tea.KeyMod{tea.ModCtrl, tea.ModAlt} {
+		got, cmd := m.handleKey(tea.KeyPressMsg(tea.Key{Code: 'v', Mod: mod}))
+		if cmd == nil {
+			t.Fatalf("%v+v 应该去剪贴板取东西", mod)
+		}
+		if n := len(got.(model).attachments); n != 0 {
+			t.Fatalf("取东西是异步的，这一刻不该凭空多出 %d 张", n)
+		}
+	}
+}
+
+// 剪贴板里是文字时，Ctrl+V 就是普通粘贴：插到光标处，别当成附图、也别拿"没有图片"打回去
+func TestClipboardTextPastesIntoInput(t *testing.T) {
+	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+
+	got, _ := m.Update(clipboardPasteMsg{text: "看看这段"})
+	after := got.(model)
+	if after.input.Value() != "看看这段" {
+		t.Fatalf("文字该贴进输入框: %q", after.input.Value())
+	}
+	if len(after.attachments) != 0 {
+		t.Fatalf("文字不该变成附图: %+v", after.attachments)
+	}
+}
+
+// 确认框里按 Ctrl+V 贴进来的文字，当成"拒绝并说明"的内容
+func TestClipboardTextPatchesApprovalFeedback(t *testing.T) {
+	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+	m.state = stateApproval
+	m.approval = &approvalState{req: domain.ApprovalRequest{Tool: "write_file"}}
+
+	got, _ := m.Update(clipboardPasteMsg{text: "别动这个文件"})
+	after := got.(model)
+	if !after.approval.typing {
+		t.Fatal("贴了字就该进说明输入")
+	}
+	if string(after.approval.feedback) != "别动这个文件" {
+		t.Fatalf("说明内容不对: %q", string(after.approval.feedback))
+	}
+	if after.input.Value() != "" {
+		t.Fatalf("输入框不该被改到: %q", after.input.Value())
+	}
+}

@@ -1,10 +1,26 @@
 package openai
 
+// AIChatMessage 的 Content 有两种形态：纯文本时是一个字符串，带图片时是一组
+// ContentPart（openai 那套多模态写法）。用 any 让调用方决定塞哪种，
+// 不带图的请求体和以前一模一样，字节不变，接口侧的上下文缓存也就不会失效。
 type AIChatMessage struct {
 	Role       string     `json:"role"`
-	Content    string     `json:"content"`
+	Content    any        `json:"content"`
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 	ToolCallId string     `json:"tool_call_id,omitempty"`
+}
+
+// ContentPart 是带图片的消息里 content 数组的一段：一段文字，或者一张图片
+type ContentPart struct {
+	Type     string    `json:"type"`
+	Text     string    `json:"text,omitempty"`
+	ImageURL *ImageURL `json:"image_url,omitempty"`
+}
+
+// ImageURL 是图片段的内容。URL 用 data:image/png;base64,... 这种内嵌写法，
+// 就不用先把图片上传到别处
+type ImageURL struct {
+	URL string `json:"url"`
 }
 
 type FunctionDefinition struct {

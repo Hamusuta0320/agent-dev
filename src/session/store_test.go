@@ -13,9 +13,13 @@ import (
 
 func TestSaveAndLoad(t *testing.T) {
 	store := NewStore(filepath.Join(t.TempDir(), "sessions"))
+	img, err := domain.NewImage([]byte("\x89PNG\r\n\x1a\n 假装这是截图"))
+	if err != nil {
+		t.Fatalf("造图片失败: %v", err)
+	}
 
 	s := domain.NewSession(`D:\code\demo`)
-	s.AppendUser("跑下测试")
+	s.AppendUser("跑下测试", img)
 	s.AppendAssistant("我看看", "先读文件", []domain.ToolCall{{Id: "call_1", Name: "Read", Arguments: `{"path":"a.go"}`}})
 	s.AppendToolResult(domain.ToolCall{Id: "call_1", Name: "Read"}, "1→package a")
 	s.AppendAssistant("改好了", "收尾", nil)
@@ -33,6 +37,10 @@ func TestSaveAndLoad(t *testing.T) {
 	}
 	if len(got.Messages) != 4 {
 		t.Fatalf("应该有 4 条消息，实际 %d", len(got.Messages))
+	}
+	// 图片跟着会话存下来了，恢复会话之后还能接着问
+	if len(got.Messages[0].Images) != 1 || got.Messages[0].Images[0].Data != img.Data {
+		t.Fatalf("图片没存住: %+v", got.Messages[0])
 	}
 	if got.Messages[1].Reasoning != "先读文件" || got.Messages[1].ToolCalls[0].Name != "Read" {
 		t.Fatalf("思考或工具调用丢了: %+v", got.Messages[1])

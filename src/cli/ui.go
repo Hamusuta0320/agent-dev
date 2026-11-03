@@ -175,6 +175,9 @@ type model struct {
 	// lastAnswer 是上一轮回答的原文：闲着时输入框上方那块槽位拿它的尾巴填上，
 	// 免得空一大片。answer 每轮结束就 Reset 了，所以单独留一份
 	lastAnswer string
+	// attachments 是贴进来、等着随下一条提问一起发出去的图片。
+	// 发送、切换会话、按 Esc 都会清空
+	attachments []imageAttachment
 
 	// usage 是最后一次请求的上下文占用（总数来自响应里的 usage），
 	// 贴在输入框上方常驻显示，新一轮开始时清零
@@ -382,6 +385,42 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.approval.insert([]rune(msg.Content)...)
 			return m, nil
 		}
+		// 拖图片进终端 / 粘贴图片路径：认出来的话挂到下一条提问上，别当文字塞进输入框
+		if m.state == stateIdle {
+			atts, problem := imagesFromPaste(msg.Content)
+			if len(atts) > 0 || problem != "" {
+				next, cmd := m.attachImages(atts)
+				if problem == "" {
+					return next, cmd
+				}
+				return next, tea.Sequence(cmd, m.print(errStyle.Render(problem)))
+			}
+		}
+
+	case clipboardPasteMsg:
+		if msg.err != nil {
+			if errors.Is(msg.err, errNoClipboardImage) {
+				return m, m.print(hintStyle.Render(
+					"剪贴板里没有图片也没有文字：截图后按 Ctrl+V，或者把图片文件拖进来"))
+			}
+			return m, m.print(errStyle.Render("读剪贴板失败: " + msg.err.Error()))
+		}
+		// 文字就和终端自己粘贴一样，插到光标处；确认框里贴的是"拒绝并说明"
+		if msg.text != "" {
+			if m.state == stateApproval && m.approval != nil {
+				m.approval.typing = true
+				m.approval.insert([]rune(msg.text)...)
+				return m, nil
+			}
+			if m.state == stateIdle {
+				m.input.InsertString(msg.text)
+			}
+			return m, nil
+		}
+		if m.state == stateIdle {
+			return m.attachImages([]imageAttachment{{label: "剪贴板", img: msg.img}})
+		}
+		return m, nil
 	}
 
 	// 表单里非按键的消息（光标闪烁）只交给正在编辑的那一格
@@ -422,6 +461,21 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if m.state == stateIdle && m.input.Value() == "" {
 			m.quitting = true
 			return m, tea.Quit
+		}
+
+	case "ctrl+v", "alt+v":
+		// 多数终端把 Ctrl+V 当成"我自己贴一段文字"，这个键根本到不了这儿；终端肯放过来时
+		// 就由我们去剪贴板取一次：有文字贴文字，没有文字才当成图。Alt+V 是备用入口
+		// （Windows Terminal、VS Code 集成终端默认会接走 Ctrl+V）
+		if m.state == stateIdle {
+			return m, pasteFromClipboard()
+		}
+
+	case "esc":
+		// 附了图想撤：闲着时 Esc 没别的用处，就用来清空
+		if m.state == stateIdle && len(m.attachments) > 0 {
+			m.attachments = nil
+			return m, m.print(hintStyle.Render("已清空附图"))
 		}
 	}
 
@@ -490,6 +544,12 @@ func (m model) handleApprovalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 	options := approvalOptions(pending.req.Tool)
 	key := msg.String()
+
+	// 和输入框里一样：终端肯把 Ctrl+V 放过来时，由我们去剪贴板取一次，
+	// 贴进来的文字就当"拒绝并说明"
+	if key == "ctrl+v" || key == "alt+v" {
+		return m, pasteFromClipboard()
+	}
 
 	if pending.typing {
 		switch {
@@ -1046,14 +1106,76 @@ func (m model) completionLines() []string {
 	return out
 }
 
+// attachImages 把几张图片挂到下一条提问上，在历史区说一声加了什么。
+// 到上限就先提示一句，别默默攒着——攒下的每一张都要跟着会话存、每一轮发出去
+func (m model) attachImages(atts []imageAttachment) (tea.Model, tea.Cmd) {
+	if len(atts) == 0 {
+		return m, nil
+	}
+	var lines []string
+	for _, a := range atts {
+		if len(m.attachments) >= maxAttachments {
+			lines = append(lines, errStyle.Render(fmt.Sprintf(
+				"一条提问最多 %d 张图，这几张先不收了（Esc 清空后再贴）", maxAttachments)))
+			break
+		}
+		m.attachments = append(m.attachments, a)
+		lines = append(lines, hintStyle.Render(fmt.Sprintf(
+			"+ 附图 %s（%s %s）", a.label, sizeText(int64(a.img.Size())), a.img.Kind())))
+	}
+	return m, m.print(strings.Join(lines, "\n"))
+}
+
+// takeAttachments 把攒着的图片取走交给这一轮；取走之后输入框上方那行就空了
+func (m *model) takeAttachments() []domain.Image {
+	if len(m.attachments) == 0 {
+		return nil
+	}
+	imgs := make([]domain.Image, 0, len(m.attachments))
+	for _, a := range m.attachments {
+		imgs = append(imgs, a.img)
+	}
+	m.attachments = nil
+	return imgs
+}
+
+// attachmentsLine 是输入框上方那行"这条提问带了哪些图"：贴进来就看得见，
+// 发送、Esc 或者切会话之后消失
+func (m model) attachmentsLine() string {
+	if len(m.attachments) == 0 {
+		return ""
+	}
+	items := []string{hintStyle.Render("附图 ") + statusStyle.Render(fmt.Sprintf("%d 张", len(m.attachments)))}
+	for _, a := range m.attachments {
+		items = append(items, hintStyle.Render(fmt.Sprintf("%s %s", sizeText(int64(a.img.Size())), a.img.Kind())))
+	}
+	items = append(items, hintStyle.Render("· Esc 清空 · Enter 发送"))
+	return strings.Join(items, hintStyle.Render(" · "))
+}
+
+// imagePrompt 是只贴了图片、一个字没写时替用户说的话：请求里总得有一段文字，
+// 光秃秃一个图片数组有的接口会不高兴
+func imagePrompt(n int) string {
+	if n <= 1 {
+		return "看看这张图"
+	}
+	return fmt.Sprintf("看看这 %d 张图", n)
+}
+
 // submit 处理一次回车：本地命令就地执行，普通输入交给模型
 func (m model) submit() (tea.Model, tea.Cmd) {
 	input := strings.TrimSpace(m.input.Value())
-	if input == "" {
+	// 只附了图片、没写字也是一次正经提问，不用拦
+	if input == "" && len(m.attachments) == 0 {
 		return m, nil
 	}
 	m.input.Reset()
 	m.suggestIdx = 0
+
+	// 一个字没写就替用户说一句"看看这几张图"，纯图片的提问也能发出去
+	if input == "" {
+		return m.startRun(imagePrompt(len(m.attachments)), m.takeAttachments())
+	}
 
 	switch parseCommand(input) {
 	case cmdExit:
@@ -1063,7 +1185,9 @@ func (m model) submit() (tea.Model, tea.Cmd) {
 		return m, m.print(helpText())
 	case cmdNew:
 		m.cur = domain.NewSession(m.workdir)
-		m.lastAnswer = "" // 新会话，槽位里不该还挂着上个会话的回答
+		// 新会话，槽位里不该还挂着上个会话的回答，攒着的图也不再属于谁
+		m.lastAnswer = ""
+		m.attachments = nil
 		return m, m.print(bannerStyle.Render("新会话 "+m.cur.Id) +
 			hintStyle.Render("，消息 "+fmt.Sprint(len(m.cur.Messages))+" 条"))
 	case cmdResume:
@@ -1076,7 +1200,7 @@ func (m model) submit() (tea.Model, tea.Cmd) {
 		return m.switchMode(input)
 	}
 
-	return m.startRun(input)
+	return m.startRun(input, m.takeAttachments())
 }
 
 // switchMode 处理 /mode：不带参数就报当前模式和可选项，带了就切过去并写回配置，
@@ -1136,8 +1260,9 @@ func (m model) resume(input string) (tea.Model, tea.Cmd) {
 		next.Id = id
 	}
 	m.cur = next
-	// 换会话了，旧回答的尾巴不该还挂在槽位里
+	// 换会话了，旧回答的尾巴不该还挂在槽位里，攒着的图也不再属于谁
 	m.lastAnswer = ""
+	m.attachments = nil
 	out := bannerStyle.Render("已恢复会话 "+next.Id) +
 		hintStyle.Render(fmt.Sprintf("，共 %d 条消息，目录 %s", len(next.Messages), m.store.Dir))
 	// 别的目录里开的会话也照样能接着聊，只是工具仍按当前目录跑，提一句免得误会
@@ -1209,8 +1334,9 @@ func sizeText(n int64) string {
 	}
 }
 
-// startRun 把提问丢给 core.Loop，用 goroutine + channel 把过程事件送回 UI
-func (m model) startRun(prompt string) (tea.Model, tea.Cmd) {
+// startRun 把提问丢给 core.Loop，用 goroutine + channel 把过程事件送回 UI。
+// images 是随这条提问一起发出去的图片，会和文字一起记进会话
+func (m model) startRun(prompt string, images []domain.Image) (tea.Model, tea.Cmd) {
 	p, err := buildProvider(m.cfg)
 	if err != nil {
 		return m, m.print(errStyle.Render("创建 Provider 失败: " + err.Error()))
@@ -1239,6 +1365,7 @@ func (m model) startRun(prompt string) (tea.Model, tea.Cmd) {
 		defer close(r.ch)
 		r.err = core.Loop(domain.Ctx{
 			Prompt:       prompt,
+			Images:       images,
 			Provider:     p,
 			Tools:        tool.ForMode(mode),
 			Context:      ctx,
@@ -1263,11 +1390,16 @@ func (m model) startRun(prompt string) (tea.Model, tea.Cmd) {
 		}
 	}()
 
+	// 把用户原话原样回显到历史区，多行输入也保留换行。
+	// 先折行再着色：lipgloss 是逐行套样式的，反过来（先着色再折行）的话
+	// 折出来的第二行起就丢了颜色
+	echo := []string{promptStyle.Render(m.fitWidth(prompt))}
+	if len(images) > 0 {
+		// 图片本身在上面看不到，得说清楚这条提问带了几张，事后翻历史才知道当时给了什么
+		echo = append(echo, hintStyle.Render(fmt.Sprintf("  （附 %d 张图片）", len(images))))
+	}
 	return m, tea.Sequence(
-		// 把用户原话原样回显到历史区，多行输入也保留换行。
-		// 先折行再着色：lipgloss 是逐行套样式的，反过来（先着色再折行）的话
-		// 折出来的第二行起就丢了颜色
-		m.print(promptStyle.Render(m.fitWidth(prompt))),
+		m.print(strings.Join(echo, "\n")),
 		m.spin.Tick,
 		m.toolSpin.Tick,
 		waitEvent(r),
@@ -1624,6 +1756,11 @@ func (m model) View() tea.View {
 	// 运行进度和补全候选共用这块固定行数的位置，紧挨着输入框
 	b.WriteString(m.activeView())
 	b.WriteString("\n")
+	// 附图那行贴着输入框：贴进来、挂在下一条提问上的图就在这儿，一眼看得见
+	if line := m.attachmentsLine(); line != "" {
+		b.WriteString(m.wrap(line))
+		b.WriteString("\n")
+	}
 	b.WriteString(boxStyle.Width(m.width - 4).Render(m.input.View()))
 	b.WriteString("\n")
 	if m.state == stateRunning {

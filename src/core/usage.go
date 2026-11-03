@@ -30,9 +30,19 @@ func estimateMessages(messages []domain.AIChatMessage) int {
 		for _, call := range m.ToolCalls {
 			total += estimateTokens(call.Name) + estimateTokens(call.Arguments)
 		}
+		for _, img := range m.Images {
+			if !img.Empty() {
+				total += imageTokens
+			}
+		}
 	}
 	return total
 }
+
+// imageTokens 是估算一张图片占用的 token 数。接口是按像素分块算的，
+// 本地只知道字节数，差得远；这里按"一张普通截图一千上下"给个固定值，
+// 足够让界面上那根百分比条不至于漏掉图片这一块
+const imageTokens = 1000
 
 // estimateToolSpecs 估工具定义（名字、说明、参数 schema）的占用
 func estimateToolSpecs(specs []domain.ToolSpec) int {

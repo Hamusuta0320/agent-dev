@@ -102,6 +102,14 @@ func helpText() string {
 		"  Enter 发送，Shift+Enter 换行（Ctrl+J 也行），粘贴多行文本会当成一次输入",
 		"  输入以 / 开头时会列出可补全的命令，↑↓ 选择、Tab 或 Enter 补全",
 		"  Tab 被终端接走时（比如 VS Code 集成终端），改用 Ctrl+Space 或 → 补全",
+		"",
+		bannerStyle.Render("图片"),
+		"  截图后按 Ctrl+V（终端把 Ctrl+V 接走时用 Alt+V）贴剪贴板里的图",
+		"  剪贴板里是文字时，这个键就是普通粘贴；终端自己接管 Ctrl+V 时走它自带的粘贴",
+		"  也可以把图片文件直接拖进终端，或者粘贴图片的路径",
+		"  附上的图会随下一条提问一起发给模型，输入框上方能看到带了哪几张",
+		"  只贴图不写字也能发；Esc 清空附图；一条提问最多 "+fmt.Sprint(maxAttachments)+
+			" 张，单张最大 "+fmt.Sprint(domain.MaxImageBytes>>20)+"MB",
 	)
 	return strings.Join(lines, "\n")
 }

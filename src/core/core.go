@@ -15,12 +15,12 @@ import (
 	"time"
 )
 
-// Loop 跑完一次用户提问：先把输入记进会话，再和模型来回，直到它不再调用工具
+// Loop 跑完一次用户提问：先把输入和附带的图片记进会话，再和模型来回，直到它不再调用工具
 func Loop(ctx domain.Ctx) error {
 	if ctx.Session == nil {
 		ctx.Session = domain.NewSession(ctx.WorkDir)
 	}
-	ctx.Session.AppendUser(ctx.Prompt)
+	ctx.Session.AppendUser(ctx.Prompt, ctx.Images...)
 	_, err := Run(ctx, ctx.Session)
 	return err
 }

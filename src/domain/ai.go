@@ -34,6 +34,9 @@ type AIChatMessage struct {
 	Content    string
 	ToolCalls  []ToolCall
 	ToolCallId string
+	// Images 是随这条消息一起发给模型的图片，目前只有用户的提问会带。
+	// 带图的消息发给接口时 content 会变成"文字 + 图片"的数组，没有图还是老样子的字符串
+	Images []Image
 }
 
 type ChatResult struct {

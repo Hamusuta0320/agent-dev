@@ -123,12 +123,35 @@ func buildMessages(messages []domain.AIChatMessage) []openai.AIChatMessage {
 	for _, m := range messages {
 		result = append(result, openai.AIChatMessage{
 			Role:       m.Role,
-			Content:    m.Content,
+			Content:    buildContent(m),
 			ToolCalls:  buildOpenAIToolCalls(m.ToolCalls),
 			ToolCallId: m.ToolCallId,
 		})
 	}
 	return result
+}
+
+// buildContent 拼一条消息的 content：没带图片就还是那个字符串，
+// 带了就换成"文字 + 每张图一个 image_url"的数组（文字放最前面，
+// 有的接口在只有图片时会抱怨没有文字指令）。
+func buildContent(m domain.AIChatMessage) any {
+	if len(m.Images) == 0 {
+		return m.Content
+	}
+	parts := make([]openai.ContentPart, 0, len(m.Images)+1)
+	if strings.TrimSpace(m.Content) != "" {
+		parts = append(parts, openai.ContentPart{Type: "text", Text: m.Content})
+	}
+	for _, img := range m.Images {
+		if img.Empty() {
+			continue
+		}
+		parts = append(parts, openai.ContentPart{
+			Type:     "image_url",
+			ImageURL: &openai.ImageURL{URL: img.DataURL()},
+		})
+	}
+	return parts
 }
 
 // Chat 请求一次模型：失败（网络抖动、限流、5xx、空响应）时最多重试 maxAttempts 次，

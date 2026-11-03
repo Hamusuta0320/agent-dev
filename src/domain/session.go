@@ -20,6 +20,8 @@ const (
 type SessionMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content,omitempty"`
+	// Images 是用户提问里附的图片，跟着会话一起存下来，恢复会话后还能接着问
+	Images []Image `json:"images,omitempty"`
 	// Reasoning 是模型的思考内容，只做记录，不回传给模型
 	Reasoning  string     `json:"reasoning,omitempty"`
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
@@ -60,8 +62,9 @@ func (s *Session) Append(msg SessionMessage) {
 	}
 }
 
-func (s *Session) AppendUser(content string) {
-	s.Append(SessionMessage{Role: RoleUser, Content: content})
+// AppendUser 记录用户的一条提问，images 是随提问附上的图片（可以没有）
+func (s *Session) AppendUser(content string, images ...Image) {
+	s.Append(SessionMessage{Role: RoleUser, Content: content, Images: images})
 }
 
 // AppendAssistant 记录模型这一轮的回答：思考过程、正文和工具调用
@@ -85,14 +88,15 @@ func (s *Session) AppendToolResult(call ToolCall, content string) {
 }
 
 // History 把会话整理成发给模型的 messages。
-// 思考内容不回传（有的 provider 不接受 reasoning 字段），空白的 assistant 消息也跳过。
+// 思考内容不回传（有的 provider 不接受 reasoning 字段），空白的 assistant 消息也跳过；
+// 只有图片没有文字的提问要留着，那也是一条正经提问。
 func (s *Session) History() []AIChatMessage {
 	messages := make([]AIChatMessage, 0, len(s.Messages))
 	for _, m := range s.Messages {
 		if m.Role == RoleAssistant && m.Content == "" && len(m.ToolCalls) == 0 {
 			continue
 		}
-		if m.Role == RoleUser && m.Content == "" {
+		if m.Role == RoleUser && m.Content == "" && len(m.Images) == 0 {
 			continue
 		}
 		messages = append(messages, AIChatMessage{
@@ -100,6 +104,7 @@ func (s *Session) History() []AIChatMessage {
 			Content:    m.Content,
 			ToolCalls:  m.ToolCalls,
 			ToolCallId: m.ToolCallId,
+			Images:     m.Images,
 		})
 	}
 	return messages

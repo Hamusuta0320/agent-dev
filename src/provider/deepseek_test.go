@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -231,5 +232,66 @@ func TestRetryDelay(t *testing.T) {
 			t.Fatalf("第 %d 次重试的等待 %s 该比上一次 %s 长", i, d, prev)
 		}
 		prev = d
+	}
+}
+
+// 带图片的提问要按 openai 那套多模态格式发出去：content 变成数组，
+// 文字在最前面，后面每张图一个 image_url，用 data: 地址内嵌
+func TestChatSendsImageParts(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("请求体不是 JSON: %v", err)
+		}
+		got = body
+		writeStream(w, "看到了")
+	}))
+	t.Cleanup(srv.Close)
+
+	img, err := domain.NewImage([]byte("\x89PNG\r\n\x1a\n 假装这是图"))
+	if err != nil {
+		t.Fatalf("造图片失败: %v", err)
+	}
+	messages := []domain.AIChatMessage{
+		{Role: domain.RoleUser, Content: "这个界面哪里不对？", Images: []domain.Image{img}},
+		{Role: domain.RoleUser, Content: "没有图的照着老样子发"},
+	}
+	if _, err := newTestProvider(srv.URL).Chat(context.Background(), messages, nil, nil); err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+
+	msgs, _ := got["messages"].([]any)
+	if len(msgs) != 2 {
+		t.Fatalf("应该发两条消息，实际 %d 条", len(msgs))
+	}
+
+	// 带图的那条：content 是数组，第一段文字、第二段图片
+	first, _ := msgs[0].(map[string]any)
+	parts, ok := first["content"].([]any)
+	if !ok {
+		t.Fatalf("带图的消息 content 应该是数组，实际 %T", first["content"])
+	}
+	if len(parts) != 2 {
+		t.Fatalf("应该是一段文字加一张图，实际 %d 段", len(parts))
+	}
+	text, _ := parts[0].(map[string]any)
+	if text["type"] != "text" || text["text"] != "这个界面哪里不对？" {
+		t.Fatalf("第一段应该是原话: %+v", text)
+	}
+	image, _ := parts[1].(map[string]any)
+	if image["type"] != "image_url" {
+		t.Fatalf("第二段应该是图片: %+v", image)
+	}
+	url, _ := image["image_url"].(map[string]any)
+	wantURL := img.DataURL()
+	if url["url"] != wantURL {
+		t.Fatalf("图片应该用 data: 地址内嵌，实际 %v", url["url"])
+	}
+
+	// 没有图的消息还是老样子的字符串，请求体字节不变才能命中接口侧的上下文缓存
+	second, _ := msgs[1].(map[string]any)
+	if second["content"] != "没有图的照着老样子发" {
+		t.Fatalf("没图的消息 content 应该还是字符串，实际 %T", second["content"])
 	}
 }
