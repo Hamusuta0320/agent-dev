@@ -110,6 +110,13 @@ func helpText() string {
 		"  附上的图会随下一条提问一起发给模型，输入框上方能看到带了哪几张",
 		"  只贴图不写字也能发；Esc 清空附图；一条提问最多 "+fmt.Sprint(maxAttachments)+
 			" 张，单张最大 "+fmt.Sprint(domain.MaxImageBytes>>20)+"MB",
+		"",
+		bannerStyle.Render("约定与技能"),
+		"  工作目录和它上层目录里的 AGENTS.md 会自动读进提示词，不用每次重复交代",
+		"  没有 AGENTS.md 的地方才退回读 CLAUDE.md，同一处只读一份",
+		"  跨项目通用的规矩放 ~/.agents/AGENTS.md（全局，同样优先于 ~/.claude/CLAUDE.md）",
+		"  技能放在 ~/.agents/skills/<名字>/SKILL.md：文件头 frontmatter 里写 name 和 description，",
+		"  正文写步骤；启动后模型能看到技能清单，用到时自己把那份文件读完再动手",
 	)
 	return strings.Join(lines, "\n")
 }

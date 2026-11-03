@@ -30,6 +30,10 @@ func systemPrompt(ctx domain.Ctx) string {
 		fmt.Fprintf(&sb, "- Bash 工具实际用的 shell: %s\n", shell)
 	}
 	sb.WriteString(modeSection(ctx.Mode))
+	sb.WriteString(conventionSection(workdir))
+	if root, err := SkillsRoot(); err == nil {
+		sb.WriteString(skillSection(root))
+	}
 
 	sb.WriteString(`
 ## 工具使用

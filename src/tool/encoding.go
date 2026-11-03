@@ -2,6 +2,8 @@ package tool
 
 import (
 	"bytes"
+	"fmt"
+	"os"
 	"runtime"
 	"strings"
 	"unicode/utf8"
@@ -9,6 +11,24 @@ import (
 	"golang.org/x/text/encoding/simplifiedchinese"
 	"golang.org/x/text/transform"
 )
+
+// ReadText 读一个文本文件并解码成 UTF-8：UTF-8 原样返回，
+// 本地编码（GBK/GB18030）无损解开，解不动的（二进制）返回错误。
+// 读项目里的约定文件、技能说明这类小文件时用它，别自己 string(ReadFile(...))
+func ReadText(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	if utf8.Valid(data) {
+		return string(data), nil
+	}
+	decoded, ok := decodeLocalLossless(data)
+	if !ok {
+		return "", fmt.Errorf("%s 不是文本文件", path)
+	}
+	return decoded, nil
+}
 
 // localEncoding 说明：本地编码统一用 GB18030，而不是 GBK。
 // GBK 是 GB18030 的子集，对 GBK 内容编解码结果完全一致，
