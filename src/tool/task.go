@@ -52,7 +52,7 @@ func (s taskStatus) Label() string {
 
 // bgTask 是一个后台任务：命令在单独的 goroutine 里跑，输出攒在内存里，
 // 结束状态（退出码 / 超时 / 被停掉）既可以用 Task 工具查，也会在结束时
-// 自动出现在下一轮的系统提示词里，省得模型干等着或者反复轮询。
+// 自动跟在下一轮对话的末尾，省得模型干等着或者反复轮询。
 type bgTask struct {
 	ID        string
 	Command   string
@@ -180,7 +180,7 @@ func (t *bgTask) notification() string {
 }
 
 // TaskNotifications 返回"已经结束、但还没告诉过模型"的后台任务，取过就不再重复。
-// core 每轮拼系统提示词时调它，模型不用轮询也能知道后台跑完了
+// core 每轮拼请求消息时调它，把结果接在对话末尾；模型不用轮询也能知道后台跑完了
 func TaskNotifications() []string {
 	return backgroundTasks.takeNotifications()
 }
@@ -361,7 +361,7 @@ func (t TaskTool) Description() string {
 		"action=list 列出所有任务；action=output 读某个任务的输出（tail_lines 只要最后几行）；" +
 		"action=wait 等任务跑完（最多 timeout_seconds 秒，默认 30，最长 120）；action=stop 把任务停掉。" +
 		"output/wait/stop 都要带 task_id。" +
-		"任务结束时会自动出现在下一轮的系统提示词里，所以只有现在就需要结果时才用 action=wait，" +
+		"任务结束时会自动跟在下一轮对话的末尾，所以只有现在就需要结果时才用 action=wait，" +
 		"别用 sleep 之类的方式反复轮询。"
 }
 

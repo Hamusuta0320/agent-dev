@@ -35,6 +35,9 @@ func systemPrompt(ctx domain.Ctx) string {
 		sb.WriteString(skillSection(root))
 	}
 
+	// 后台任务通知不放进系统提示词：那里的任何变化都会让整段历史的
+	// 上下文缓存失效，而通知恰好是每轮都会变的一次性内容。它由 taskMessages
+	// 作为一条追加在对话末尾的 user 消息发出去
 	sb.WriteString(`
 ## 工具使用
 - 每次调用工具都要用 intent 写一句这次要做什么（比如"读一下登录逻辑"），界面上会显示在工具名后面。
@@ -51,25 +54,29 @@ func systemPrompt(ctx domain.Ctx) string {
 - 不执行破坏性命令（rm -rf、git reset --hard、强推等），除非用户明确要求。
 - 结束后用一两句话说明改了什么、有没有跑过编译或测试；回答语言跟用户一致。
 `)
-	sb.WriteString(taskSection())
 	return sb.String()
 }
 
-// taskSection 把"后台任务已经跑完"的通知拼进提示词。
+// taskMessages 把"后台任务已经跑完"的通知拼成一条 user 消息，追加在对话末尾。
 // 通知是一次性的：报过一次的任务不会再出现在下一轮，模型也就不用自己去轮询。
-// 这里只放提示词、不往会话历史里插消息，历史里的工具调用配对不受影响。
-func taskSection() string {
-	notes := tool.TaskNotifications()
+// 放在末尾而不是系统提示词里，是为了让前面 [系统提示词 + 历史] 的字节保持不变，
+// 接口侧的上下文缓存只会在末尾多出这一条；历史里的工具调用配对也不受影响。
+func taskMessages() []domain.AIChatMessage {
+	return taskNotice(tool.TaskNotifications())
+}
+
+// taskNotice 把通知文本拼成消息，没有通知时返回 nil（不往请求里塞空消息）
+func taskNotice(notes []string) []domain.AIChatMessage {
 	if len(notes) == 0 {
-		return ""
+		return nil
 	}
 	var sb strings.Builder
-	sb.WriteString("\n## 后台任务\n下面这些后台任务已经结束了，结果你还没看过：\n")
+	sb.WriteString("## 后台任务\n下面这些后台任务已经结束了，结果你还没看过：\n")
 	for _, n := range notes {
 		sb.WriteString(n + "\n")
 	}
-	sb.WriteString("要看输出用 Task action=output；不用的话直接把结论告诉用户，别为了确认结果再跑一遍同样的命令。\n")
-	return sb.String()
+	sb.WriteString("要看输出用 Task action=output；不用的话直接把结论告诉用户，别为了确认结果再跑一遍同样的命令。")
+	return []domain.AIChatMessage{{Role: domain.RoleUser, Content: sb.String()}}
 }
 
 // modeSection 把当前工作模式的约束写进系统提示词。

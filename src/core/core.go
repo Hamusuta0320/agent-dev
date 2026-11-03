@@ -60,6 +60,10 @@ func Run(ctx domain.Ctx, session *domain.Session) (string, error) {
 	// always 记着本回合里用户说过"总是允许"的工具，后面同样的工具不再问
 	always := make(map[string]bool)
 
+	// lastPrompt 是上一轮接口报的 prompt 数。它是真值，比本地估算准；
+	// 压缩之后这一轮的占用已经变了，要清零重新估
+	lastPrompt := 0
+
 	for step := range maxSteps {
 		// 用户中途按了 Ctrl+C 就别再要下一轮了，赶紧把这一轮结束掉
 		if err := cancelErr(ctx.Context); err != nil {
@@ -77,10 +81,28 @@ func Run(ctx domain.Ctx, session *domain.Session) (string, error) {
 			}
 			emit(domain.Event{Kind: kind, Text: ev.Text})
 		}
-		messages := buildMessages(ctx, session)
+		sys := systemPrompt(ctx)
+		used := estimateTokens(sys) + usage.toolTokens + usage.messageTokens
+		if lastPrompt > used {
+			used = lastPrompt
+		}
+		if needCompact(ctx.ContextLimit, used) {
+			force := lastPrompt > 0 && needCompact(ctx.ContextLimit, lastPrompt)
+			if compactContext(ctx, session, emit, usage, estimateTokens(sys), force) {
+				usage.messageTokens = estimateMessages(session.History())
+				lastPrompt = 0
+			}
+		}
+		messages := buildMessages(sys, session)
+		// 后台任务的通知追加在最后：前面 [系统提示词 + 历史] 的字节保持稳定，
+		// 只有这条新内容需要模型重新处理
+		messages = append(messages, taskMessages()...)
 		res, err := ctx.Provider.Chat(ctx.Context, messages, specs, onDelta)
 		if err != nil {
 			return "", err
+		}
+		if res.Usage.PromptTokens > 0 {
+			lastPrompt = res.Usage.PromptTokens
 		}
 		// 上下文占用：总数用响应里的 usage，三项分项按本地估算的比例拆
 		emit(domain.Event{
@@ -288,11 +310,12 @@ func doneChan(c context.Context) <-chan struct{} {
 	return c.Done()
 }
 
-// buildMessages 每次请求都重新拼：系统提示词在前（环境可能变），后面是会话历史
-func buildMessages(ctx domain.Ctx, session *domain.Session) []domain.AIChatMessage {
+// buildMessages 每次请求都重新拼：系统提示词在前（环境可能变），后面是会话历史。
+// 系统提示词由调用方传进来，同一轮里估算占用和真正发请求用的是同一份。
+func buildMessages(sys string, session *domain.Session) []domain.AIChatMessage {
 	messages := []domain.AIChatMessage{
 		{
-			Content: systemPrompt(ctx),
+			Content: sys,
 			Role:    domain.RoleSystem,
 		},
 	}
@@ -345,6 +368,12 @@ func ConsoleEmit(in io.Reader, out io.Writer) domain.EmitFunc {
 				midLine = false
 			}
 			fmt.Fprintf(out, "[重试] %s\n", ev.Text)
+		case domain.EventCompact:
+			if midLine {
+				fmt.Fprintln(out)
+				midLine = false
+			}
+			fmt.Fprintf(out, "[压缩] %s\n", ev.Text)
 		// 流式输出不带换行，这一轮结束要收个尾，否则下一轮的标题会粘在后面
 		case domain.EventAnswerEnd:
 			if midLine {

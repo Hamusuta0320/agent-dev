@@ -33,7 +33,7 @@ func TestSystemPromptFallsBackToCwd(t *testing.T) {
 func TestMakeMessages(t *testing.T) {
 	s := domain.NewSession("")
 	s.AppendUser("改个 bug")
-	msgs := buildMessages(domain.Ctx{}, s)
+	msgs := buildMessages(systemPrompt(domain.Ctx{}), s)
 	if len(msgs) != 2 {
 		t.Fatalf("应该只有 system + user 两条，实际 %d", len(msgs))
 	}
@@ -45,10 +45,28 @@ func TestMakeMessages(t *testing.T) {
 	}
 }
 
-// 没有后台任务要报时，提示词里不该多出一段空的通知，白占 token
-func TestSystemPromptNoTaskSection(t *testing.T) {
+// 后台任务通知永远不进系统提示词：那里的任何变化都会打掉整段历史的上下文缓存。
+// 没有通知时也不该多出一条空消息。
+func TestTaskNoticeNotInSystemPrompt(t *testing.T) {
 	p := systemPrompt(domain.Ctx{WorkDir: `/tmp/demo`, Shell: "pwsh"})
-	if strings.Contains(p, "## 后台任务") || strings.Contains(p, "TaskNotifications") {
-		t.Fatalf("没有任务通知时不该有后台任务小节:\n%s", p)
+	if strings.Contains(p, "## 后台任务") {
+		t.Fatalf("系统提示词里不该有后台任务小节:\n%s", p)
+	}
+	if msgs := taskMessages(); len(msgs) != 0 {
+		t.Fatalf("没有任务通知时不该多出消息: %+v", msgs)
+	}
+}
+
+// 有通知时作为一条 user 消息追加在对话末尾，内容带上任务摘要
+func TestTaskNoticeIsTrailingUserMessage(t *testing.T) {
+	msgs := taskNotice([]string{"- task_1 已完成（exit_code: 0，耗时 1.2s）：go test ./..."})
+	if len(msgs) != 1 || msgs[0].Role != domain.RoleUser {
+		t.Fatalf("应该是一条 user 消息: %+v", msgs)
+	}
+	if !strings.Contains(msgs[0].Content, "## 后台任务") || !strings.Contains(msgs[0].Content, "task_1") {
+		t.Fatalf("通知内容不对: %q", msgs[0].Content)
+	}
+	if len(taskNotice(nil)) != 0 {
+		t.Fatal("没有通知时不该返回消息")
 	}
 }

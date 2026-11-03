@@ -1461,6 +1461,10 @@ func (m model) handleEvent(ev domain.Event) (tea.Model, tea.Cmd) {
 		m.status = "连接失败，正在重试…"
 		out = append(out, errStyle.Render("⚠ "+ev.Text))
 
+	// 上下文压缩：压完会继续正常回答，这里只留一行说明，别打断用户的阅读
+	case domain.EventCompact:
+		out = append(out, hintStyle.Render("· "+ev.Text))
+
 	case domain.EventAnswerEnd:
 		if !m.reasoningShown {
 			out = append(out, m.block("思考", thinkStyle, m.reasoning.String(), printReasoningLines)...)

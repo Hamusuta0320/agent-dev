@@ -29,6 +29,9 @@ const (
 	// EventRetry 表示连模型失败了、正在重试，Text 是给用户看的说明。
 	// 它只用来告知和展示，不改变 Run 的流程
 	EventRetry
+	// EventCompact 表示上下文压缩的进展（开始摘要、压完了多少、失败了），
+	// Text 是给用户看的一句话。它不影响 Run 的流程
+	EventCompact
 )
 
 // ToolStatus 是一次工具调用的执行状态
