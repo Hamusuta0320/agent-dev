@@ -1233,6 +1233,50 @@ func TestViewHeightStable(t *testing.T) {
 	}
 }
 
+// 输入框的宽度必须正好等于"框总宽减去边框内边距"。
+//
+// 之前这里差 6 格（textarea 按 width-4 设，但框里只装得下 width-8），
+// 结果字提前折行、框从 5 行长到 6 行，整个界面行数变了，inline 渲染把顶上的
+// 边框裁掉，看着就像输入框缺了一块。
+func TestInputBoxWidthMatchesContentArea(t *testing.T) {
+	for _, width := range []int{50, 80, 120} {
+		m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+		// 走真实消息路径，跟运行时一致
+		mi, _ := m.update(tea.WindowSizeMsg{Width: width, Height: 30})
+		m = mi.(model)
+
+		want := width - 4 - boxOverhead
+		if got := m.input.Width(); got != want {
+			t.Fatalf("宽 %d：输入框该是 %d 格（框总宽 %d 减边框内边距 %d），实际 %d 格",
+				width, want, width-4, boxOverhead, got)
+		}
+
+		// 不管打多少字，框都必须是 5 行（上边框 + 3 行内容 + 下边框），
+		// 而且不能比框还宽——长了就得自己滚动，不能把界面撑变形
+		for name, text := range map[string]string{
+			"空":    "",
+			"刚满一行": strings.Repeat("a", want),
+			"超一行":  strings.Repeat("a", want+2),
+			"很多行":  strings.Repeat("b", want*5),
+			"中文一堆": strings.Repeat("问", want/2+10),
+			"带换行的": strings.Repeat("x\n", 8),
+		} {
+			m.input.SetValue(text)
+			box := boxStyle.Width(width - 4).Render(m.input.View())
+			lines := strings.Split(box, "\n")
+			if len(lines) != 5 {
+				t.Fatalf("宽 %d %s：输入框该恒定 5 行，实际 %d 行", width, name, len(lines))
+			}
+			for i, ln := range lines {
+				if w := lipgloss.Width(ln); w > width-4 {
+					t.Fatalf("宽 %d %s：第 %d 行宽 %d，超过框宽 %d",
+						width, name, i, w, width-4)
+				}
+			}
+		}
+	}
+}
+
 // 有任务在跑时界面要自己续上定时刷新，跑完之后别再空转
 func TestTaskTickerRearms(t *testing.T) {
 	if runtime.GOOS == "windows" && tool.ShellName() == "cmd" {

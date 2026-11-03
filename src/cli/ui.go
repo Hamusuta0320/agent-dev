@@ -80,6 +80,11 @@ var (
 			BorderForeground(lipgloss.Color("238")).
 			Padding(0, 1)
 
+	// boxOverhead 是 boxStyle 边框和内边距总共吃掉的宽度：
+	// 左右各 1 格边框 + 左右各 1 格内边距 = 4 格。
+	// 输入框内部能放字的宽度必须是"框总宽 - 4"，算错了字会提前折行、框被撑高。
+	boxOverhead = 4
+
 	// 上下文占用里三类来源各用一种颜色，扫一眼就知道是哪一块在涨
 	usageSystemStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
 	usageToolStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("215"))
@@ -208,7 +213,10 @@ func newModel(cfg config.GlobalConfig, store *session.Store, workdir string, cur
 	input := textarea.New()
 	input.Placeholder = "问点什么，/help 看命令"
 	input.ShowLineNumbers = false
-	input.MaxHeight = 10
+	// 高度固定 3 行：整块界面依赖"行数恒定"来对齐，输入框一旦跟着内容长高，
+	// 下面的行就被挤出屏幕，inline 渲染会把顶上的边框裁掉，看着像输入框缺了一块。
+	// 内容超过 3 行时 textarea 自己滚动。
+	input.MaxHeight = 3
 	input.SetHeight(3)
 	input.Prompt = "" // 输入框前面不放箭头，边框已经够用了
 	styles := input.Styles()
@@ -218,7 +226,8 @@ func newModel(cfg config.GlobalConfig, store *session.Store, workdir string, cur
 	input.SetStyles(styles)
 	// Enter 留给"发送"，换行改用 Shift+Enter（终端不区分修饰键时 Ctrl+J 也能换行）
 	input.KeyMap.InsertNewline = key.NewBinding(key.WithKeys("shift+enter", "ctrl+j"))
-	input.SetWidth(78)
+	// 窗口尺寸还不知道，先给个占位宽度；收到 WindowSizeMsg 会按真实宽度重设
+	input.SetWidth(76 - boxOverhead)
 	input.Focus()
 
 	spin := spinner.New()
@@ -337,7 +346,8 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = max(msg.Width, 24)
 		m.height = max(msg.Height, 10)
-		m.input.SetWidth(m.width - 4)
+		// 输入框能放字的宽度 = 框总宽(width-4) 减去边框内边距(boxOverhead)
+		m.input.SetWidth(max(m.width-4-boxOverhead, 20))
 		m.resizeForm()
 		if !m.started {
 			// 第一次知道窗口多大：这时候打开场白，才算得准要补多少空行
