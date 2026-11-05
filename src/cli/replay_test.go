@@ -783,6 +783,42 @@ func TestReplayResumeRendersHistory(t *testing.T) {
 	}
 }
 
+// /resume 的列表里要能看出这次是聊什么的：标题跟在 id 后面；没标题的老会话
+// 就只到大小为止，不留一截空档。切过去之后恢复说明里也把标题带出来
+func TestReplayResumeListShowsTitle(t *testing.T) {
+	store := session.NewStore(filepath.Join(t.TempDir(), "sessions"))
+	titled := domain.NewSession(".")
+	titled.Title = "给恢复会话列表加标题"
+	titled.AppendUser("上次问的那个问题")
+	if err := store.Save(titled); err != nil {
+		t.Fatalf("准备会话失败: %v", err)
+	}
+	plain := domain.NewSession(".")
+	plain.AppendUser("很久以前的会话")
+	if err := store.Save(plain); err != nil {
+		t.Fatalf("准备会话失败: %v", err)
+	}
+
+	hs := newHarnessStore(t, 100, 30, false, store)
+	hs.send(doneMsg{}) // 这一轮跑完了，回到空闲才能敲命令
+	time.Sleep(200 * time.Millisecond)
+
+	for _, r := range "/resume" {
+		hs.p.Send(tea.KeyPressMsg(tea.Key{Code: r, Text: string(r)}))
+		time.Sleep(10 * time.Millisecond)
+	}
+	hs.p.Send(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	time.Sleep(300 * time.Millisecond)
+
+	view := strings.Join(hs.snapshot("会话列表"), "\n")
+	if !strings.Contains(view, "给恢复会话列表加标题") {
+		t.Fatalf("列表里应该有会话标题:\n%s", view)
+	}
+	if !strings.Contains(view, "很久以前的会话") && !strings.Contains(view, plain.Id) {
+		t.Fatalf("没标题的老会话也该列出来:\n%s", view)
+	}
+}
+
 // 待办清单出现在帧里（帧一下变高）或收起（帧一下变矮）的同时又往历史区打内容，
 // 是"帧高变化 + 插行"叠在一起的那一刻：插行的落点按屏幕上那一帧的位置算，
 // 按成另一帧的行数就会把帧顶出屏幕，旧帧的下半截留在屏幕上擦不掉。

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -227,13 +228,59 @@ func (s *Store) Load(id string) (*domain.Session, error) {
 // Info 是一条会话的摘要，用来在列表里挑一个恢复
 type Info struct {
 	Id string
+	// Title 是会话的标题，第一轮聊完由模型起；老会话没有，是空串
+	Title string
 	// Size 是会话文件大小，粗略体现会话有多长
 	Size    int64
 	ModTime time.Time
 }
 
+// titleHeadBytes 是找标题时只读文件头的字节数。标题紧跟在 id 后面，
+// 这点字节足够；会话再长也不用整个读进来
+const titleHeadBytes = 512
+
+// readTitle 从会话文件头上认出标题。没标题（老会话）或者读不出来时返回空串。
+// 文件只读开头一小段，所以里面那个 JSON 多半是断的——不能直接解整个对象
+// （截断的 JSON 解出来字段是空的），得顺着键一个个走，碰到 title 就取出来收工。
+func (s *Store) readTitle(id string) string {
+	path, err := s.path(id)
+	if err != nil {
+		return ""
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	dec := json.NewDecoder(io.LimitReader(f, titleHeadBytes))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return ""
+	}
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return ""
+		}
+		if keyTok != "title" {
+			// 别的字段整段跳过，值太长（比如 messages）就在这儿断了，反正标题已经错过了
+			var skip json.RawMessage
+			if err := dec.Decode(&skip); err != nil {
+				return ""
+			}
+			continue
+		}
+		var title string
+		if err := dec.Decode(&title); err != nil {
+			return ""
+		}
+		return strings.TrimSpace(title)
+	}
+	return ""
+}
+
 // ListInfo 列出已保存的会话摘要，按修改时间从新到旧（最新的排最前）。
-// 只看文件名和文件属性，不解析会话内容——会话多了也不会卡。
+// 只读文件名、文件属性和文件头里的标题，不解析整个会话——会话多了也不会卡。
 func (s *Store) ListInfo() ([]Info, error) {
 	entries, err := os.ReadDir(s.Dir)
 	if errors.Is(err, os.ErrNotExist) {
@@ -253,6 +300,7 @@ func (s *Store) ListInfo() ([]Info, error) {
 			info.Size = fi.Size()
 			info.ModTime = fi.ModTime()
 		}
+		info.Title = s.readTitle(info.Id)
 		infos = append(infos, info)
 	}
 	sort.Slice(infos, func(i, j int) bool {

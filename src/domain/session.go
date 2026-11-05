@@ -36,6 +36,9 @@ type SessionMessage struct {
 
 type Session struct {
 	Id string `json:"id"`
+	// Title 是第一轮聊完之后模型给起的一句话标题，/resume 列表里靠它认出是哪一次会话。
+	// 老会话没有这个字段，读出来是空串。字段位置紧跟在 id 后面：列表只读文件头就能拿到它
+	Title string `json:"title,omitempty"`
 	// WorkDir 是会话开始时的工作目录
 	WorkDir   string           `json:"work_dir,omitempty"`
 	CreatedAt time.Time        `json:"created_at"`

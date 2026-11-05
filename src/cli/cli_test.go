@@ -1570,16 +1570,16 @@ func TestResumeText(t *testing.T) {
 	}
 }
 
-// /resume 不带参数的列表：最近的在最前，当前会话要标出来
+// /resume 不带参数的列表：最近的在最前，当前会话要标出来，会话标题跟在后面
 func TestResumeListText(t *testing.T) {
 	cur := &domain.Session{Id: "20240102-000000-0001"}
 	infos := []session.Info{
-		{Id: "20240103-000000-0002", Size: 2048, ModTime: time.Date(2024, 1, 3, 9, 30, 0, 0, time.UTC)},
+		{Id: "20240103-000000-0002", Title: "给恢复会话列表加标题", Size: 2048, ModTime: time.Date(2024, 1, 3, 9, 30, 0, 0, time.UTC)},
 		{Id: cur.Id, Size: 512, ModTime: time.Date(2024, 1, 2, 9, 30, 0, 0, time.UTC)},
 	}
-	text := stripANSI(resumeListText(infos, cur))
+	text := stripANSI(resumeListText(infos, cur, 76))
 
-	for _, want := range []string{"共 2 个", "1. 20240103-000000-0002", "2K", "512B", "/resume 序号"} {
+	for _, want := range []string{"共 2 个", "1. 20240103-000000-0002", "2K", "512B", "/resume 序号", "给恢复会话列表加标题"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("列表里应该有 %q:\n%s", want, text)
 		}
@@ -1589,9 +1589,26 @@ func TestResumeListText(t *testing.T) {
 	}
 
 	// 一条都没有时给句提示，不要打出空列表
-	empty := stripANSI(resumeListText(nil, cur))
+	empty := stripANSI(resumeListText(nil, cur, 76))
 	if !strings.Contains(empty, "还没有存过的会话") {
 		t.Fatalf("空列表的说明不对: %s", empty)
+	}
+}
+
+// 老会话没有标题，列表里也不该留一截空档或者打个占位符出来
+func TestResumeListTextWithoutTitle(t *testing.T) {
+	infos := []session.Info{
+		{Id: "20240103-000000-0002", Size: 2048, ModTime: time.Date(2024, 1, 3, 9, 30, 0, 0, time.UTC)},
+	}
+	text := stripANSI(resumeListText(infos, nil, 76))
+	line := ""
+	for _, l := range strings.Split(text, "\n") {
+		if strings.Contains(l, "20240103-000000-0002") {
+			line = l
+		}
+	}
+	if !strings.HasSuffix(strings.TrimRight(line, " "), "2K") {
+		t.Fatalf("没标题时行尾就是大小，实际 %q", line)
 	}
 }
 

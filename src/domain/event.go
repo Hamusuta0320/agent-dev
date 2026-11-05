@@ -32,6 +32,9 @@ const (
 	// EventCompact 表示上下文压缩的进展（开始摘要、压完了多少、失败了），
 	// Text 是给用户看的一句话。它不影响 Run 的流程
 	EventCompact
+	// EventTitle 表示会话起了标题，Text 就是标题本身。
+	// 它只是告知，标题已经写进会话里了
+	EventTitle
 )
 
 // ToolStatus 是一次工具调用的执行状态

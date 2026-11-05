@@ -275,6 +275,9 @@ func sessionText(cur *domain.Session, workdir string, store *session.Store) stri
 		dir = store.Dir
 	}
 	out := fmt.Sprintf("工作区 %s\n会话 %s，共 %d 条消息", workdir, cur.Id, len(cur.Messages))
+	if title := strings.TrimSpace(cur.Title); title != "" {
+		out += "\n标题 " + title
+	}
 	if dir != "" {
 		out += "\n存到 " + dir
 	}

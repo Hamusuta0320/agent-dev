@@ -22,6 +22,9 @@ func Loop(ctx domain.Ctx) error {
 	}
 	ctx.Session.AppendUser(ctx.Prompt, ctx.Images...)
 	_, err := Run(ctx, ctx.Session)
+	// 聊完一轮就把会话命名一次：/resume 的列表里只有时间戳认不出是哪一次。
+	// 已经有标题（不是第一轮）就什么都不做；拟不出来也不影响这一轮的结果
+	ensureTitle(ctx, ctx.Session)
 	return err
 }
 
@@ -374,6 +377,12 @@ func ConsoleEmit(in io.Reader, out io.Writer) domain.EmitFunc {
 				midLine = false
 			}
 			fmt.Fprintf(out, "[压缩] %s\n", ev.Text)
+		case domain.EventTitle:
+			if midLine {
+				fmt.Fprintln(out)
+				midLine = false
+			}
+			fmt.Fprintf(out, "[会话] 标题 %s\n", ev.Text)
 		// 流式输出不带换行，这一轮结束要收个尾，否则下一轮的标题会粘在后面
 		case domain.EventAnswerEnd:
 			if midLine {

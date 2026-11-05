@@ -20,11 +20,15 @@ type fakeProvider struct {
 func (p *fakeProvider) Chat(ctx context.Context, messages []domain.AIChatMessage, tools []domain.ToolSpec, onDelta func(domain.StreamEvent)) (domain.ChatResult, error) {
 	p.calls = append(p.calls, messages)
 	p.step++
-	if p.step == 1 {
+	switch p.step {
+	case 1:
 		return domain.ChatResult{
 			Reasoning: "先看看文件",
 			ToolCalls: []domain.ToolCall{{Id: "call_1", Name: "echo", Arguments: `{"text":"hi"}`}},
 		}, nil
+	case 3:
+		// 第三轮是 Loop 收尾时给会话拟标题，不是对话
+		return domain.ChatResult{Content: "标题：修个 bug。"}, nil
 	}
 	return domain.ChatResult{Content: "改好了", Reasoning: "收尾"}, nil
 }
@@ -90,14 +94,21 @@ func TestLoopRecordsSession(t *testing.T) {
 	}
 
 	// 第二次请求应该已经带上历史（system + 用户 + 第一轮 assistant + tool）
-	if len(p.calls) != 2 {
-		t.Fatalf("应该请求两次模型，实际 %d", len(p.calls))
+	if len(p.calls) != 3 {
+		t.Fatalf("应该请求三次模型（两轮对话 + 一次拟标题），实际 %d", len(p.calls))
 	}
 	if len(p.calls[1]) != 4 {
 		t.Fatalf("第二次请求应该带 4 条消息，实际 %d: %+v", len(p.calls[1]), p.calls[1])
 	}
 	if p.calls[1][0].Role != domain.RoleSystem || p.calls[1][3].Role != domain.RoleTool {
 		t.Fatalf("历史顺序不对: %+v", p.calls[1])
+	}
+	// 第三次是收尾拟标题：拟出来的标题去掉"标题："和句号存进会话，/resume 列表认的就是它
+	if len(p.calls[2]) != 2 || p.calls[2][0].Content != titleSystemPrompt {
+		t.Fatalf("第三次请求应该是拟标题: %+v", p.calls[2])
+	}
+	if session.Title != "修个 bug" {
+		t.Fatalf("会话标题不对: %q", session.Title)
 	}
 }
 

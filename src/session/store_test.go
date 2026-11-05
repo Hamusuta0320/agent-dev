@@ -106,6 +106,42 @@ func TestListInfoMissingDir(t *testing.T) {
 	}
 }
 
+// 列表里的标题从文件头读出来：标题紧跟在 id 后面，会话再长也不整个解析
+func TestListInfoReadsTitle(t *testing.T) {
+	store := NewStore(filepath.Join(t.TempDir(), "sessions"))
+
+	titled := domain.NewSession(".")
+	titled.Title = "给恢复会话列表加标题"
+	titled.AppendUser("聊点别的")
+	// 塞一大段内容，让标题所在的文件头离末尾远一点
+	titled.AppendAssistant(strings.Repeat("很长的一段回答", 2000), "", nil)
+	if err := store.Save(titled); err != nil {
+		t.Fatalf("保存失败: %v", err)
+	}
+
+	// 老会话没有标题字段，读出来是空串，列表里就不显示
+	plain := domain.NewSession(".")
+	plain.AppendUser("老会话")
+	if err := store.Save(plain); err != nil {
+		t.Fatalf("保存失败: %v", err)
+	}
+
+	infos, err := store.ListInfo()
+	if err != nil {
+		t.Fatalf("列会话摘要失败: %v", err)
+	}
+	titles := map[string]string{}
+	for _, info := range infos {
+		titles[info.Id] = info.Title
+	}
+	if titles[titled.Id] != "给恢复会话列表加标题" {
+		t.Fatalf("标题没读出来: %q", titles[titled.Id])
+	}
+	if titles[plain.Id] != "" {
+		t.Fatalf("没标题的会话该给空串: %q", titles[plain.Id])
+	}
+}
+
 // 工作区 id 由目录路径决定：同一个目录永远得到同一个 id，不同目录不会撞
 func TestWorkspaceId(t *testing.T) {
 	root := t.TempDir()

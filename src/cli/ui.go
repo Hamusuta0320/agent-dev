@@ -1624,7 +1624,7 @@ func (m model) resume(input string) (tea.Model, tea.Cmd) {
 		return m, m.print(errStyle.Render("恢复会话失败: " + err.Error()))
 	}
 	if arg == "" {
-		return m, m.print(resumeListText(infos, m.cur))
+		return m, m.print(resumeListText(infos, m.cur, m.width-4))
 	}
 
 	id, err := pickSession(infos, arg)
@@ -1660,6 +1660,10 @@ func (m model) resumeText(next *domain.Session) string {
 	}
 	out = append(out, bannerStyle.Render("已恢复会话 "+next.Id)+
 		hintStyle.Render(fmt.Sprintf("，共 %d 条消息，目录 %s", len(next.Messages), m.store.Dir)))
+	// 起过标题的会话把名字也带上，好和列表里那一行对得上
+	if title := strings.TrimSpace(next.Title); title != "" {
+		out = append(out, hintStyle.Render("  标题 "+title))
+	}
 	// 别的目录里开的会话也照样能接着聊，只是工具仍按当前目录跑，提一句免得误会
 	if next.WorkDir != "" && next.WorkDir != m.workdir {
 		out = append(out, hintStyle.Render("  这个会话是在 "+next.WorkDir+" 开的；继续聊时工具还是在当前目录 "+
@@ -1684,8 +1688,9 @@ func pickSession(infos []session.Info, arg string) (string, error) {
 	return "", fmt.Errorf("没找到会话 %q，先 /resume 看列表", arg)
 }
 
-// resumeListText 是 /resume 不带参数时的会话列表：最近的在最前，当前会话标出来
-func resumeListText(infos []session.Info, cur *domain.Session) string {
+// resumeListText 是 /resume 不带参数时的会话列表：最近的在最前，当前会话标出来。
+// id 是一串时间戳，认不出是哪一次，所以有标题就把标题跟在后面；width 是列表可用的宽度
+func resumeListText(infos []session.Info, cur *domain.Session, width int) string {
 	title := bannerStyle.Render("会话列表") +
 		hintStyle.Render(fmt.Sprintf("  共 %d 个，最近的在最前", len(infos)))
 	if len(infos) == 0 {
@@ -1707,8 +1712,11 @@ func resumeListText(infos []session.Info, cur *domain.Session) string {
 		if !info.ModTime.IsZero() {
 			when = info.ModTime.Format("01-02 15:04")
 		}
-		lines = append(lines, style.Render(fmt.Sprintf("%s%d. %-24s %s  %s",
-			mark, i+1, info.Id, when, sizeText(info.Size))))
+		line := fmt.Sprintf("%s%d. %-24s %s  %s", mark, i+1, info.Id, when, sizeText(info.Size))
+		if t := strings.TrimSpace(info.Title); t != "" {
+			line += "  " + t
+		}
+		lines = append(lines, clipLine(style.Render(line), width))
 	}
 	if len(infos) > len(shown) {
 		lines = append(lines, hintStyle.Render(fmt.Sprintf("  …还有 %d 个更早的", len(infos)-len(shown))))
@@ -1931,6 +1939,10 @@ func (m model) handleEvent(ev domain.Event) (tea.Model, tea.Cmd) {
 	// 上下文压缩：压完会继续正常回答，这里只留一行说明，别打断用户的阅读
 	case domain.EventCompact:
 		out = append(out, hintStyle.Render("· "+ev.Text))
+
+	// 会话起好标题了：说一声，往后 /resume 列表里认的就是这个名字
+	case domain.EventTitle:
+		out = append(out, hintStyle.Render("· 会话标题 "+ev.Text))
 
 	case domain.EventAnswerEnd:
 		out = append(out, m.reasoningBlock()...)
