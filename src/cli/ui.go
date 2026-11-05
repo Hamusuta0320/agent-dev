@@ -1437,6 +1437,8 @@ func (m model) submit() (tea.Model, tea.Cmd) {
 		return m, m.print(helpText())
 	case cmdNew:
 		m.cur = domain.NewSession(m.workdir)
+		// 新会话还没起标题，窗口标题退回程序名：别继续挂着上一个会话的名字
+		setWindowTitle(m.cur.Title)
 		// 新会话，攒着的图不再属于谁，待办清单同理：它是上一个任务的进度表。
 		// 排队消息也一样——那是排给上一段对话的下一步
 		m.attachments = nil
@@ -1707,6 +1709,9 @@ func (m model) resume(input string) (tea.Model, tea.Cmd) {
 		next.Id = id
 	}
 	m.cur = next
+	// 换会话了，窗口标题跟着换成这段会话的名字；老会话没标题就退回程序名，
+	// 总之不能继续挂着上一个会话的名字
+	setWindowTitle(next.Title)
 	// 换会话了，攒着的图不再属于谁；上下文占用那行也得清掉，它说的是上一个会话
 	// 的用量，留着会让人以为这段历史已经占了那么多窗口。排队消息同理，那是排给上一段对话的
 	m.attachments = nil
@@ -2010,8 +2015,10 @@ func (m model) handleEvent(ev domain.Event) (tea.Model, tea.Cmd) {
 	case domain.EventCompact:
 		out = append(out, hintStyle.Render("· "+ev.Text))
 
-	// 会话起好标题了：说一声，往后 /resume 列表里认的就是这个名字
+	// 会话起好标题了：说一声，往后 /resume 列表里认的就是这个名字。
+	// 窗口标题也跟着换成它，缩到后台时靠窗口标题就能认出这个窗口在聊什么
 	case domain.EventTitle:
+		setWindowTitle(ev.Text)
 		out = append(out, hintStyle.Render("· 会话标题 "+ev.Text))
 
 	case domain.EventAnswerEnd:
