@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"strconv"
@@ -8,6 +9,7 @@ import (
 
 	"hamusuta/agent-dev/src/config"
 	"hamusuta/agent-dev/src/domain"
+	"hamusuta/agent-dev/src/provider"
 
 	"charm.land/bubbles/v2/textarea"
 	"charm.land/bubbles/v2/textinput"
@@ -23,11 +25,22 @@ type configField struct {
 
 // configFields 的顺序要和 configForm 里那几个输入框、以及 saveConfigForm 里取的顺序一致
 var configFields = []configField{
-	{"接口地址", "例如 https://api.deepseek.com"},
+	{"接口地址", "例如 https://api.deepseek.com，留空就用内置地址"},
 	{"密钥", "sk- 开头的那串"},
-	{"模型", "例如 deepseek-chat"},
+	{"模型", "例如 deepseek-chat；Ctrl+L 能从接口拉列表挑"},
 	{"上下文上限", "模型的上下文窗口（token），可填 128000、128k、1M（1M = 1024k）"},
 }
+
+// 表单里各字段的位置。键位和取值的代码都靠它认字段，不写魔法数字
+const (
+	urlField = iota
+	keyField
+	modelField
+	limitField
+)
+
+// maxFormModels 是模型候选列表最多显示几行，再多就在窗口里滚动
+const maxFormModels = 8
 
 // configForm 是 /config 打开的表单。值就存在 inputs 里，非编辑态按打码后的样子渲染，
 // 回车聚焦到某个 textinput 才进入编辑。
@@ -38,14 +51,40 @@ type configForm struct {
 	editing bool
 	err     string // 保存失败的提示
 
+	// models 是从接口拉回来的模型名，pickIdx 是候选里选中的那个（-1 表示列表没展开）。
+	// 两者都是"配好地址和密钥就能挑模型"用的，手填模型名照样可以
+	models  []string
+	pickIdx int
+	// wantPick 表示这份列表拉回来之后要直接展开候选（用户按 Ctrl+L 就是来挑的）
+	wantPick bool
+	// fetching 表示正在拉列表，fetchErr 是上次拉失败的原因
+	fetching bool
+	fetchErr string
+	// fetchSeq 是拉取序号：连按几次 Ctrl+L 时只认最后那次的结果
+	fetchSeq int
+
 	// name / typ 是这套模型的名字和协议类型：名字不在表单里改（它是 /model 认的那把钥匙），
 	// 类型也先固定，保存时原样带回去
 	name string
 	typ  string
 }
 
+// modelsFetchedMsg 是拉模型列表的结果回来了。apiUrl / seq 记着这次拉的是哪个地址、
+// 第几次拉，回来时表单里的地址已经改过或者又有一次更新的拉取在路上，就不认这份结果
+type modelsFetchedMsg struct {
+	models []string
+	apiUrl string
+	seq    int
+	err    error
+}
+
 func newConfigForm(mc config.ModelConfig) configForm {
-	values := []string{mc.ApiUrl, mc.ApiKey, mc.Model, strconv.Itoa(mc.Limit())}
+	apiUrl := strings.TrimSpace(mc.ApiUrl)
+	if apiUrl == "" {
+		// 没填过地址就先摆上内置的那个：DeepSeek / OpenAI 的地址是固定的，少打一遍
+		apiUrl = config.DefaultApiUrl(mc.Type)
+	}
+	values := []string{apiUrl, mc.ApiKey, mc.Model, strconv.Itoa(mc.Limit())}
 	inputs := make([]textinput.Model, len(configFields))
 	for i, f := range configFields {
 		in := textinput.New()
@@ -56,7 +95,7 @@ func newConfigForm(mc config.ModelConfig) configForm {
 		in.SetVirtualCursor(false)
 		inputs[i] = in
 	}
-	return configForm{inputs: inputs, name: mc.Label(), typ: mc.Type}
+	return configForm{inputs: inputs, name: mc.Label(), typ: mc.Type, pickIdx: -1}
 }
 
 // value 取某个字段去掉首尾空白后的值
@@ -67,21 +106,26 @@ func (f configForm) value(i int) string {
 	return strings.TrimSpace(f.inputs[i].Value())
 }
 
-// modelConfig 把表单里填的东西拼成一套模型配置；上下文上限留空就用默认值，
-// 填了但不是正整数（也认 128k、1M 这种带单位的写法，按 1024 进制换算）则返回错误，交给界面提示
+// modelConfig 把表单里填的东西拼成一套模型配置；接口地址留空就用内置的那个，
+// 上下文上限留空就用默认值，填了但不是正整数（也认 128k、1M 这种带单位的写法，
+// 按 1024 进制换算）则返回错误，交给界面提示
 func (f configForm) modelConfig() (config.ModelConfig, error) {
 	mc := config.ModelConfig{
 		Name:   f.name,
 		Type:   f.typ,
-		ApiUrl: f.value(0),
-		ApiKey: f.value(1),
-		Model:  f.value(2),
+		ApiUrl: f.value(urlField),
+		ApiKey: f.value(keyField),
+		Model:  f.value(modelField),
 	}
 	// 类型先只有 OpenAI 兼容这一套，没写就按 DeepSeek 记下来，配置文件里能看出是什么
 	if strings.TrimSpace(mc.Type) == "" {
 		mc.Type = "DeepSeek"
 	}
-	limit := f.value(3)
+	// 地址留空就用内置的那个：这两家的地址是固定的，没必要逼着人抄一遍
+	if mc.ApiUrl == "" {
+		mc.ApiUrl = config.DefaultApiUrl(mc.Type)
+	}
+	limit := f.value(limitField)
 	if limit == "" {
 		mc.ContextLimit = config.DefaultContextLimit
 		return mc, nil
@@ -113,17 +157,84 @@ func (m model) fieldLines() []string {
 			body = f.inputs[i].View()
 		case f.value(i) == "":
 			body = hintStyle.Render("（未填）" + fld.hint)
-		case i == 1:
+		case i == keyField:
 			body = maskSecret(f.value(i))
 		default:
 			body = f.value(i)
 		}
 		out = append(out, mark+hintStyle.Render(label)+body)
 	}
+	// 模型候选那一块：拉取中的进度、拉失败的提示、或者能挑的列表
+	out = append(out, f.listLines()...)
 	if f.err != "" {
 		out = append(out, errStyle.Render("  "+f.err))
 	}
 	return out
+}
+
+// picking 表示候选列表正展开着：这会儿 ↑↓ 是在列表里挪，而不是切字段
+func (f configForm) picking() bool {
+	return f.pickIdx >= 0 && f.pickIdx < len(f.models)
+}
+
+// listLines 是模型候选那一块，没有可说的就一行不占
+func (f configForm) listLines() []string {
+	switch {
+	case f.fetching:
+		return []string{hintStyle.Render("  正在从接口拉取模型列表…")}
+	case f.fetchErr != "":
+		return []string{errStyle.Render("  拉取模型列表失败：" + f.fetchErr) +
+			hintStyle.Render("（可以重试，也可以直接在模型那格手填）")}
+	case f.picking():
+		return modelPickLines(&f)
+	case len(f.models) > 0:
+		return []string{hintStyle.Render(fmt.Sprintf(
+			"  接口上有 %d 个模型：Ctrl+L 打开列表挑，或者直接在模型那格手填", len(f.models)))}
+	}
+	return nil
+}
+
+// modelPickLines 渲染候选列表：最多 maxFormModels 行，选中的那个始终留在可见范围里
+func modelPickLines(f *configForm) []string {
+	start, end := pickWindow(len(f.models), f.pickIdx, maxFormModels)
+	out := []string{hintStyle.Render(fmt.Sprintf("  可选模型 %d 个：", len(f.models)))}
+	for i := start; i < end; i++ {
+		mark, style := "  ", hintStyle
+		if i == f.pickIdx {
+			mark, style = "▸ ", promptStyle
+		}
+		out = append(out, mark+style.Render(f.models[i]))
+	}
+	if end < len(f.models) {
+		out = append(out, hintStyle.Render(fmt.Sprintf("  …还有 %d 个", len(f.models)-end)))
+	}
+	return out
+}
+
+// pickWindow 算出候选列表该显示哪一段：选中的那一项始终在窗口里，尽量落在中间。
+// n 是候选总数，idx 是选中的下标，rows 是窗口最多几行
+func pickWindow(n, idx, rows int) (int, int) {
+	if rows <= 0 || n <= 0 {
+		return 0, 0
+	}
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= n {
+		idx = n - 1
+	}
+	start := idx - rows/2
+	if start+rows > n {
+		start = n - rows
+	}
+	if start < 0 {
+		start = 0
+	}
+	end := start + rows
+	if end > n {
+		end = n
+	}
+	return start, end
 }
 
 // configLabelWidth 是表单里最长的那个标签有多宽，几行的值都对齐在它后面
@@ -174,13 +285,14 @@ func maskSecret(s string) string {
 	return string(r[:4]) + "…" + string(r[len(r)-4:])
 }
 
-// openConfig 打开配置表单，值从内存里的 cfg 重新读一遍，显示的就是当前生效的配置
+// openConfig 打开配置表单，值从内存里的 cfg 重新读一遍，显示的就是当前生效的配置。
+// 地址和密钥都填着的话顺手去接口拉一次模型列表：多半就是来换模型的，列表先摆好
 func (m model) openConfig() (tea.Model, tea.Cmd) {
 	m.form = newConfigForm(m.currentModel())
 	m.resizeForm()
 	m.state = stateConfig
 	m.input.Blur()
-	return m, nil
+	return m.pullModels(false)
 }
 
 // resizeForm 让表单里的输入框跟着终端宽度走，内容长了就横向滚动
@@ -210,6 +322,12 @@ func (m model) handleConfigKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		case "enter":
 			f.inputs[f.cur].Blur()
 			f.editing = false
+			// 刚改完地址或密钥：顺手去接口拉一遍模型列表，配好了就能直接挑模型
+			if (f.cur == urlField || f.cur == keyField) && f.value(f.cur) != strings.TrimSpace(f.backup) {
+				f.models = nil
+				f.pickIdx = -1
+				return m.pullModels(false)
+			}
 			return m, nil
 		case "esc":
 			f.inputs[f.cur].SetValue(f.backup) // 这一格改坏了就退回原值
@@ -222,27 +340,144 @@ func (m model) handleConfigKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
+	// 候选列表展开着：这会儿 ↑↓ 归列表，Enter 采用，Esc 收起
+	if f.picking() {
+		switch msg.String() {
+		case "up", "k":
+			f.pickIdx = (f.pickIdx - 1 + len(f.models)) % len(f.models)
+			return m, nil
+		case "down", "j":
+			f.pickIdx = (f.pickIdx + 1) % len(f.models)
+			return m, nil
+		case "enter":
+			f.chooseModel()
+			return m, nil
+		case "esc":
+			f.pickIdx = -1
+			return m, nil
+		}
+	}
+
 	switch msg.String() {
 	case "up", "shift+tab":
 		f.cur = (f.cur - 1 + len(configFields)) % len(configFields)
+		f.pickIdx = -1 // 换字段就把候选收起来，不然 ↑↓ 归谁说不清
 		f.err = ""
 		return m, nil
 	case "down", "tab":
 		f.cur = (f.cur + 1) % len(configFields)
+		f.pickIdx = -1
 		f.err = ""
 		return m, nil
 	case "enter":
 		f.backup = f.inputs[f.cur].Value()
 		f.inputs[f.cur].Focus()
 		f.editing = true
+		f.pickIdx = -1
 		f.err = ""
 		return m, textinput.Blink
+	case "ctrl+l":
+		return m.fetchModelList()
 	case "ctrl+s":
 		return m.saveConfig()
 	case "esc", "ctrl+c":
 		return m.closeConfig()
 	}
 	return m, nil
+}
+
+// fetchModelList 处理 Ctrl+L：去接口拉一遍模型列表，拉回来直接展开候选让人挑。
+// 地址或密钥还没填时先提示一句——这时候请求也发不出去
+func (m model) fetchModelList() (tea.Model, tea.Cmd) {
+	f := &m.form
+	if f.value(urlField) == "" {
+		f.err = "先填接口地址，再用 Ctrl+L 拉模型列表"
+		return m, nil
+	}
+	if f.value(keyField) == "" {
+		f.err = "先填密钥，再用 Ctrl+L 拉模型列表"
+		return m, nil
+	}
+	f.err = ""
+	f.models = nil
+	f.pickIdx = -1
+	return m.pullModels(true)
+}
+
+// pullModels 在地址和密钥都填着的时候去接口拉一遍模型列表。
+// wantPick 为真就拉回来直接展开候选（按 Ctrl+L 就是来挑模型的），
+// 否则只把列表记在手里，等用户要的时候再展开（打开表单、改完地址密钥时顺手拉的那次）
+func (m model) pullModels(wantPick bool) (tea.Model, tea.Cmd) {
+	f := &m.form
+	apiUrl, apiKey := f.value(urlField), f.value(keyField)
+	if apiUrl == "" || apiKey == "" {
+		return m, nil
+	}
+	f.fetchSeq++
+	f.fetching = true
+	f.fetchErr = ""
+	f.wantPick = wantPick
+	return m, fetchModels(apiUrl, apiKey, f.fetchSeq)
+}
+
+// fetchModels 起一个 Cmd 去接口拉模型列表。网络请求放进 Cmd 里跑，
+// 界面不会跟着卡一下；结果回来是 modelsFetchedMsg。seq 是这次拉取的序号，
+// 连按几次只认最后那次的结果
+func fetchModels(apiUrl, apiKey string, seq int) tea.Cmd {
+	return func() tea.Msg {
+		names, err := provider.ListModels(context.Background(), apiUrl, apiKey)
+		return modelsFetchedMsg{models: names, apiUrl: apiUrl, seq: seq, err: err}
+	}
+}
+
+// applyModelList 把拉回来的结果接到表单上。拉的还是改以前的地址、
+// 或者这会儿用户已经把地址改掉了、又有一次更新的拉取在路上，这份结果就不认了。
+// 失败时只有用户按 Ctrl+L 主动拉的那次才把原因摆出来：顺手拉的那次是后台行为，
+// 拿一条错误信息打断改配置的人不值当
+func (m model) applyModelList(msg modelsFetchedMsg) model {
+	f := &m.form
+	if msg.seq != f.fetchSeq {
+		return m
+	}
+	f.fetching = false
+	if strings.TrimSpace(msg.apiUrl) != f.value(urlField) {
+		return m
+	}
+	wantPick := f.wantPick
+	f.wantPick = false
+	if msg.err != nil {
+		f.models = nil
+		f.pickIdx = -1
+		f.fetchErr = ""
+		if wantPick {
+			f.fetchErr = msg.err.Error()
+		}
+		return m
+	}
+	f.fetchErr = ""
+	f.models = msg.models
+	f.pickIdx = -1
+	if wantPick {
+		// 光标停在现在填着的那个模型上，没填（或列表里没有）就停在第一个
+		f.pickIdx = 0
+		for i, name := range f.models {
+			if strings.EqualFold(name, f.value(modelField)) {
+				f.pickIdx = i
+				break
+			}
+		}
+	}
+	return m
+}
+
+// chooseModel 把候选里选中的那个填进模型那一格
+func (f *configForm) chooseModel() {
+	if !f.picking() {
+		return
+	}
+	f.inputs[modelField].SetValue(f.models[f.pickIdx])
+	f.pickIdx = -1
+	f.err = ""
 }
 
 // saveConfig 把表单里的值写回配置文件，并同步内存里的 cfg —— 不用重启，下一轮就用新配置。

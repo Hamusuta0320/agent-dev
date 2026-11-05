@@ -492,6 +492,13 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.cursorHold = false
 		return m, nil
 
+	case modelsFetchedMsg:
+		// 只认表单开着时候的结果：表单已经关了，这份列表就没用了
+		if m.state != stateConfig {
+			return m, nil
+		}
+		return m.applyModelList(msg), nil
+
 	case tea.KeyPressMsg:
 		if m.state == stateConfig {
 			return m.handleConfigKey(msg)
@@ -2444,8 +2451,19 @@ func (m model) frameLines() []string {
 // configFrameLines 是 /config 表单：表单本体 + 一行按键提示
 func (m model) configFrameLines() []string {
 	lines := m.fieldLines()
-	return append(lines,
-		hintStyle.Render("↑↓ 选字段 · Enter 编辑 · Ctrl+S 保存 · Esc 返回"))
+	return append(lines, hintStyle.Render(m.configHint()))
+}
+
+// configHint 是表单底部那行按键提示：候选列表展开时键位不一样，得跟着说
+func (m model) configHint() string {
+	f := &m.form
+	switch {
+	case f.picking():
+		return "↑↓ 选模型 · Enter 采用 · Esc 收起列表"
+	case f.fetching:
+		return "正在拉取模型列表…"
+	}
+	return "↑↓ 选字段 · Enter 编辑 · Ctrl+L 拉取模型列表 · Ctrl+S 保存 · Esc 返回"
 }
 
 // approvalFrameLines 是确认框：它顶替输入框，这一刻只能回答 y / a / n。

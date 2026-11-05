@@ -17,6 +17,25 @@ type ProbeConfig struct {
 // DefaultContextLimit 是上下文窗口的默认大小（token）：配置里没填时用它算已用百分比
 const DefaultContextLimit = 128000
 
+// 内置的接口地址。这两家都走 OpenAI 兼容协议，地址是固定的，不用每次手打；
+// 手填的地址永远优先，留空时才用这里的
+const (
+	DefaultDeepSeekApiUrl = "https://api.deepseek.com"
+	DefaultOpenAIApiUrl   = "https://api.openai.com/v1"
+)
+
+// DefaultApiUrl 按协议类型给出内置的接口地址。认不出的类型返回空串：
+// 瞎猜一个地址比让用户自己填更糟
+func DefaultApiUrl(typ string) string {
+	switch strings.ToLower(strings.TrimSpace(typ)) {
+	case "", "deepseek":
+		return DefaultDeepSeekApiUrl
+	case "openai":
+		return DefaultOpenAIApiUrl
+	}
+	return ""
+}
+
 // ModelConfig 是一套模型配置。Type 说明走哪套协议（DeepSeek 和 OpenAI 都是 OpenAI 兼容接口，
 // 只是地址和模型名不同），Name 是它在 Models 列表里的名字，/model 靠它切换。
 type ModelConfig struct {
