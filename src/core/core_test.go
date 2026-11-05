@@ -497,21 +497,6 @@ func TestCancelStopsRunAndFillsToolResults(t *testing.T) {
 	}
 }
 
-// sleepTool 睡一会儿再返回，用来观察同一批调用是不是并行跑的
-type sleepTool struct {
-	name string
-	d    time.Duration
-}
-
-func (t *sleepTool) Name() string           { return t.name }
-func (t *sleepTool) Description() string    { return "睡一会儿" }
-func (t *sleepTool) Schema() map[string]any { return map[string]any{"type": "object"} }
-func (t *sleepTool) Mutating() bool         { return false }
-func (t *sleepTool) Execute(ctx context.Context, raw json.RawMessage) (string, error) {
-	time.Sleep(t.d)
-	return t.name + " done", nil
-}
-
 // twoCallProvider 第一轮同时要两个只读工具，第二轮收尾
 type twoCallProvider struct{ step int }
 
@@ -526,18 +511,20 @@ func (p *twoCallProvider) Chat(ctx context.Context, messages []domain.AIChatMess
 	return domain.ChatResult{Content: "好了"}, nil
 }
 
-// 同一轮里的只读工具可以并行跑，不该一个等一个
+// 同一轮里的只读工具可以并行跑，不该一个等一个。
+// 判据是"两个调用有没有重叠"而不是墙钟耗时：机器一忙，计时就不准，这个用例
+// 在负载高的机器上会假报警（分开跑 240ms，并行跑 120ms，差得本来就不多）
 func TestReadOnlyToolsRunInParallel(t *testing.T) {
-	const d = 120 * time.Millisecond
+	// 两个调用共用同一个计数器，才能看出它们有没有同时跑
+	shared := &busyTool{name: "sleep_a"}
 	session := domain.NewSession("/tmp/demo")
 
-	start := time.Now()
 	if _, err := Run(domain.Ctx{
 		Prompt:   "看看两个文件",
 		Provider: &twoCallProvider{},
 		Tools: map[string]domain.Tool{
-			"sleep_a": &sleepTool{name: "sleep_a", d: d},
-			"sleep_b": &sleepTool{name: "sleep_b", d: d},
+			"sleep_a": shared,
+			"sleep_b": shared,
 		},
 		Context: context.Background(),
 		WorkDir: "/tmp/demo",
@@ -546,9 +533,8 @@ func TestReadOnlyToolsRunInParallel(t *testing.T) {
 	}, session); err != nil {
 		t.Fatalf("Run 失败: %v", err)
 	}
-	elapsed := time.Since(start)
-	if elapsed > d+d/2 {
-		t.Fatalf("两个 %s 的只读工具应该并行跑，实际花了 %s", d, elapsed)
+	if !shared.overlap.Load() {
+		t.Fatal("两个只读工具应该并行跑，实际一个等一个")
 	}
 }
 

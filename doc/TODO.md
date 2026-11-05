@@ -3,6 +3,10 @@
 当前状态：`go build` / `go vet` / `go test ./...` 全过。TUI、会话持久化与恢复、上下文压缩、
 贴图提问、后台任务、审批 diff 预览、约定文件与技能、工作模式隔离、失败重试都已可用。
 
+技能除了模型自己按需读，用户也能直接点名：`/技能名 [补充说明]` 会把那份 `SKILL.md`
+整段并进这一条提问（`src/core/skills.go` 的 `SkillPrompt`），`/skills` 列出装了哪些；
+输入 `/` 开头时技能和内置命令一起补全，认不出来的 `/xxx` 会提示一句而不是发给模型。
+
 下面按"代码里已经留了空目录"→"功能缺口"→"工程化"排。
 
 ## 一、规划了但还没写的目录
@@ -16,8 +20,10 @@
       想调措辞得改代码；独立出来还能做多套模板，比如给子任务用的精简版。
 - [ ] `src/log/` —— 结构化日志。现在只有界面展示和 `core.ConsoleEmit` 的纯文本输出，
       跑完之后出了问题没法回溯。
-- [ ] `src/model/` —— 模型抽象。`config.DeepSeekConfig` 名字写死在类型上，
-      协议也只有 OpenAI 兼容一套（`src/provider/openai/`），接 Anthropic 得动到配置结构。
+- [ ] `src/model/` —— 接非 OpenAI 兼容的模型（比如 Anthropic 的 `/v1/messages`）。
+      配置结构已经换成 `config.ModelConfig`（`DeepSeekConfig` 只是老名字的别名），
+      造 provider 的入口也收敛到 `provider.New`，缺的是新协议本身的实现。
+      剩下的多模型工作不需要这个目录也能做，先空着。
 
 ## 二、功能缺口
 
@@ -34,13 +40,20 @@
 
 ### 多模型
 
-- [ ] 配置只有一份 `Provider`，没有 `/model` 切换。换模型要 `/config` 走一遍表单再写回文件。
-      多个 provider 配置 + 运行时切换，是接多家模型的前置条件。
+- [x] 配置可以写多套模型（`config.yaml` 的 `Models` 列表 + `Current` 指定默认用哪套），
+      `/model` 列出并切换，切换会写回配置；`/config` 改的是当前这套。
+      老配置只写 `Provider` 一段照常能跑，保存时会把 Models / Current / Provider 一起写齐。
+      新增 `provider.New(config.ModelConfig)`，Type 认 DeepSeek / OpenAI（都是 OpenAI 兼容接口）。
+- [ ] 还差一家：Anthropic 那套 `/v1/messages` 协议和 OpenAI 兼容接口不一样，得单独实现一个
+      provider 并在 `provider.New` 里分派。
 
 ### 待办跟踪
 
-- [ ] 没有 todo 清单。多步任务全靠模型自己记，长任务容易跑偏。
+- [x] `TodoWrite` 工具（`src/tool/todo.go`）：整份传上来整份替换，状态只有 pending /
+      in_progress / completed 三种。清单存在内存里，输入框上方常驻一行进度，`/todo` 看完整清单，
+      `/new`、`/resume` 时清空。系统提示词里写清了什么时候该开清单、任何时候最多一条进行中。
       注意 `Task` 工具（`src/tool/task.go`）是后台 bash 进程，不是子 agent，别混。
+- [ ] 清单没有跟着会话存盘：现在退出就没了。要留的话得进 `domain.Session`。
 
 ### 会话管理
 

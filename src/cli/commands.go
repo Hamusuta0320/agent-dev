@@ -2,8 +2,11 @@ package main
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
+	"unicode"
 
+	"hamusuta/agent-dev/src/core"
 	"hamusuta/agent-dev/src/domain"
 	"hamusuta/agent-dev/src/session"
 )
@@ -19,6 +22,9 @@ const (
 	cmdSession
 	cmdConfig
 	cmdMode
+	cmdModel
+	cmdSkills
+	cmdTodo
 	cmdExit
 )
 
@@ -35,8 +41,11 @@ var commandSpecs = []commandSpec{
 	{cmdNew, "/new", "开一个新会话"},
 	{cmdResume, "/resume", "恢复以前的会话：不带参数列出来，带序号或 id 切过去"},
 	{cmdSession, "/session", "看当前会话 id 和消息条数"},
-	{cmdConfig, "/config", "配置模型：接口地址、密钥、模型名"},
+	{cmdConfig, "/config", "配置当前这套模型：接口地址、密钥、模型名"},
 	{cmdMode, "/mode", "看或切换工作模式：只读 / 编辑需授权 / 完全授权"},
+	{cmdModel, "/model", "看配置好的几套模型，或切到其中一套（会写回配置文件）"},
+	{cmdSkills, "/skills", "看装了哪些技能，直接 /技能名 就能调用"},
+	{cmdTodo, "/todo", "看这次任务的待办清单"},
 	{cmdExit, "/exit", "退出（也可以 Ctrl+D）"},
 }
 
@@ -59,6 +68,12 @@ func parseCommand(input string) command {
 		return cmdConfig
 	case "/mode":
 		return cmdMode
+	case "/model":
+		return cmdModel
+	case "/skills":
+		return cmdSkills
+	case "/todo":
+		return cmdTodo
 	case "/exit", "/quit", "exit", "quit":
 		return cmdExit
 	}
@@ -82,6 +97,68 @@ func suggestCommands(input string) []commandSpec {
 		return nil
 	}
 	return out
+}
+
+// suggestSkills 是能补全的技能：名字前面补个 /，和内置命令摆在同一张候选表里。
+// 规则跟内置命令一样，只在还没打空格时补；已经打全了就不再提示。
+// 这里对大小写不敏感——技能名是用户自己起的，不该逼他记住大小写
+func suggestSkills(input string, skills []core.Skill) []commandSpec {
+	s := strings.TrimLeft(input, " \t")
+	if !strings.HasPrefix(s, "/") || strings.ContainsAny(s, " \t\n") {
+		return nil
+	}
+	lower := strings.ToLower(s)
+	var out []commandSpec
+	for _, skill := range skills {
+		name := "/" + skill.Name
+		if strings.HasPrefix(strings.ToLower(name), lower) {
+			out = append(out, commandSpec{name: name, desc: skill.Desc})
+		}
+	}
+	if len(out) == 1 && strings.EqualFold(out[0].name, s) {
+		return nil
+	}
+	return out
+}
+
+// looksLikeCommand 判断输入的第一段是不是"想打一条命令"：/ 开头，后面全是名字里
+// 该有的字符（字母、数字、连字符、下划线）。认出来却没有对应的命令或技能，
+// 说一句比闷头发给模型强；/tmp/foo.log 这种带路径分隔符的照旧当普通提问
+func looksLikeCommand(field string) bool {
+	if !strings.HasPrefix(field, "/") || len(field) == 1 {
+		return false
+	}
+	for _, r := range field[1:] {
+		switch {
+		case r == '-' || r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// firstField 是输入的第一段，空输入时返回空串
+func firstField(input string) string {
+	if fields := strings.Fields(input); len(fields) > 0 {
+		return fields[0]
+	}
+	return ""
+}
+
+// parseSkillCall 把 "/技能名 补充说明" 拆成技能和后面那截补充说明。
+// 认不出技能时 ok 为 false——是命令打错了还是技能名不对，交给调用方去看
+func parseSkillCall(input string, skills []core.Skill) (core.Skill, string, bool) {
+	name := firstField(input)
+	if name == "" {
+		return core.Skill{}, "", false
+	}
+	skill, ok := core.FindSkill(skills, name)
+	if !ok {
+		return core.Skill{}, "", false
+	}
+	rest := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(input), name))
+	return skill, rest, true
 }
 
 func helpText() string {
@@ -111,15 +188,82 @@ func helpText() string {
 		"  只贴图不写字也能发；Esc 清空附图；一条提问最多 "+fmt.Sprint(maxAttachments)+
 			" 张，单张最大 "+fmt.Sprint(domain.MaxImageBytes>>20)+"MB",
 		"",
+		bannerStyle.Render("待办与模型"),
+		"  多步任务里模型会用 TodoWrite 列清单，输入框上方常驻一行进度，/todo 看完整清单",
+		"  /model 列出配置好的几套模型，/model 名字切过去（会写回配置文件，重启还是它）",
+		"  配置文件在用户目录下的 .agent-dev/config.yaml，跟工作区无关；Models 下可以写好几套，",
+		"  Current 指定默认用哪套；只写老格式的 Provider 段也能跑，/config 保存一次就会补齐两条",
+		"",
 		bannerStyle.Render("约定与技能"),
 		"  工作目录和它上层目录里的 AGENTS.md 会自动读进提示词，不用每次重复交代",
 		"  没有 AGENTS.md 的地方才退回读 CLAUDE.md，同一处只读一份",
 		"  跨项目通用的规矩放 ~/.agents/AGENTS.md（全局，同样优先于 ~/.claude/CLAUDE.md）",
 		"  技能放在 ~/.agents/skills/<名字>/SKILL.md：文件头 frontmatter 里写 name 和 description，",
 		"  正文写步骤；启动后模型能看到技能清单，用到时自己把那份文件读完再动手",
+		"  想直接点名用某个技能，就打 /技能名（后面可以跟补充说明，也可以不带）——",
+		"  那份 SKILL.md 会整段摆进这一条消息里，模型照着做，不用再读一遍文件",
+		"  /skills 看装了哪些技能；输入 / 开头的名字时，技能和内置命令一起补全",
+		"  /help 之外以 / 开头又不认识的，会提示一句，不会当成提问发给模型",
 	)
 	return strings.Join(lines, "\n")
 }
+
+// skillsText 是 /skills 的输出：装了哪些技能，以及怎么直接调用
+func skillsText(skills []core.Skill) string {
+	root, _ := core.SkillsRoot()
+	title := bannerStyle.Render("技能")
+	if len(skills) == 0 {
+		return title + "\n" + hintStyle.Render("  还没装：把说明放进 "+
+			filepath.Join(root, "<名字>", "SKILL.md")+"，重启后 /skills 就能看到")
+	}
+	title += hintStyle.Render(fmt.Sprintf("  %d 个，目录 %s", len(skills), root))
+	// 名字长短不一，按最长的对齐，后面的说明才不会参差
+	width := 0
+	for _, skill := range skills {
+		if n := len([]rune(skill.Name)) + 1; n > width {
+			width = n
+		}
+	}
+	lines := []string{title}
+	for _, skill := range skills {
+		lines = append(lines, promptStyle.Render(fmt.Sprintf("  /%-*s", width, skill.Name))+
+			hintStyle.Render(" "+skill.Desc))
+	}
+	lines = append(lines,
+		"",
+		hintStyle.Render("  直接调用：/技能名，后面可以跟补充说明；那份 SKILL.md 会整段摆进这一条消息"))
+	return strings.Join(lines, "\n")
+}
+
+// unknownCommandText 是打了一条不认识的 /命令 时的提示。
+// 技能名记不全很常见，把名字里含这段字都列出来，比只甩一句"没有这个命令"有用
+func unknownCommandText(name string, skills []core.Skill) string {
+	lower := strings.ToLower(strings.TrimPrefix(name, "/"))
+	var near []string
+	for _, spec := range commandSpecs {
+		if strings.Contains(strings.TrimPrefix(spec.name, "/"), lower) {
+			near = append(near, spec.name)
+		}
+	}
+	for _, skill := range skills {
+		if strings.Contains(strings.ToLower(skill.Name), lower) {
+			near = append(near, "/"+skill.Name)
+		}
+	}
+	lines := []string{errStyle.Render("没有叫 " + name + " 的命令或技能")}
+	if len(near) > maxNearCommands {
+		near = near[:maxNearCommands]
+	}
+	if len(near) > 0 {
+		lines = append(lines, hintStyle.Render("  相近的：")+strings.Join(near, " · "))
+	}
+	lines = append(lines, hintStyle.Render(
+		"  /help 看命令，/skills 看装了哪些技能；不想走命令就把开头的 / 去掉"))
+	return strings.Join(lines, "\n")
+}
+
+// maxNearCommands 是"相近的命令"最多列几个：列一屏沾边的等于没提示
+const maxNearCommands = 8
 
 func sessionText(cur *domain.Session, workdir string, store *session.Store) string {
 	dir := ""

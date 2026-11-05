@@ -147,6 +147,107 @@ func TestSkillsRoot(t *testing.T) {
 	}
 }
 
+// 按名字找技能：带不带 / 都认，前缀只在对得上唯一一个时才认——
+// 猜错了会拿另一个技能的步骤去干活，比让用户多打几个字糟得多
+func TestFindSkill(t *testing.T) {
+	skills := []Skill{
+		{Name: "add-disease", Path: "a"},
+		{Name: "add-scheduled-task", Path: "b"},
+		{Name: "Research", Path: "c"},
+	}
+	cases := []struct {
+		name string
+		want string
+		ok   bool
+	}{
+		{"add-disease", "add-disease", true},
+		{"/add-disease", "add-disease", true},
+		{"  /add-disease  ", "add-disease", true},
+		{"research", "Research", true}, // 大小写不敏感
+		{"res", "Research", true},      // 唯一前缀
+		{"add", "", false},             // 前缀对上两个，不猜
+		{"zzz", "", false},
+		{"", "", false},
+		{"/", "", false},
+	}
+	for _, c := range cases {
+		got, ok := FindSkill(skills, c.name)
+		if ok != c.ok {
+			t.Fatalf("%q 应该是 %v，实际 %v", c.name, c.ok, ok)
+		}
+		if ok && got.Name != c.want {
+			t.Fatalf("%q 应该找到 %s，实际 %s", c.name, c.want, got.Name)
+		}
+	}
+}
+
+// 手动调用技能时把说明正文整段摆进消息：模型不用再读一遍文件，
+// frontmatter 留着自己用，不占发给模型的正文
+func TestSkillPromptInlinesBody(t *testing.T) {
+	root := t.TempDir()
+	writeSkill(t, root, "pdf", `---
+name: pdf-处理
+description: 拆分合并 PDF
+---
+# 步骤
+
+1. 确认 qpdf 装好了。
+`)
+	skills := loadSkills(root)
+	if len(skills) != 1 {
+		t.Fatalf("应该 1 个技能，实际 %d 个", len(skills))
+	}
+	got := SkillPrompt(skills[0], "把 a.pdf 和 b.pdf 合并")
+	for _, want := range []string{
+		"pdf-处理",
+		"/pdf-处理",
+		skills[0].Path,
+		"--- 技能说明开始 ---",
+		"1. 确认 qpdf 装好了。",
+		"--- 技能说明结束 ---",
+		"把 a.pdf 和 b.pdf 合并",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("展开出来的消息里缺少 %q:\n%s", want, got)
+		}
+	}
+	// 正文前面的 frontmatter 不该跟着塞进去
+	if strings.Contains(got, "description: 拆分合并 PDF") {
+		t.Fatalf("frontmatter 不该出现在正文里:\n%s", got)
+	}
+
+	// 没补充说明时，让模型先问清楚缺什么
+	if bare := SkillPrompt(skills[0], "   "); !strings.Contains(bare, "没有补充说明") {
+		t.Fatalf("应该交代一句没有补充说明:\n%s", bare)
+	}
+}
+
+// 说明读不动（文件没了、或者大到会把上下文吃光）时，退回把路径留给模型自己读
+func TestSkillPromptFallsBackToPath(t *testing.T) {
+	missing := Skill{Name: "gone", Path: filepath.Join(t.TempDir(), "nope", skillFileName)}
+	got := SkillPrompt(missing, "")
+	if !strings.Contains(got, missing.Path) || !strings.Contains(got, "Read") {
+		t.Fatalf("读不动时应该让模型自己去读:\n%s", got)
+	}
+	if strings.Contains(got, "--- 技能说明开始 ---") {
+		t.Fatalf("没读到正文就不该有正文分隔线:\n%s", got)
+	}
+
+	root := t.TempDir()
+	writeSkill(t, root, "huge", strings.Repeat("很长的一行说明\n", maxSkillPromptBytes/8))
+	huge := loadSkills(root)
+	if len(huge) != 1 {
+		t.Fatalf("应该 1 个技能，实际 %d 个", len(huge))
+	}
+	big := SkillPrompt(huge[0], "")
+	if strings.Contains(big, "--- 技能说明开始 ---") {
+		t.Fatalf("超过上限的说明不该整段摆进去（%d 字节）", len(big))
+	}
+	if !strings.Contains(big, huge[0].Path) {
+		t.Fatalf("大文件也得把路径留给模型:\n%.200s", big)
+	}
+}
+
 func writeSkill(t *testing.T, root, name, content string) {
 	t.Helper()
 	dir := filepath.Join(root, name)

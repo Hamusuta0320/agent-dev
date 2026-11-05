@@ -25,6 +25,11 @@ const maxSkillSectionBytes = 32 << 10
 // maxSkillDescRunes 是一句话描述的截断长度，描述写成长篇也该压成一行
 const maxSkillDescRunes = 80
 
+// maxSkillPromptBytes 是用户手动调用技能时，直接摆进消息里的说明正文上限。
+// SKILL.md 一般只有几 KB；真碰上几百 KB 的那种，塞进去会把上下文挤掉，
+// 还不如把路径留给模型，让它自己去 Read
+const maxSkillPromptBytes = 128 << 10
+
 // Skill 是一个装在技能目录里的技能：名字、一句话说明，以及说明文件的完整路径。
 // 描述只用来决定"要不要用它"，真要用还得让模型去 Read 那个文件
 type Skill struct {
@@ -115,6 +120,80 @@ func loadSkills(root string) []Skill {
 		skills = skills[:maxSkills]
 	}
 	return skills
+}
+
+// Skills 返回技能目录里装好的技能（按名字排序）。没装技能、读不动目录时返回空，
+// 调用方不用处理错误：技能是锦上添花，缺了不该拦住任何流程
+func Skills() []Skill {
+	root, err := SkillsRoot()
+	if err != nil {
+		return nil
+	}
+	return loadSkills(root)
+}
+
+// FindSkill 在清单里按名字找一个技能，名字前面的 "/" 会自动去掉。
+// 先认完整名字，再认只对得上的前缀；前缀能对上好几个就当没找到——
+// 猜错了会拿另一个技能的步骤去干活，比让用户多打几个字糟得多
+func FindSkill(skills []Skill, name string) (Skill, bool) {
+	name = strings.TrimSpace(name)
+	name = strings.TrimSpace(strings.TrimPrefix(name, "/"))
+	if name == "" {
+		return Skill{}, false
+	}
+	for _, s := range skills {
+		if strings.EqualFold(s.Name, name) {
+			return s, true
+		}
+	}
+	lower := strings.ToLower(name)
+	var matched []Skill
+	for _, s := range skills {
+		if strings.HasPrefix(strings.ToLower(s.Name), lower) {
+			matched = append(matched, s)
+		}
+	}
+	if len(matched) == 1 {
+		return matched[0], true
+	}
+	return Skill{}, false
+}
+
+// SkillPrompt 把一份技能展开成一条用户消息：说明全文摆在前头，再接用户补的话。
+// 用户既然点名要这个技能，就省掉"模型先 Read 一遍再说"那一轮，
+// 也保证它看到的是完整的那份说明，而不是记忆里的一行描述
+func SkillPrompt(s Skill, rest string) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "用户手动调用了技能「%s」（/%s），这次就照它的步骤做。\n", s.Name, s.Name)
+	fmt.Fprintf(&sb, "技能文件：%s\n", s.Path)
+
+	if body := skillBody(s.Path); body != "" {
+		sb.WriteString("\n--- 技能说明开始 ---\n")
+		sb.WriteString(strings.TrimSpace(body))
+		sb.WriteString("\n--- 技能说明结束 ---\n")
+	} else {
+		// 读不动或者太大：路径已经给了，让模型自己去读，别把这份说明整段丢掉
+		sb.WriteString("（这份说明没能一次读进来——太大或读不动，先用 Read 把上面那个文件读完再动手。）\n")
+	}
+
+	if rest = strings.TrimSpace(rest); rest != "" {
+		sb.WriteString("\n用户这一条说：" + rest)
+	} else {
+		sb.WriteString("\n用户没有补充说明：技能里要什么输入、缺哪些信息，先问清楚再动手。")
+	}
+	return sb.String()
+}
+
+// skillBody 读技能说明的正文（去掉 frontmatter）；读不动或者超过上限时返回空串
+func skillBody(path string) string {
+	text, err := tool.ReadText(path)
+	if err != nil || len(text) > maxSkillPromptBytes {
+		return ""
+	}
+	if _, body := splitFrontMatter(text); strings.TrimSpace(body) != "" {
+		return body
+	}
+	return text
 }
 
 // readSkill 读一份 SKILL.md：名字和描述优先取文件头的 frontmatter，

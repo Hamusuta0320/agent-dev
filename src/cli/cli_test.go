@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"hamusuta/agent-dev/src/config"
+	"hamusuta/agent-dev/src/core"
 	"hamusuta/agent-dev/src/domain"
 	"hamusuta/agent-dev/src/session"
 	"hamusuta/agent-dev/src/tool"
@@ -237,7 +239,7 @@ func TestWithMark(t *testing.T) {
 // 输入以 / 开头时列出能补全的命令，打全了就不再提示
 func TestSuggestCommands(t *testing.T) {
 	cases := map[string][]string{
-		"/":     {"/help", "/new", "/resume", "/session", "/config", "/mode", "/exit"},
+		"/":     {"/help", "/new", "/resume", "/session", "/config", "/mode", "/model", "/skills", "/todo", "/exit"},
 		"/c":    {"/config"},
 		"/re":   {"/resume"},
 		"/se":   {"/session"},
@@ -355,23 +357,56 @@ func TestEnterCompletesPartialCommand(t *testing.T) {
 // 补全候选要跟选中项同步，高亮只打在选中那一行
 func TestCompletionLines(t *testing.T) {
 	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+	// 本机装了什么技能不该影响这条断言，技能单独的补全在 TestSuggestSkills 里测
+	m.skills = nil
 	m.input.SetValue("/")
 	m.suggestIdx = 2
 	lines := m.completionLines()
-	if len(lines) != len(commandSpecs) {
-		t.Fatalf("候选应该全列出来: %q", lines)
+	// 候选比槽位多：留一行报总数，其余是选中项附近的几个
+	if len(lines) != maxActiveRows {
+		t.Fatalf("候选应该压到 %d 行: %q", maxActiveRows, lines)
 	}
-	for i, line := range lines {
+	for i, line := range lines[:maxActiveRows-1] {
 		hasMark := strings.HasPrefix(stripANSI(line), "▸ ")
 		if hasMark != (i == 2) {
 			t.Fatalf("第 %d 行的高亮不对: %q", i, line)
 		}
+	}
+	if last := stripANSI(lines[len(lines)-1]); !strings.Contains(last, strconv.Itoa(len(commandSpecs))) {
+		t.Fatalf("最后一行该说明一共有多少候选: %q", last)
 	}
 
 	// 不是命令输入时没有候选
 	m.input.SetValue("你好")
 	if lines := m.completionLines(); lines != nil {
 		t.Fatalf("普通输入不该有候选: %q", lines)
+	}
+}
+
+// 候选多到一屏放不下时，选中项必须始终留在可见的那一段里，
+// 否则 ↑↓ 就是在摸黑挪光标
+func TestCompletionLinesFollowsSelection(t *testing.T) {
+	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+	m.skills = nil
+	for i := 0; i < 30; i++ {
+		m.skills = append(m.skills, core.Skill{Name: fmt.Sprintf("skill-%02d", i), Desc: "技能"})
+	}
+	m.input.SetValue("/skill-")
+
+	last := len(m.suggestAll()) - 1
+	m.suggestIdx = last
+	lines := m.completionLines()
+	if len(lines) != maxActiveRows {
+		t.Fatalf("应该压到 %d 行，实际 %d 行", maxActiveRows, len(lines))
+	}
+	found := false
+	for _, line := range lines {
+		if strings.HasPrefix(stripANSI(line), "▸ ") && strings.Contains(stripANSI(line), "skill-29") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("选到最后一项时它该留在可见范围内: %q", lines)
 	}
 }
 
@@ -408,8 +443,8 @@ func TestConfigFormSave(t *testing.T) {
 	if saved.state != stateIdle {
 		t.Fatalf("保存成功应该回到输入状态，状态 %v", saved.state)
 	}
-	if dc := deepSeekConfig(saved.cfg); dc.Model != "deepseek-chat" || dc.ApiKey != "sk-test" {
-		t.Fatalf("内存里的配置没更新: %+v", dc)
+	if dc, err := saved.cfg.CurrentModel(); err != nil || dc.Model != "deepseek-chat" || dc.ApiKey != "sk-test" {
+		t.Fatalf("内存里的配置没更新: %+v, %v", dc, err)
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -667,16 +702,16 @@ func TestUsageLine(t *testing.T) {
 
 // 配置表单里的上下文上限：默认带出默认值，填了就用填的，填了非正整数要拦住
 func TestConfigFormContextLimit(t *testing.T) {
-	f := newConfigForm(config.DeepSeekConfig{ApiUrl: "https://api.deepseek.com", ApiKey: "sk-1", Model: "deepseek-chat"})
+	f := newConfigForm(config.ModelConfig{ApiUrl: "https://api.deepseek.com", ApiKey: "sk-1", Model: "deepseek-chat"})
 	if got := f.value(3); got != strconv.Itoa(config.DefaultContextLimit) {
 		t.Fatalf("表单里应该带出默认上限，实际 %q", got)
 	}
-	if dc, err := f.deepSeekConfig(); err != nil || dc.Limit() != config.DefaultContextLimit {
+	if dc, err := f.modelConfig(); err != nil || dc.Limit() != config.DefaultContextLimit {
 		t.Fatalf("没动过上限时应该用默认值: %+v, %v", dc, err)
 	}
 
 	f.inputs[3].SetValue("64000")
-	dc, err := f.deepSeekConfig()
+	dc, err := f.modelConfig()
 	if err != nil {
 		t.Fatalf("填了合法上限不该报错: %v", err)
 	}
@@ -686,7 +721,7 @@ func TestConfigFormContextLimit(t *testing.T) {
 
 	for _, bad := range []string{"abc", "0", "-5", "12x"} {
 		f.inputs[3].SetValue(bad)
-		if _, err := f.deepSeekConfig(); err == nil {
+		if _, err := f.modelConfig(); err == nil {
 			t.Fatalf("上限填 %q 应该报错", bad)
 		}
 	}
@@ -701,7 +736,7 @@ func TestConfigFormContextLimit(t *testing.T) {
 		{"1.5M", 1572864},
 	} {
 		f.inputs[3].SetValue(c.in)
-		dc, err := f.deepSeekConfig()
+		dc, err := f.modelConfig()
 		if err != nil {
 			t.Fatalf("上限填 %q 不该报错: %v", c.in, err)
 		}
@@ -965,15 +1000,15 @@ func TestActiveViewKeepsHeight(t *testing.T) {
 	m.width, m.height = 80, 30
 
 	lines := func() int { return strings.Count(m.activeView(), "\n") + 1 }
-	if got := lines(); got != activeRows {
-		t.Fatalf("闲着时这块也应该是 %d 行，实际 %d 行", activeRows, got)
+	if got := lines(); got != m.activeRows() {
+		t.Fatalf("闲着时这块也应该是 %d 行，实际 %d 行", m.activeRows(), got)
 	}
 	idle := m.viewLines()
 
 	// 补全候选占几行也不该改变这块的高度
 	m.input.SetValue("/")
-	if got := lines(); got != activeRows {
-		t.Fatalf("有补全候选时这块应该是 %d 行，实际 %d 行", activeRows, got)
+	if got := lines(); got != m.activeRows() {
+		t.Fatalf("有补全候选时这块应该是 %d 行，实际 %d 行", m.activeRows(), got)
 	}
 
 	// 跑任务时状态、思考和回答越长，这块也还是同样的高度
@@ -981,8 +1016,8 @@ func TestActiveViewKeepsHeight(t *testing.T) {
 	m.status = "思考中…"
 	m.reasoning.WriteString(strings.Repeat("想了很久\n", 40))
 	m.answer.WriteString(strings.Repeat("回答很长\n", 40))
-	if got := lines(); got != activeRows {
-		t.Fatalf("运行中这块应该是 %d 行，实际 %d 行", activeRows, got)
+	if got := lines(); got != m.activeRows() {
+		t.Fatalf("运行中这块应该是 %d 行，实际 %d 行", m.activeRows(), got)
 	}
 	if got := m.viewLines(); got != idle {
 		t.Fatalf("跑起来之后界面总行数应该还是 %d 行，实际 %d 行", idle, got)
@@ -1001,8 +1036,8 @@ func TestActiveViewKeepsHeight(t *testing.T) {
 		{id: "1", lines: m.toolCallLines(domain.ToolCall{Name: "Read", Arguments: `{"path":"a.go"}`})},
 		{id: "2", lines: m.toolCallLines(domain.ToolCall{Name: "Grep", Arguments: `{"pattern":"x"}`})},
 	}
-	if got := lines(); got != activeRows {
-		t.Fatalf("有工具在跑时这块应该是 %d 行，实际 %d 行", activeRows, got)
+	if got := lines(); got != m.activeRows() {
+		t.Fatalf("有工具在跑时这块应该是 %d 行，实际 %d 行", m.activeRows(), got)
 	}
 }
 
@@ -1017,8 +1052,8 @@ func TestIdleSlotShowsLastAnswer(t *testing.T) {
 	}
 
 	m.lastAnswer = "第一行\n" + strings.Repeat("中间这段会被挤掉\n", 20) + "最后一行"
-	if got := strings.Count(m.activeView(), "\n") + 1; got != activeRows {
-		t.Fatalf("这块应该恒定 %d 行，实际 %d 行", activeRows, got)
+	if got := strings.Count(m.activeView(), "\n") + 1; got != m.activeRows() {
+		t.Fatalf("这块应该恒定 %d 行，实际 %d 行", m.activeRows(), got)
 	}
 	view := stripANSI(m.activeView())
 	if !strings.Contains(view, "上一轮回答（结尾）") {
@@ -1039,8 +1074,8 @@ func TestIdleSlotShowsLastAnswer(t *testing.T) {
 	// 超长的一行要折好，不能把槽位撑破
 	m.input.SetValue("")
 	m.lastAnswer = strings.Repeat("很长的一句话", 40)
-	if got := strings.Count(m.activeView(), "\n") + 1; got != activeRows {
-		t.Fatalf("长行折行后这块还是 %d 行，实际 %d 行", activeRows, got)
+	if got := strings.Count(m.activeView(), "\n") + 1; got != m.activeRows() {
+		t.Fatalf("长行折行后这块还是 %d 行，实际 %d 行", m.activeRows(), got)
 	}
 }
 
@@ -1049,8 +1084,8 @@ func TestIdleSlotShowsHints(t *testing.T) {
 	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
 	m.width, m.height = 80, 30
 
-	if got := strings.Count(m.activeView(), "\n") + 1; got != activeRows {
-		t.Fatalf("摆提示时这块也该恒定 %d 行，实际 %d 行", activeRows, got)
+	if got := strings.Count(m.activeView(), "\n") + 1; got != m.activeRows() {
+		t.Fatalf("摆提示时这块也该恒定 %d 行，实际 %d 行", m.activeRows(), got)
 	}
 	view := stripANSI(m.activeView())
 	for _, want := range []string{"/help", "/config", "/mode", "Enter 发送", "Ctrl+V 贴图"} {
@@ -1175,8 +1210,8 @@ func TestTasksLineInView(t *testing.T) {
 		(!strings.Contains(idleView, "已跑") && !strings.Contains(idleView, "耗时")) {
 		t.Fatalf("闲时槽位里该有任务 id 和时长:\n%s", idleView)
 	}
-	if got := strings.Count(m.activeView(), "\n") + 1; got != activeRows {
-		t.Fatalf("有任务时这块也该恒定 %d 行，实际 %d 行", activeRows, got)
+	if got := strings.Count(m.activeView(), "\n") + 1; got != m.activeRows() {
+		t.Fatalf("有任务时这块也该恒定 %d 行，实际 %d 行", m.activeRows(), got)
 	}
 }
 
@@ -1701,5 +1736,107 @@ func TestClipboardTextPatchesApprovalFeedback(t *testing.T) {
 	}
 	if after.input.Value() != "" {
 		t.Fatalf("输入框不该被改到: %q", after.input.Value())
+	}
+}
+
+// 技能名也能补全：候选里名字前面带上 /，跟内置命令摆在同一条链上
+func TestSuggestSkills(t *testing.T) {
+	skills := []core.Skill{
+		{Name: "add-disease", Desc: "添加病种"},
+		{Name: "add-scheduled-task", Desc: "开发定时任务"},
+		{Name: "research", Desc: "查资料"},
+	}
+	cases := map[string]string{
+		"/add":         "/add-disease,/add-scheduled-task",
+		"/res":         "/research",
+		"/ADD":         "/add-disease,/add-scheduled-task", // 技能名是用户自己起的，不该逼他记大小写
+		"/add-disease": "",                                 // 已经打全了
+		"/new":         "",                                 // 内置命令不在这张表里
+		"/add 加个病种":    "",                                 // 开始写参数了
+		"":             "",
+		"你好":           "",
+	}
+	for input, want := range cases {
+		var got []string
+		for _, spec := range suggestSkills(input, skills) {
+			got = append(got, spec.name)
+		}
+		if strings.Join(got, ",") != want {
+			t.Fatalf("%q 的技能候选是 %v，应该是 %q", input, got, want)
+		}
+	}
+}
+
+// 补全候选里内置命令永远排在技能前面：打一个 / 时第一项还得是 /help，
+// 不会因为装了几百个技能就把熟悉的命令挤走
+func TestSuggestAllKeepsBuiltinsFirst(t *testing.T) {
+	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+	m.skills = []core.Skill{{Name: "aaa-skill", Desc: "排在最前面的技能"}}
+	m.input.SetValue("/")
+	specs := m.suggestAll()
+	if len(specs) != len(commandSpecs)+1 {
+		t.Fatalf("候选数不对: %d", len(specs))
+	}
+	if specs[0].name != "/help" {
+		t.Fatalf("第一项应该是 /help，实际 %q", specs[0].name)
+	}
+	if last := specs[len(specs)-1].name; last != "/aaa-skill" {
+		t.Fatalf("技能应该接在命令后面，实际最后一项 %q", last)
+	}
+}
+
+// / 开头、后面全是名字里该有的字符，才算"想打命令"；带路径分隔符的照旧当提问
+func TestLooksLikeCommand(t *testing.T) {
+	cases := map[string]bool{
+		"/zzz":         true,
+		"/add-disease": true,
+		"/a_b":         true,
+		"/技能名":         true,
+		"/":            false,
+		"":             false,
+		"/tmp/foo.log": false,
+		"/a.b":         false,
+		"hello":        false,
+	}
+	for input, want := range cases {
+		if got := looksLikeCommand(input); got != want {
+			t.Fatalf("%q 应该 %v，实际 %v", input, want, got)
+		}
+	}
+}
+
+// "/技能名 补充说明" 要拆成技能和后面那截；认不出就交回去让调用方报错
+func TestParseSkillCall(t *testing.T) {
+	skills := []core.Skill{
+		{Name: "add-disease", Path: "x"},
+		{Name: "add-scheduled-task", Path: "y"},
+	}
+	if skill, rest, ok := parseSkillCall("/add-disease 加个病种，参考 XX", skills); !ok {
+		t.Fatal("应该认出技能")
+	} else if skill.Name != "add-disease" || rest != "加个病种，参考 XX" {
+		t.Fatalf("拆得不对: %+v %q", skill, rest)
+	}
+	// 只打命令名，没有补充说明
+	if _, rest, ok := parseSkillCall("/add-disease", skills); !ok || rest != "" {
+		t.Fatalf("应该认出技能、补充说明为空: %q %v", rest, ok)
+	}
+	// 前缀能对上两个就不猜
+	if _, _, ok := parseSkillCall("/add", skills); ok {
+		t.Fatal("前缀对上多个时不该选一个")
+	}
+	if _, _, ok := parseSkillCall("/zzz", skills); ok {
+		t.Fatal("不认识的命令不该认成技能")
+	}
+}
+
+// 打错的命令要指出相近的，别只甩一句"没有"
+func TestUnknownCommandText(t *testing.T) {
+	skills := []core.Skill{{Name: "add-disease", Desc: "添加病种"}}
+	got := unknownCommandText("/disease", skills)
+	if !strings.Contains(got, "相近的：") || !strings.Contains(got, "/add-disease") {
+		t.Fatalf("应该列出相近的技能:\n%s", got)
+	}
+	if !strings.Contains(got, "/skills") {
+		t.Fatalf("应该提示 /skills 看装了哪些技能:\n%s", got)
 	}
 }

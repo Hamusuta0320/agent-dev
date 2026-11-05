@@ -53,7 +53,7 @@ type statusError struct {
 }
 
 func (e *statusError) Error() string {
-	return fmt.Sprintf("deepseek 返回 %d: %s", e.code, e.body)
+	return fmt.Sprintf("模型接口返回 %d: %s", e.code, e.body)
 }
 
 // retriable 说明这个状态码值不值得再试
@@ -248,7 +248,7 @@ func (p DeepSeekProvider) attempt(ctx context.Context, reqBody []byte, onDelta f
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return chatResult, fmt.Errorf("请求 deepseek 失败: %w", err)
+		return chatResult, fmt.Errorf("请求模型接口失败: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -460,7 +460,11 @@ func contextOrBackground(ctx context.Context) context.Context {
 
 func NewDeepSeek(dc config.DeepSeekConfig) (DeepSeekProvider, error) {
 	if dc.ApiUrl == "" || dc.ApiKey == "" || dc.Model == "" {
-		return DeepSeekProvider{}, fmt.Errorf("deepseek 配置不完整：ApiUrl/ApiKey/Model 必填")
+		label := dc.Label()
+		if label == "" {
+			label = "（未命名）"
+		}
+		return DeepSeekProvider{}, fmt.Errorf("模型 %s 的配置不完整：ApiUrl/ApiKey/Model 必填", label)
 	}
 	return DeepSeekProvider{
 		Cfg: dc,

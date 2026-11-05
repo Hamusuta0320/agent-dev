@@ -37,10 +37,15 @@ type configForm struct {
 	backup  string // 进入编辑前的值，Esc 用它撤销
 	editing bool
 	err     string // 保存失败的提示
+
+	// name / typ 是这套模型的名字和协议类型：名字不在表单里改（它是 /model 认的那把钥匙），
+	// 类型也先固定，保存时原样带回去
+	name string
+	typ  string
 }
 
-func newConfigForm(dc config.DeepSeekConfig) configForm {
-	values := []string{dc.ApiUrl, dc.ApiKey, dc.Model, strconv.Itoa(dc.Limit())}
+func newConfigForm(mc config.ModelConfig) configForm {
+	values := []string{mc.ApiUrl, mc.ApiKey, mc.Model, strconv.Itoa(mc.Limit())}
 	inputs := make([]textinput.Model, len(configFields))
 	for i, f := range configFields {
 		in := textinput.New()
@@ -49,7 +54,7 @@ func newConfigForm(dc config.DeepSeekConfig) configForm {
 		in.SetValue(values[i])
 		inputs[i] = in
 	}
-	return configForm{inputs: inputs}
+	return configForm{inputs: inputs, name: mc.Label(), typ: mc.Type}
 }
 
 // value 取某个字段去掉首尾空白后的值
@@ -60,33 +65,38 @@ func (f configForm) value(i int) string {
 	return strings.TrimSpace(f.inputs[i].Value())
 }
 
-// deepSeekConfig 把表单里填的东西拼成配置；上下文上限留空就用默认值，
+// modelConfig 把表单里填的东西拼成一套模型配置；上下文上限留空就用默认值，
 // 填了但不是正整数（也认 128k、1M 这种带单位的写法，按 1024 进制换算）则返回错误，交给界面提示
-func (f configForm) deepSeekConfig() (config.DeepSeekConfig, error) {
-	dc := config.DeepSeekConfig{
-		Type:   "DeepSeek",
+func (f configForm) modelConfig() (config.ModelConfig, error) {
+	mc := config.ModelConfig{
+		Name:   f.name,
+		Type:   f.typ,
 		ApiUrl: f.value(0),
 		ApiKey: f.value(1),
 		Model:  f.value(2),
 	}
+	// 类型先只有 OpenAI 兼容这一套，没写就按 DeepSeek 记下来，配置文件里能看出是什么
+	if strings.TrimSpace(mc.Type) == "" {
+		mc.Type = "DeepSeek"
+	}
 	limit := f.value(3)
 	if limit == "" {
-		dc.ContextLimit = config.DefaultContextLimit
-		return dc, nil
+		mc.ContextLimit = config.DefaultContextLimit
+		return mc, nil
 	}
 	n, err := domain.ParseTokens(limit)
 	if err != nil {
-		return dc, fmt.Errorf("上下文上限填正整数或带单位（128k、1M，1M = 1024k）: %w", err)
+		return mc, fmt.Errorf("上下文上限填正整数或带单位（128k、1M，1M = 1024k）: %w", err)
 	}
-	dc.ContextLimit = n
-	return dc, nil
+	mc.ContextLimit = n
+	return mc, nil
 }
 
 // fieldLines 渲染表单主体，第一行是标题
 func (m model) fieldLines() []string {
 	f := &m.form
 	out := []string{
-		bannerStyle.Render("模型配置") + hintStyle.Render("  DeepSeek · "+m.cfgPathLabel()),
+		bannerStyle.Render("模型配置") + hintStyle.Render("  "+modelFormTitle(f)+" · "+m.cfgPathLabel()),
 	}
 	width := 0
 	for _, fld := range configFields {
@@ -141,7 +151,7 @@ func maskSecret(s string) string {
 
 // openConfig 打开配置表单，值从内存里的 cfg 重新读一遍，显示的就是当前生效的配置
 func (m model) openConfig() (tea.Model, tea.Cmd) {
-	m.form = newConfigForm(deepSeekConfig(m.cfg))
+	m.form = newConfigForm(m.currentModel())
 	m.resizeForm()
 	m.state = stateConfig
 	m.input.Blur()
@@ -210,32 +220,73 @@ func (m model) handleConfigKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// saveConfig 把表单里的值写回配置文件，并同步内存里的 cfg —— 不用重启，下一轮就用新配置
+// saveConfig 把表单里的值写回配置文件，并同步内存里的 cfg —— 不用重启，下一轮就用新配置。
+// 配了好几套模型时改的是当前这套：按名字替换掉 Models 里对应的那一条
 func (m model) saveConfig() (tea.Model, tea.Cmd) {
-	dc, err := m.form.deepSeekConfig()
+	mc, err := m.form.modelConfig()
 	if err != nil {
 		m.form.err = err.Error()
 		return m, nil
 	}
-	if dc.ApiUrl == "" || dc.ApiKey == "" || dc.Model == "" {
+	if mc.ApiUrl == "" || mc.ApiKey == "" || mc.Model == "" {
 		m.form.err = "接口地址、密钥、模型都得填"
 		return m, nil
 	}
-	if err := config.SaveProvider(m.cfgPath, dc); err != nil {
+	// 还没有名字的新模型就用模型名当名字，/model 里才有得叫
+	if strings.TrimSpace(mc.Name) == "" {
+		mc.Name = mc.Label()
+	}
+	models := replaceModel(m.cfg.AvailableModels(), mc)
+	if err := config.SaveModels(m.cfgPath, models, mc.Name); err != nil {
 		m.form.err = err.Error()
 		return m, nil
 	}
-	if err := m.cfg.Provider.Encode(dc); err != nil {
-		m.form.err = "已写入文件，但内存配置没更新成功: " + err.Error()
-		return m, nil
-	}
+	m.cfg.Models = models
+	m.cfg.Current = mc.Name
+	// 老的 Provider 段跟着同步一份，还按老格式读配置的代码看到的也是当前这套
+	legacy := mc
+	legacy.Name = ""
+	_ = m.cfg.Provider.Encode(legacy)
+
 	// 保存后重新生成表单，密钥回到打码显示
-	m.form = newConfigForm(dc)
-	m.contextLimit = dc.Limit()
+	m.form = newConfigForm(mc)
+	m.contextLimit = mc.Limit()
 	m.state = stateIdle
 	m.input.Focus()
 	return m, tea.Sequence(
 		m.print(bannerStyle.Render("模型配置已保存")+hintStyle.Render("  → "+m.cfgPathLabel())),
 		textarea.Blink,
 	)
+}
+
+// replaceModel 把 mc 放进 models：名字对得上的那条原地换掉，没有就追加。
+// 名字是 /model 认的那把钥匙，所以改名等于新增一套
+func replaceModel(models []config.ModelConfig, mc config.ModelConfig) []config.ModelConfig {
+	out := make([]config.ModelConfig, 0, len(models)+1)
+	replaced := false
+	for _, old := range models {
+		if !replaced && strings.EqualFold(old.Label(), mc.Name) {
+			out = append(out, mc)
+			replaced = true
+			continue
+		}
+		out = append(out, old)
+	}
+	if !replaced {
+		out = append(out, mc)
+	}
+	return out
+}
+
+// modelFormTitle 是表单标题里那句"哪套模型 · 什么类型"
+func modelFormTitle(f *configForm) string {
+	name := strings.TrimSpace(f.name)
+	if name == "" {
+		name = "新模型"
+	}
+	kind := strings.TrimSpace(f.typ)
+	if kind == "" {
+		kind = "DeepSeek"
+	}
+	return name + " · " + kind
 }

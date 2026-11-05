@@ -38,7 +38,9 @@ func TestForMode(t *testing.T) {
 func TestMutatingFlags(t *testing.T) {
 	want := map[string]bool{
 		"Read": false, "Grep": false, "Glob": false, "Task": false,
-		"Write": true, "Edit": true, "Bash": true,
+		// 待办清单只存在内存里，不碰磁盘
+		"TodoWrite": false,
+		"Write":     true, "Edit": true, "Bash": true,
 	}
 	for name, mutating := range want {
 		tool, ok := Tools[name]

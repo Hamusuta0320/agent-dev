@@ -38,8 +38,15 @@ const (
 	stateApproval
 )
 
-// 默认的配置文件路径，和 main 里 loadConfig 用的是同一个
-const defaultCfgPath = "config.yaml"
+// defaultCfgPath 是配置文件的默认位置：用户目录下的 .agent-dev/config.yaml，跟工作区无关。
+// 取不到用户目录时退回当前目录的 config.yaml，好歹能启动
+func defaultCfgPath() string {
+	path, err := config.DefaultPath()
+	if err != nil {
+		return "config.yaml"
+	}
+	return path
+}
 
 // 运行中在底部预览几行，结束后打到上方历史区；太长的内容只显示开头几行，
 // 完整内容在会话文件里
@@ -58,12 +65,40 @@ const (
 	maxTaskChips = 3
 	// maxResumeList 是 /resume 列表最多列几个会话，再多就折成一句"还有 N 个"
 	maxResumeList = 10
-	// activeRows 是输入框上方那块会变的内容固定占几行：跑任务时是状态、工具调用
-	// 和预览的尾巴，闲着时是补全候选。行数必须恒定——Bubble Tea 在 inline 模式下
-	// 遇到帧变矮，会把腾出来的行空在屏幕底部，输入框就离了屏幕底边；宁可在上面
-	// 补空行。7 行正好放得下全部命令候选。
-	activeRows = 7
+	// maxActiveRows 是输入框上方那块会变的内容最多占几行：跑任务时是状态、工具调用
+	// 和预览的尾巴，闲着时是补全候选。7 行正好放得下全部命令候选。
+	//
+	// 但它是上限不是定值，实际占几行由 activeRows() 按终端高度算——帧一旦高到快
+	// 占满屏幕，inline 渲染的滚动账就算不对了，屏幕上会叠出好几份界面。
+	maxActiveRows = 7
+	// minActiveRows 是再挤也要给这块留的行数，不然运行状态完全看不见
+	minActiveRows = 1
+	// chromeRows 是帧里除这块以外固定占掉的行数：待办 + 任务栏 + 附图 +
+	// 输入框（上边框 + 3 行内容 + 下边框）+ 上下文占用 + 按键提示
+	chromeRows = 10
+	// reserveHistoryRows 是帧上方至少留给历史区的行数。这块不能是 0：print
+	// 是靠"光标此刻在最后一屏的底部"来插行的，帧顶到终端顶上时这个前提就废了
+	reserveHistoryRows = 3
 )
+
+// activeRows 算出输入框上方那块内容实际能占几行。
+//
+// 它必须随终端高度收缩：帧高一旦逼近屏幕高度，每次 print 往上方插行时算出来的
+// 滚动量就偏了，屏幕上会留下好几份叠在一起的界面（状态行、输入框边框、上下文占用
+// 各出现好几遍）。宁可少显示几行预览，也不能让帧把屏幕占满。
+func (m model) activeRows() int {
+	if m.height <= 0 {
+		return maxActiveRows
+	}
+	avail := m.height - chromeRows - reserveHistoryRows
+	if avail < minActiveRows {
+		return minActiveRows
+	}
+	if avail > maxActiveRows {
+		return maxActiveRows
+	}
+	return avail
+}
 
 var (
 	bannerStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212"))
@@ -149,6 +184,10 @@ type model struct {
 	workdir string
 	cur     *domain.Session
 
+	// skills 是用户目录下装好的技能，启动时读一次。输入补全和 /技能名 手动调用
+	// 都靠它；运行期不重扫，中途装的技能重启之后才出现
+	skills []core.Skill
+
 	input  textarea.Model
 	spin   spinner.Model
 	state  uiState
@@ -209,6 +248,10 @@ type model struct {
 	quitting bool
 }
 
+// loadSkills 读用户目录下的技能清单。单独抽成一个变量是为了测试：
+// 不抽的话每个用 newModel 的测试都得依赖本机装了什么技能
+var loadSkills = core.Skills
+
 func newModel(cfg config.GlobalConfig, store *session.Store, workdir string, cur *domain.Session) model {
 	input := textarea.New()
 	input.Placeholder = "问点什么，/help 看命令"
@@ -246,19 +289,22 @@ func newModel(cfg config.GlobalConfig, store *session.Store, workdir string, cur
 
 	// 配置里的模式写错了不该拦住启动，退回默认模式，/mode 会立刻显示成什么
 	mode, _ := domain.ParseMode(cfg.Mode)
+	// 配置里可能写了好几套模型，用 Current 指的那套；解不出来就留空，界面照样能开
+	current, _ := cfg.CurrentModel()
 
 	return model{
 		cfg:          cfg,
-		cfgPath:      defaultCfgPath,
+		cfgPath:      defaultCfgPath(),
 		store:        store,
 		workdir:      workdir,
 		cur:          cur,
+		skills:       loadSkills(),
 		input:        input,
 		spin:         spin,
 		toolSpin:     toolSpin,
 		state:        stateIdle,
-		form:         newConfigForm(deepSeekConfig(cfg)),
-		contextLimit: deepSeekConfig(cfg).Limit(),
+		form:         newConfigForm(current),
+		contextLimit: current.Limit(),
 		mode:         mode,
 		reasoning:    &strings.Builder{},
 		answer:       &strings.Builder{},
@@ -276,8 +322,9 @@ func (m model) Init() tea.Cmd {
 func (m model) bannerLines() []string {
 	lines := []string{
 		bannerStyle.Render("agent-dev") + hintStyle.Render("  会话 "+m.cur.Id),
-		hintStyle.Render("模式 ") + statusStyle.Render(m.mode.Label()) +
-			hintStyle.Render(" · Enter 发送 · Shift+Enter 换行 · Ctrl+C 退出 · /help 看命令"),
+		hintStyle.Render("模型 ") + statusStyle.Render(m.modelLabel()) +
+			hintStyle.Render(" · 模式 ") + statusStyle.Render(m.mode.Label()) +
+			hintStyle.Render(" · Enter 发送 · Shift+Enter 换行 · /help 看命令"),
 	}
 	if inVSCodeTerminal() {
 		// VS Code 集成终端会把 Tab 拿去移动焦点，键根本到不了程序，先把后路写在脸上
@@ -481,6 +528,11 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, pasteFromClipboard()
 		}
 
+	case "ctrl+l":
+		// 屏幕上要是留下了上一帧的残影（拖过窗口、滚过滚轮之后容易出现），
+		// 按这个键把整块内容按内存里的底账重打一遍，界面立刻恢复干净
+		return m, m.rebuild()
+
 	case "esc":
 		// 附了图想撤：闲着时 Esc 没别的用处，就用来清空
 		if m.state == stateIdle && len(m.attachments) > 0 {
@@ -497,7 +549,7 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	movingRight := msg.Code == tea.KeyRight && m.cursorAtEnd()
 	if isCompleteKey(msg) || movingRight {
 		if m.state == stateIdle {
-			if specs := suggestCommands(m.input.Value()); len(specs) > 0 {
+			if specs := m.suggestAll(); len(specs) > 0 {
 				return m.complete(specs)
 			}
 		}
@@ -508,7 +560,7 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 	// 输入框上方有补全候选时，↑↓ 选、Enter 补全
 	if m.state == stateIdle {
-		if specs := suggestCommands(m.input.Value()); len(specs) > 0 {
+		if specs := m.suggestAll(); len(specs) > 0 {
 			switch msg.String() {
 			case "up":
 				m.suggestIdx = (m.curSuggest(specs) - 1 + len(specs)) % len(specs)
@@ -889,6 +941,15 @@ func callDetailLines(call domain.ToolCall) []string {
 			return nil
 		}
 		return []string{hintStyle.Render("  " + taskLabel(args))}
+	case "TodoWrite":
+		var args tool.TodoArgs
+		if json.Unmarshal([]byte(call.Arguments), &args) != nil {
+			return nil
+		}
+		if len(args.Todos) == 0 {
+			return []string{hintStyle.Render("  清空清单")}
+		}
+		return []string{hintStyle.Render("  " + tool.TodoProgress(args.Todos))}
 	}
 	// 认不出的工具（将来加的）退回参数摘要，总比什么都不显示强
 	return []string{hintStyle.Render(" " + firstLines(call.Arguments, toolArgRunes))}
@@ -1060,6 +1121,12 @@ func bashDetailLines(call domain.ToolCall) []string {
 	return out
 }
 
+// suggestAll 是输入框上方的全部补全候选：内置命令排前面，技能接在后面。
+// 内置命令永远在前，所以打一个 / 时第一项还是 /help，不会因为装了技能就换位
+func (m model) suggestAll() []commandSpec {
+	return append(suggestCommands(m.input.Value()), suggestSkills(m.input.Value(), m.skills)...)
+}
+
 // curSuggest 把选中项夹进候选范围：输入变过之后旧下标可能已经越界
 func (m model) curSuggest(specs []commandSpec) int {
 	if m.suggestIdx < 0 || m.suggestIdx >= len(specs) {
@@ -1097,21 +1164,54 @@ func (m model) cursorAtEnd() bool {
 	return m.input.Line() == len(lines)-1 && m.input.Column() == len([]rune(last))
 }
 
-// completionLines 是输入框上方的补全候选，选中的一行高亮
+// completionLines 是输入框上方的补全候选，选中的一行高亮。
+// 候选可能上百个（技能一装就是几十个），这块槽位又只有 maxActiveRows 行，
+// 所以只显示选中项附近的一段，另外用一行交代总共有多少。
 func (m model) completionLines() []string {
-	specs := suggestCommands(m.input.Value())
+	specs := m.suggestAll()
 	if len(specs) == 0 {
 		return nil
 	}
 	cur := m.curSuggest(specs)
-	out := make([]string, 0, len(specs))
-	for i, spec := range specs {
-		name := fmt.Sprintf("%-9s", spec.name)
+	total := len(specs)
+	// 槽位高度随终端缩，窗口也跟着它走：留一行给末尾那句说明
+	rows := m.activeRows()
+	if rows < 2 {
+		rows = 2
+	}
+	start, end := 0, total
+	overflow := total > rows
+	if overflow {
+		visible := rows - 1
+		start = cur - visible/2
+		if start < 0 {
+			start = 0
+		}
+		if start > total-visible {
+			start = total - visible
+		}
+		end = start + visible
+	}
+	// 技能名长短差很多（add-disease 这样的比 /mode 长得多），
+	// 列宽按窗口里最长的那条算，免得名字和说明粘在一起
+	width := 9
+	for _, spec := range specs[start:end] {
+		if n := len([]rune(spec.name)); n > width {
+			width = n
+		}
+	}
+	out := make([]string, 0, rows)
+	for i := start; i < end; i++ {
+		name := fmt.Sprintf("%-*s", width, specs[i].name)
 		if i == cur {
-			out = append(out, promptStyle.Render("▸ "+name)+hintStyle.Render(spec.desc))
+			out = append(out, promptStyle.Render("▸ "+name)+hintStyle.Render(specs[i].desc))
 			continue
 		}
-		out = append(out, hintStyle.Render("  "+name+spec.desc))
+		out = append(out, hintStyle.Render("  "+name+specs[i].desc))
+	}
+	if overflow {
+		out = append(out, hintStyle.Render(
+			fmt.Sprintf("  …共 %d 个候选，↑↓ 选，继续打字缩小范围", total)))
 	}
 	return out
 }
@@ -1184,7 +1284,8 @@ func (m model) submit() (tea.Model, tea.Cmd) {
 
 	// 一个字没写就替用户说一句"看看这几张图"，纯图片的提问也能发出去
 	if input == "" {
-		return m.startRun(imagePrompt(len(m.attachments)), m.takeAttachments())
+		prompt := imagePrompt(len(m.attachments))
+		return m.startRun(prompt, prompt, m.takeAttachments())
 	}
 
 	switch parseCommand(input) {
@@ -1195,9 +1296,11 @@ func (m model) submit() (tea.Model, tea.Cmd) {
 		return m, m.print(helpText())
 	case cmdNew:
 		m.cur = domain.NewSession(m.workdir)
-		// 新会话，槽位里不该还挂着上个会话的回答，攒着的图也不再属于谁
+		// 新会话，槽位里不该还挂着上个会话的回答，攒着的图也不再属于谁，
+		// 待办清单同理：它是上一个任务的进度表
 		m.lastAnswer = ""
 		m.attachments = nil
+		tool.ClearTodos()
 		return m, m.print(bannerStyle.Render("新会话 "+m.cur.Id) +
 			hintStyle.Render("，消息 "+fmt.Sprint(len(m.cur.Messages))+" 条"))
 	case cmdResume:
@@ -1208,9 +1311,29 @@ func (m model) submit() (tea.Model, tea.Cmd) {
 		return m.openConfig()
 	case cmdMode:
 		return m.switchMode(input)
+	case cmdModel:
+		return m.switchModel(input)
+	case cmdSkills:
+		return m, m.print(skillsText(m.skills))
+	case cmdTodo:
+		return m, m.print(todoText(tool.CurrentTodos()))
 	}
 
-	return m.startRun(input, m.takeAttachments())
+	return m.runSkill(input)
+}
+
+// runSkill 处理 "不是内置命令" 的那一类输入：
+// 认得出是技能（/技能名 [补充说明]）就把那份 SKILL.md 整段并进这一条提问；
+// 认不出但形状像条命令的，提示一句就停，别把半截 /zzz 当成提问发给模型
+func (m model) runSkill(input string) (tea.Model, tea.Cmd) {
+	if skill, rest, ok := parseSkillCall(input, m.skills); ok {
+		// 历史区只回显用户敲的那一句：真把几百行说明打出来，屏幕就糊了
+		return m.startRun(input, core.SkillPrompt(skill, rest), m.takeAttachments())
+	}
+	if name := firstField(input); !looksLikeCommand(name) {
+		return m.startRun(input, input, m.takeAttachments())
+	}
+	return m, m.print(unknownCommandText(firstField(input), m.skills))
 }
 
 // switchMode 处理 /mode：不带参数就报当前模式和可选项，带了就切过去并写回配置，
@@ -1237,6 +1360,143 @@ func (m model) switchMode(input string) (tea.Model, tea.Cmd) {
 		out += "\n" + hintStyle.Render("（没能写回配置: "+err.Error()+"，本次运行仍然生效）")
 	}
 	return m, m.print(out)
+}
+
+// switchModel 处理 /model：不带参数就列出手上配置好的几套模型，带了就切过去并写回配置，
+// 下一轮请求就用新模型，不用重启。
+func (m model) switchModel(input string) (tea.Model, tea.Cmd) {
+	arg := ""
+	if fields := strings.Fields(input); len(fields) > 1 {
+		arg = strings.Join(fields[1:], " ")
+	}
+	models := m.cfg.AvailableModels()
+	if arg == "" {
+		return m, m.print(modelText(models, m.cfg.Current))
+	}
+
+	target, ok := pickModel(models, arg)
+	if !ok {
+		return m, m.print(errStyle.Render(fmt.Sprintf("没有叫 %q 的模型；/model 看看有哪些", arg)))
+	}
+	// 内存里也把名字补齐，和写回文件的那份保持一致
+	for i := range models {
+		if strings.TrimSpace(models[i].Name) == "" {
+			models[i].Name = models[i].Label()
+		}
+	}
+	m.cfg.Current = target.Label()
+	m.cfg.Models = models
+	// 上下文窗口跟着换，界面上的"已用 x%"才不会是按上一套模型算的
+	m.contextLimit = target.Limit()
+
+	out := bannerStyle.Render("已切到模型 ") + statusStyle.Render(target.Label()) +
+		hintStyle.Render("  "+modelHint(target))
+	// 写回配置失败不影响本次运行，说明一下就行
+	if err := config.SaveModels(m.cfgPath, models, m.cfg.Current); err != nil {
+		out += "\n" + hintStyle.Render("（没能写回配置: "+err.Error()+"，本次运行仍然生效）")
+	}
+	return m, m.print(out)
+}
+
+// pickModel 把 /model 的参数认成一套配置：名字和模型名都能认，前面几个字对得上也算，
+// 但必须只对上一套——两套以上拿不准时让用户说全
+func pickModel(models []config.ModelConfig, arg string) (config.ModelConfig, bool) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return config.ModelConfig{}, false
+	}
+	for _, mc := range models {
+		if strings.EqualFold(mc.Label(), arg) || strings.EqualFold(strings.TrimSpace(mc.Model), arg) {
+			return mc, true
+		}
+	}
+	var matched []config.ModelConfig
+	for _, mc := range models {
+		if strings.HasPrefix(strings.ToLower(mc.Label()), strings.ToLower(arg)) {
+			matched = append(matched, mc)
+		}
+	}
+	if len(matched) == 1 {
+		return matched[0], true
+	}
+	return config.ModelConfig{}, false
+}
+
+// modelText 是 /model 不带参数时的说明：当前用的那套标出来，顺便列出怎么切
+func modelText(models []config.ModelConfig, current string) string {
+	title := bannerStyle.Render("模型") +
+		hintStyle.Render(fmt.Sprintf("  共 %d 套，当前用 %s", len(models), orDash(current)))
+	if len(models) == 0 {
+		return title + "\n" + hintStyle.Render(
+			"  还没配模型：/config 填一套；想配多套就在配置文件的 Models 下照着加几段")
+	}
+	lines := []string{title}
+	active, _ := pickModel(models, current)
+	for _, mc := range models {
+		mark, style := "  ", hintStyle
+		if strings.EqualFold(mc.Label(), active.Label()) && current != "" {
+			mark, style = "▸ ", promptStyle
+		} else if current == "" && strings.EqualFold(mc.Label(), models[0].Label()) {
+			// Current 留空时用第一套
+			mark, style = "▸ ", promptStyle
+		}
+		lines = append(lines, style.Render(fmt.Sprintf("%s%-20s %s", mark, mc.Label(), modelHint(mc))))
+	}
+	lines = append(lines,
+		"",
+		hintStyle.Render("  切换：/model 名字，会写回配置文件；下次启动还是这套"),
+		hintStyle.Render("  配多套：在配置文件的 Models 下照着写几段，Current 指定用哪套（路径见 /config 顶部"))
+	return strings.Join(lines, "\n")
+}
+
+// modelHint 是一句话说明某套模型配的是什么
+func modelHint(mc config.ModelConfig) string {
+	kind := strings.TrimSpace(mc.Type)
+	if kind == "" {
+		kind = "DeepSeek"
+	}
+	out := kind
+	if model := strings.TrimSpace(mc.Model); model != "" {
+		out += " · " + model
+	}
+	if url := strings.TrimSpace(mc.ApiUrl); url != "" {
+		out += " · " + url
+	}
+	return out + " · 上下文 " + domain.FormatTokens(mc.Limit())
+}
+
+// orDash 空串显示成破折号
+func orDash(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "—"
+	}
+	return s
+}
+
+// todoText 是 /todo 的输出：这次任务的清单，一条都没有时说明怎么让它有
+func todoText(items []tool.TodoItem) string {
+	title := bannerStyle.Render("待办")
+	if len(items) == 0 {
+		return title + "\n" + hintStyle.Render(
+			"  现在是空的：多步任务里模型会自己用 TodoWrite 列清单，输入框上方也能看到进度")
+	}
+	done, running := tool.TodoCounts(items)
+	title += hintStyle.Render(fmt.Sprintf("  %d/%d 完成", done, len(items)))
+	if running > 0 {
+		title += hintStyle.Render(fmt.Sprintf(" · %d 项进行中", running))
+	}
+	lines := []string{title}
+	for i, it := range items {
+		mark, style := "[ ]", hintStyle
+		switch it.Status {
+		case tool.TodoCompleted:
+			mark, style = "[x]", toolOKStyle
+		case tool.TodoInProgress:
+			mark, style = "[~]", promptStyle
+		}
+		lines = append(lines, style.Render(fmt.Sprintf("  %s %d. %s", mark, i+1, it.Content)))
+	}
+	return strings.Join(lines, "\n")
 }
 
 // resume 处理 /resume：不带参数列出现有会话，带参数就切过去。
@@ -1270,9 +1530,11 @@ func (m model) resume(input string) (tea.Model, tea.Cmd) {
 		next.Id = id
 	}
 	m.cur = next
-	// 换会话了，旧回答的尾巴不该还挂在槽位里，攒着的图也不再属于谁
+	// 换会话了，旧回答的尾巴不该还挂在槽位里，攒着的图也不再属于谁，
+	// 待办清单同理：那是上一个会话里的任务
 	m.lastAnswer = ""
 	m.attachments = nil
+	tool.ClearTodos()
 	out := bannerStyle.Render("已恢复会话 "+next.Id) +
 		hintStyle.Render(fmt.Sprintf("，共 %d 条消息，目录 %s", len(next.Messages), m.store.Dir))
 	// 别的目录里开的会话也照样能接着聊，只是工具仍按当前目录跑，提一句免得误会
@@ -1345,8 +1607,11 @@ func sizeText(n int64) string {
 }
 
 // startRun 把提问丢给 core.Loop，用 goroutine + channel 把过程事件送回 UI。
+// display 是历史区回显的那段（通常就是用户的原话），prompt 是真正发给模型的——
+// 手动调用技能时两者不一样：回显一行 "/add-disease 加个病种"，
+// 发出去的却是展开后的整份说明。
 // images 是随这条提问一起发出去的图片，会和文字一起记进会话
-func (m model) startRun(prompt string, images []domain.Image) (tea.Model, tea.Cmd) {
+func (m model) startRun(display, prompt string, images []domain.Image) (tea.Model, tea.Cmd) {
 	p, err := buildProvider(m.cfg)
 	if err != nil {
 		return m, m.print(errStyle.Render("创建 Provider 失败: " + err.Error()))
@@ -1403,7 +1668,7 @@ func (m model) startRun(prompt string, images []domain.Image) (tea.Model, tea.Cm
 	// 把用户原话原样回显到历史区，多行输入也保留换行。
 	// 先折行再着色：lipgloss 是逐行套样式的，反过来（先着色再折行）的话
 	// 折出来的第二行起就丢了颜色
-	echo := []string{promptStyle.Render(m.fitWidth(prompt))}
+	echo := []string{promptStyle.Render(m.fitWidth(display))}
 	if len(images) > 0 {
 		// 图片本身在上面看不到，得说清楚这条提问带了几张，事后翻历史才知道当时给了什么
 		echo = append(echo, hintStyle.Render(fmt.Sprintf("  （附 %d 张图片）", len(images))))
@@ -1614,6 +1879,32 @@ func fitItems(items []string, limit int) string {
 	return out
 }
 
+// todoLine 是输入框上方常驻的待办摘要，一条待办都没有时整行空着（行数恒定，见 View）
+func (m model) todoLine() string {
+	return todoLine(tool.CurrentTodos(), m.width-4)
+}
+
+// todoLine 把待办清单压成一行，纯函数，方便直接拿造的数据测。
+// limit > 0 时保证不超过这么宽：折行会把界面高度顶乱，宁可截断
+func todoLine(items []tool.TodoItem, limit int) string {
+	if len(items) == 0 {
+		return ""
+	}
+	done, running := tool.TodoCounts(items)
+	out := hintStyle.Render("待办 ") + statusStyle.Render(fmt.Sprintf("%d/%d", done, len(items)))
+	if running > 0 {
+		out += hintStyle.Render(fmt.Sprintf(" · %d 项进行中", running))
+	}
+	// 手上这（或下一）项是什么，一眼能看到，不用去翻历史区
+	if cur := tool.TodoCurrent(items); cur != "" {
+		out += hintStyle.Render(" · ") + toolStyle.Render(firstLines(cur, 40))
+	}
+	if limit > 0 && lipgloss.Width(out) > limit {
+		out = ansi.Truncate(out, limit, "…")
+	}
+	return out
+}
+
 // tasksLine 是输入框上方常驻的后台任务栏，
 // 有任务就显示，没有就整行空着（行数恒定，见 View）。运行中的任务带上已跑时长，
 // 一眼看出卡没卡住。
@@ -1732,10 +2023,10 @@ func (m model) taskDetailLines() []string {
 		}
 		out = append(out, line)
 	}
-	// 槽位只放得下 activeRows 行，多出来的折成一句，别让人以为任务就这几个
-	if len(out) > activeRows {
-		kept := append([]string{}, out[:activeRows-1]...)
-		kept = append(kept, hintStyle.Render(fmt.Sprintf("…还有 %d 个任务", len(out)-(activeRows-1))))
+	// 槽位只放得下这么多行，多出来的折成一句，别让人以为任务就这几个
+	if rows := m.activeRows(); len(out) > rows {
+		kept := append([]string{}, out[:rows-1]...)
+		kept = append(kept, hintStyle.Render(fmt.Sprintf("…还有 %d 个任务", len(out)-(rows-1))))
 		out = kept
 	}
 	return out
@@ -1751,6 +2042,7 @@ func (m model) footerLine() string {
 		hintStyle.Render("Enter 发送"),
 		hintStyle.Render("Shift+Enter 换行"),
 		hintStyle.Render("Ctrl+C 退出"),
+		hintStyle.Render("模型 ") + statusStyle.Render(m.modelLabel()),
 		hintStyle.Render("模式 ") + statusStyle.Render(m.mode.Label()),
 	}, m.width-1)
 }
@@ -1780,7 +2072,7 @@ func (m model) lastAnswerLines() []string {
 	}
 
 	title := "上一轮回答"
-	if body := activeRows - 1; len(lines) > body {
+	if body := m.activeRows() - 1; len(lines) > body {
 		lines = lines[len(lines)-body:]
 		title = "上一轮回答（结尾）"
 	}
@@ -1796,47 +2088,87 @@ func (m model) View() tea.View {
 	if m.quitting {
 		return tea.NewView("")
 	}
-	var b strings.Builder
-	if m.state == stateConfig {
-		b.WriteString(strings.Join(m.fieldLines(), "\n"))
-		b.WriteString("\n")
-		b.WriteString(hintStyle.Render("↑↓ 选字段 · Enter 编辑 · Ctrl+S 保存 · Esc 返回"))
-		return tea.NewView(b.String())
+	return tea.NewView(compose(m.frameLines(), m.width))
+}
+
+// frameLines 按当前状态把这一帧的行拼出来。
+// 三种状态（配置表单、确认框、主界面）都从这一个口子出，最后统一交给 compose 收口，
+// 这样"逐行裁宽"这条不变量不必在每个状态里各写一遍、也不会漏掉哪个分支。
+func (m model) frameLines() []string {
+	switch m.state {
+	case stateConfig:
+		return m.configFrameLines()
+	case stateApproval:
+		return m.approvalFrameLines()
 	}
-	if m.state == stateApproval {
-		// 确认框顶替输入框：这一刻只能回答 y / a / n
-		if line := m.tasksLine(); line != "" {
-			b.WriteString(m.wrap(line))
-			b.WriteString("\n")
-		}
-		b.WriteString(m.approvalView())
-		b.WriteString("\n")
-		// 上下文占用照旧挂在下面，确认框顶掉输入框时也不让它跳到别处
-		if line := m.usageLine(); line != "" {
-			b.WriteString(m.wrap(line))
-			b.WriteString("\n")
-		}
-		b.WriteString(hintStyle.Render("↑↓ 或 j k 选择 · Enter 确认 · 直接打字可以拒绝并说明"))
-		return tea.NewView(b.String())
+	return m.mainFrameLines()
+}
+
+// configFrameLines 是 /config 表单：表单本体 + 一行按键提示
+func (m model) configFrameLines() []string {
+	lines := m.fieldLines()
+	return append(lines,
+		hintStyle.Render("↑↓ 选字段 · Enter 编辑 · Ctrl+S 保存 · Esc 返回"))
+}
+
+// approvalFrameLines 是确认框：它顶替输入框，这一刻只能回答 y / a / n
+func (m model) approvalFrameLines() []string {
+	var lines []string
+	if line := m.todoLine(); line != "" {
+		lines = append(lines, m.wrap(line))
 	}
-	// 后台任务常驻在输入框上方，运行中也一直看得到。
-	// 下面这三行（任务栏、附图、上下文占用）有没有内容都占着一行：界面行数一旦
-	// 跟着内容变，Bubble Tea 的 inline 渲染就会错位，屏幕上留下上一帧的残影。
-	b.WriteString(m.tasksLine())
-	b.WriteString("\n")
-	// 运行进度和补全候选共用这块固定行数的位置，紧挨着输入框
-	b.WriteString(m.activeView())
-	b.WriteString("\n")
-	// 附图那行贴着输入框：贴进来、挂在下一条提问上的图就在这儿，一眼看得见
-	b.WriteString(m.attachmentsLine())
-	b.WriteString("\n")
-	b.WriteString(boxStyle.Width(m.width - 4).Render(m.input.View()))
-	b.WriteString("\n")
-	// 上下文占用挂在输入框下面：紧挨着输入框看得见，又不占上面那块常驻槽位
-	b.WriteString(m.usageLine())
-	b.WriteString("\n")
-	b.WriteString(m.footerLine())
-	return tea.NewView(b.String())
+	if line := m.tasksLine(); line != "" {
+		lines = append(lines, m.wrap(line))
+	}
+	lines = append(lines, m.approvalView())
+	// 上下文占用照旧挂在下面，确认框顶掉输入框时也不让它跳到别处
+	if line := m.usageLine(); line != "" {
+		lines = append(lines, m.wrap(line))
+	}
+	return append(lines,
+		hintStyle.Render("↑↓ 或 j k 选择 · Enter 确认 · 直接打字可以拒绝并说明"))
+}
+
+// mainFrameLines 是平常那一屏。
+// 待办、任务栏、附图、上下文占用这四行有没有内容都占着一行：只有贴在最下面的
+// 输入框位置稳定，帧高才稳定。
+func (m model) mainFrameLines() []string {
+	return []string{
+		m.todoLine(),
+		m.tasksLine(),
+		// 运行进度和补全候选共用这块固定行数的位置，紧挨着输入框
+		m.activeView(),
+		// 附图那行贴着输入框：贴进来、挂在下一条提问上的图就在这儿
+		m.attachmentsLine(),
+		boxStyle.Width(m.width - 4).Render(m.input.View()),
+		// 上下文占用挂在输入框下面：紧挨着输入框看得见，又不占上面那块常驻槽位
+		m.usageLine(),
+		m.footerLine(),
+	}
+}
+
+// compose 把一帧的行收成最终画面，是整块界面唯一的出口。
+//
+// 这里只做一件事，但它是不变量：每一行都必须严格窄于终端宽度。行宽一旦超了，
+// 终端会自己折行，程序记的帧高就和屏幕实际用掉的行数对不上，从那行起整个界面错位，
+// 屏幕上留下上一帧的残影。
+//
+// 用截断而不是折行：折行会让帧高跟着内容变，而这块界面的所有区域高度都是算好的，
+// 多出来一行就把输入框顶出屏幕。宁可截掉尾巴，也不让行数失控。
+func compose(lines []string, width int) string {
+	limit := width - 1
+	if limit <= 0 {
+		return strings.Join(lines, "\n")
+	}
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimRight(line, "\r")
+		if lipgloss.Width(line) > limit {
+			line = ansi.Truncate(line, limit, "")
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
 }
 
 // activeLines 是输入框上方那块会变的内容：跑任务时是状态、工具调用和预览尾巴，
@@ -1848,7 +2180,7 @@ func (m model) activeLines() []string {
 	return m.idleLines()
 }
 
-// idleLines 是闲着时这块槽位放什么。这块高度恒定（见 activeRows）却又不能空着，
+// idleLines 是闲着时这块槽位放什么。这块高度恒定（见 activeRows()）却又不能空着，
 // 就按"最有用"的顺序挑一样填：补全候选最要紧，其次是把后台任务摊开看，
 // 再其次是上一轮回答的尾巴，实在什么都没有就摆一份提示。
 func (m model) idleLines() []string {
@@ -1869,11 +2201,14 @@ func (m model) idleLines() []string {
 // 开场那会儿槽位本来是空的，宁可摆这几行，也别留一大片空白。
 func (m model) hintLines() []string {
 	raw := []string{
-		"命令  /help 全部说明 · /config 配模型",
-		"      /mode 切换模式 · /resume 恢复会话 · /new 新会话",
-		"",
-		"输入  Enter 发送 · Shift+Enter 换行 · Tab 补全 · Ctrl+V 贴图",
+		"命令  /help 全部说明 · /config 配这套模型 · /model 换模型",
+		"      /mode 切换模式 · /resume 恢复会话 · /todo 看清单 · /new 新会话",
 	}
+	// 一个技能都没装时，这一行只会让人以为有东西没显示出来
+	if len(m.skills) > 0 {
+		raw = append(raw, "技能  /skills 看装了哪些 · 直接 /技能名 就能点名用它")
+	}
+	raw = append(raw, "", "输入  Enter 发送 · Shift+Enter 换行 · Tab 补全 · Ctrl+V 贴图")
 	// 窄终端里长行要折，折出来多余的行由 activeView 裁掉，槽位高度仍然恒定
 	limit := m.width - 3
 	out := make([]string, 0, len(raw))
@@ -1893,25 +2228,26 @@ func (m model) hintLines() []string {
 	return out
 }
 
-// activeView 把这块内容整理成固定的 activeRows 行，始终贴着输入框：
+// activeView 把这块内容整理成固定的 activeRows() 行，始终贴着输入框：
 // 跑任务时内容超了就先砍中间（留下第一行的状态或工具标题，以及最新的几行预览），
 // 闲着时按顺序留着前面的候选；都不够就在顶上补空行。
 // 这块的高度一旦跟着内容上下变，Bubble Tea 就会在屏幕底部留白，输入框立刻离地，
 // 所以这里必须恒定。单行也不能比终端还宽——超了终端会自己折行，实际用的行数
 // 就比这里记的多，屏幕从那一行起全错位。
 func (m model) activeView() string {
+	rows := m.activeRows()
 	lines := m.foldLines(m.activeLines())
-	if len(lines) > activeRows {
+	if len(lines) > rows {
 		if m.state == stateRunning {
-			kept := make([]string, 0, activeRows)
+			kept := make([]string, 0, rows)
 			kept = append(kept, lines[0])
-			kept = append(kept, lines[len(lines)-(activeRows-1):]...)
+			kept = append(kept, lines[len(lines)-(rows-1):]...)
 			lines = kept
 		} else {
-			lines = lines[:activeRows]
+			lines = lines[:rows]
 		}
 	}
-	pad := make([]string, activeRows-len(lines))
+	pad := make([]string, rows-len(lines))
 	return strings.Join(append(pad, lines...), "\n")
 }
 
@@ -1982,12 +2318,31 @@ func (m model) block(title string, titleStyle lipgloss.Style, text string, maxLi
 }
 
 // print 把一段文本打进上方的历史区。
-// tea.Println 是绕过 Bubble Tea 的屏幕缓冲区、直接往终端写的：行宽一旦超过终端，
-// 终端会自己折行，程序记的行数就和屏幕实际用的行数对不上，之后每一行都会错位，
-// 最先看出来的是贴在最下面的输入框——上下边框被挤掉、界面糊成一片。
-// 所以所有打印都得先按终端宽度折好再交出去。
-func (m model) print(text string) tea.Cmd {
+//
+// 交出去之前必须先按终端宽度折好：行宽一旦超过终端，终端会自己折行，程序记的行数
+// 就和屏幕实际用的行数对不上，之后每一行都会错位，最先看出来的是贴在最下面的
+// 输入框——上下边框被挤掉、界面糊成一片。
+func (m *model) print(text string) tea.Cmd {
 	return tea.Println(m.fitWidth(text))
+}
+
+// rebuild 把屏幕清掉重画，让界面回到干净状态。
+//
+// 为什么用它来兜底：inline 模式用的是相对光标，程序认为自己在第几行全靠自己累计
+// 的那本账。用户滚过滚轮、拖过窗口边框，或者终端自己把内容重排了，那本账就作废，
+// 而且没有绝对定位可以退回去（见 ultraviolet 里讲相对光标无法恢复的注释）。清屏是
+// 唯一能把这个账本清零的手段：它会让渲染器丢掉上一帧的记忆、强制整屏重绘。
+//
+// 试过但走不通的路，记在这儿免得以后再踩：
+//   - 清屏之后再把历史重打一遍：渲染器清屏时把光标记在左上角，接着画帧就从顶上
+//     往下画，会把刚打出来的历史盖掉。
+//   - 打一屏空行把旧内容顶出去：帧的内容没变，渲染器判定"无需重绘"直接跳过，
+//     结果帧跟着旧内容一起被顶出屏幕，屏幕上只剩空行。
+func (m *model) rebuild() tea.Cmd {
+	if m.width <= 0 || m.height <= 0 {
+		return nil
+	}
+	return tea.ClearScreen
 }
 
 // fitWidth 把每一行折到终端宽度以内。留一列余量，避免正好写满最后一列，
@@ -2027,32 +2382,41 @@ func waitEvent(r *runner) tea.Cmd {
 	}
 }
 
-// deepSeekConfig 从配置里解出 DeepSeek 这一段。解不出来时返回零值，
-// 让表单能打开、从头填，而不是直接报错退出界面。
-func deepSeekConfig(cfg config.GlobalConfig) config.DeepSeekConfig {
-	var dc config.DeepSeekConfig
-	if err := cfg.Provider.Decode(&dc); err != nil {
-		return config.DeepSeekConfig{}
+// currentModel 是当前生效的那套模型配置。配置坏了（比如 Current 指向不存在的模型）时，
+// 返回零值，让界面能开、表单能打开，把问题留到真正发请求的时候再报
+func (m model) currentModel() config.ModelConfig {
+	mc, err := m.cfg.CurrentModel()
+	if err != nil {
+		return config.ModelConfig{}
 	}
-	return dc
+	return mc
 }
 
-// buildProvider 按配置里声明的类型造 provider
+// modelLabel 是当前模型的显示名，一套都没配时给一句提示，别让界面空着
+func (m model) modelLabel() string {
+	if label := m.currentModel().Label(); label != "" {
+		return label
+	}
+	return "未配置"
+}
+
+// deepSeekConfig 从配置里解出当前这套模型。解不出来时返回零值，
+// 让表单能打开、从头填，而不是直接报错退出界面。
+func deepSeekConfig(cfg config.GlobalConfig) config.ModelConfig {
+	mc, err := cfg.CurrentModel()
+	if err != nil {
+		return config.ModelConfig{}
+	}
+	return mc
+}
+
+// buildProvider 按当前选中的那套模型配置造 provider
 func buildProvider(cfg config.GlobalConfig) (domain.Provider, error) {
-	var probe config.ProbeConfig
-	if err := cfg.Provider.Decode(&probe); err != nil {
-		return nil, fmt.Errorf("provider 解析为 ProbeConfig 报错: %w", err)
+	mc, err := cfg.CurrentModel()
+	if err != nil {
+		return nil, err
 	}
-	switch probe.Type {
-	case "DeepSeek":
-		p, err := provider.NewDeepSeek(deepSeekConfig(cfg))
-		if err != nil {
-			return nil, err
-		}
-		return p, nil
-	default:
-		return nil, fmt.Errorf("未支持的 provider 类型: %s", probe.Type)
-	}
+	return provider.New(mc)
 }
 
 // headLines 取前 maxLines 行，返回是否被截断；maxLines <= 0 表示不截断
