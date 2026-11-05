@@ -593,6 +593,56 @@ func TestReplayShortTerminalLongHistory(t *testing.T) {
 	}
 }
 
+// 大段工具输出（一次打十几行）在矮终端上是"帧被顶出屏幕"的重灾区。
+//
+// 渲染器往上插行时，是先按帧顶在屏幕上的位置往上数 offset 行、再去插的。offset
+// 一旦超过帧顶那一行，光标就从屏幕顶上顶出去了，插行落点全错，旧帧的下半截留在
+// 屏幕上再也不会被擦——屏幕上同时出现两份输入框、两行上下文占用（见 printRows）。
+// 这里拿一个真终端回放守着它。
+func TestReplayBigPrintKeepsFrame(t *testing.T) {
+	for _, size := range []struct{ w, h int }{
+		{100, 16}, {80, 20}, {60, 18}, {80, 30},
+	} {
+		t.Run(fmt.Sprintf("%dx%d", size.w, size.h), func(t *testing.T) {
+			hs := newHarness(t, size.w, size.h)
+			hs.send(eventMsg(domain.Event{Kind: domain.EventUsage, Usage: probeUsage()}))
+
+			// 连着三段"标题行 + 12 行输出"的工具结果
+			for i := range 3 {
+				call := domain.ToolCall{
+					Id:        itoa(i),
+					Name:      "Bash",
+					Arguments: `{"command":"go test ./... 2>&1","intent":"跑测试"}`,
+				}
+				hs.send(eventMsg(domain.Event{Kind: domain.EventToolCall, Call: call}))
+
+				body := make([]string, 0, printToolResultLines)
+				for j := range printToolResultLines {
+					body = append(body, fmt.Sprintf("第%d段输出第%d行", i, j))
+				}
+				hs.send(eventMsg(domain.Event{
+					Kind:   domain.EventToolResult,
+					Text:   strings.Join(body, "\n"),
+					Call:   call,
+					Status: domain.ToolStatusSuccess,
+				}))
+
+				lines := hs.snapshot(fmt.Sprintf("第 %d 段输出之后", i))
+				// 最后一行输出得真的打出来：切块不能把内容切丢
+				last := fmt.Sprintf("第%d段输出第%d行", i, printToolResultLines-1)
+				if !strings.Contains(strings.Join(lines, "\n"), last) {
+					t.Fatalf("最后一行输出 %q 没显示出来:\n%s", last, strings.Join(lines, "\n"))
+				}
+			}
+
+			// 收尾那一刻帧从"运行中"切到"空闲"，再验一次
+			hs.send(doneMsg{})
+			time.Sleep(200 * time.Millisecond)
+			hs.snapshot("结束")
+		})
+	}
+}
+
 // 精简显示（默认就是它）：历史区只留正文，思考过程和工具输出的内容都不打，
 // 工具调用还是留一行标题，知道刚才在跑什么。
 func TestQuietHidesReasoningAndToolOutput(t *testing.T) {

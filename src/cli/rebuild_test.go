@@ -97,6 +97,32 @@ func TestActiveRowsShrinksWithTerminal(t *testing.T) {
 	}
 }
 
+// 一次 print 最多能带几行，必须真的按帧高算：帧高要是数成 frameLines 的元素个数，
+// 就会少算好几行（输入框上方那块是一个整块多行字符串），一次想打的行数超过终端
+// 剩下的行数，插行落点就错了，屏幕上叠出旧帧（两份输入框、两行上下文占用）。
+func TestPrintRowsLeavesRoomAboveFrame(t *testing.T) {
+	for _, h := range []int{12, 14, 16, 18, 20, 24, 30, 40} {
+		m := newModel(safeConfig(), nil, ".", domain.NewSession("."))
+		m.width, m.height = 80, h
+
+		rows := m.frameRows()
+		// 帧高 = 固定那几行 + 输入框上方槽位，多一行少一行都不对
+		if want := chromeRows + m.activeRows(); rows != want {
+			t.Errorf("高 %d：帧高算出来 %d 行，按 chrome(%d)+槽位(%d) 应该是 %d 行",
+				h, rows, chromeRows, m.activeRows(), want)
+		}
+		// 帧高 + 一次能带的行数 + 一行余量，不能超过终端高，否则插行会顶出屏幕。
+		// 终端矮到帧本身就快占满时（槽位已经收到 1 行）没法再让，只要求至少能打一行
+		room := m.printRows()
+		if room < 1 {
+			t.Errorf("高 %d：一次打印连一行都带不了", h)
+		}
+		if rows+room+1 > h && room > 1 {
+			t.Errorf("高 %d：帧 %d 行、一次想打 %d 行，加起来超出终端", h, rows, room)
+		}
+	}
+}
+
 func safeConfig() config.GlobalConfig { return config.GlobalConfig{Mode: "full"} }
 
 func itoa(n int) string {

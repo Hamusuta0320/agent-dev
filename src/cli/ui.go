@@ -2463,8 +2463,47 @@ func (m model) block(title string, titleStyle lipgloss.Style, text string, maxLi
 // 交出去之前必须先按终端宽度折好：行宽一旦超过终端，终端会自己折行，程序记的行数
 // 就和屏幕实际用的行数对不上，之后每一行都会错位，最先看出来的是贴在最下面的
 // 输入框——上下边框被挤掉、界面糊成一片。
+//
+// 折完还要按"一次最多插几行"切开，分几次打（见 printRows）：一次插的行数超过帧顶
+// 上方空着的行数，帧就被顶出屏幕，屏幕上留下半截擦不掉的旧帧——看着就是两份输入框、
+// 两行上下文占用叠在一起。
 func (m *model) print(text string) tea.Cmd {
-	return tea.Println(m.fitWidth(text))
+	lines := strings.Split(m.fitWidth(text), "\n")
+	rows := m.printRows()
+	if rows <= 0 || len(lines) <= rows {
+		return tea.Println(strings.Join(lines, "\n"))
+	}
+	cmds := make([]tea.Cmd, 0, len(lines)/rows+1)
+	for len(lines) > 0 {
+		n := min(rows, len(lines))
+		cmds = append(cmds, tea.Println(strings.Join(lines[:n], "\n")))
+		lines = lines[n:]
+	}
+	return tea.Sequence(cmds...)
+}
+
+// printRows 是一次 tea.Println 最多能带几行；<= 0 表示不限（还不知道终端多高）。
+//
+// 这个上限不是"留白好看"，是渲染器插行算法的硬约束：插行时它先按帧顶在屏幕上的
+// 位置往上数 offset 行去插，offset 一旦超过帧顶那一行，光标就从屏幕顶上顶出去了，
+// 插行的落点全错，旧帧的下半截留在屏幕上再也不会被擦（两份输入框、两行上下文占用）。
+//
+// 帧顶上方能空出几行 = 终端高 - 帧高，再减一行余量。
+func (m model) printRows() int {
+	if m.height <= 0 {
+		return 0
+	}
+	room := m.height - m.frameRows() - 1
+	if room < 1 {
+		return 1
+	}
+	return room
+}
+
+// frameRows 是这一帧在屏幕上实际占几行。不能数 frameLines 的元素个数——输入框上方
+// 那块本身就是一个多行字符串，数元素会把帧高数少好几行，插行就又算错。
+func (m model) frameRows() int {
+	return len(strings.Split(compose(m.frameLines(), m.width), "\n"))
 }
 
 // rebuild 把屏幕清掉重画，让界面回到干净状态。
