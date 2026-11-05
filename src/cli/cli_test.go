@@ -425,8 +425,8 @@ func TestConfigFormSave(t *testing.T) {
 
 	// 少填一项就不该写文件
 	form := got.(model)
-	form.form.inputs[0].SetValue("https://api.deepseek.com")
-	form.form.inputs[1].SetValue("sk-test")
+	form.form.inputs[urlField].SetValue("https://api.deepseek.com")
+	form.form.inputs[keyField].SetValue("sk-test")
 	got, _ = form.saveConfig()
 	if s := got.(model).state; s != stateConfig {
 		t.Fatalf("校验没过不该退出表单，状态 %v", s)
@@ -437,7 +437,7 @@ func TestConfigFormSave(t *testing.T) {
 
 	// 填全了才保存，并且回到输入状态
 	form = got.(model)
-	form.form.inputs[2].SetValue("deepseek-chat")
+	form.form.inputs[modelField].SetValue("deepseek-chat")
 	got, _ = form.saveConfig()
 	saved := got.(model)
 	if saved.state != stateIdle {
@@ -708,14 +708,14 @@ func TestUsageLine(t *testing.T) {
 // 配置表单里的上下文上限：默认带出默认值，填了就用填的，填了非正整数要拦住
 func TestConfigFormContextLimit(t *testing.T) {
 	f := newConfigForm(config.ModelConfig{ApiUrl: "https://api.deepseek.com", ApiKey: "sk-1", Model: "deepseek-chat"})
-	if got := f.value(3); got != strconv.Itoa(config.DefaultContextLimit) {
+	if got := f.value(limitField); got != strconv.Itoa(config.DefaultContextLimit) {
 		t.Fatalf("表单里应该带出默认上限，实际 %q", got)
 	}
 	if dc, err := f.modelConfig(); err != nil || dc.Limit() != config.DefaultContextLimit {
 		t.Fatalf("没动过上限时应该用默认值: %+v, %v", dc, err)
 	}
 
-	f.inputs[3].SetValue("64000")
+	f.inputs[limitField].SetValue("64000")
 	dc, err := f.modelConfig()
 	if err != nil {
 		t.Fatalf("填了合法上限不该报错: %v", err)
@@ -725,7 +725,7 @@ func TestConfigFormContextLimit(t *testing.T) {
 	}
 
 	for _, bad := range []string{"abc", "0", "-5", "12x"} {
-		f.inputs[3].SetValue(bad)
+		f.inputs[limitField].SetValue(bad)
 		if _, err := f.modelConfig(); err == nil {
 			t.Fatalf("上限填 %q 应该报错", bad)
 		}
@@ -740,7 +740,7 @@ func TestConfigFormContextLimit(t *testing.T) {
 		{"1M", 1048576},
 		{"1.5M", 1572864},
 	} {
-		f.inputs[3].SetValue(c.in)
+		f.inputs[limitField].SetValue(c.in)
 		dc, err := f.modelConfig()
 		if err != nil {
 			t.Fatalf("上限填 %q 不该报错: %v", c.in, err)

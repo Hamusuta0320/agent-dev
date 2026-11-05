@@ -25,6 +25,7 @@ type configField struct {
 
 // configFields 的顺序要和 configForm 里那几个输入框、以及 saveConfigForm 里取的顺序一致
 var configFields = []configField{
+	{"类型", "←→ 切换（DeepSeek / OpenAI / MiniMax），都走 OpenAI 兼容协议"},
 	{"接口地址", "例如 https://api.deepseek.com，留空就用内置地址"},
 	{"密钥", "sk- 开头的那串"},
 	{"模型", "例如 deepseek-chat；Ctrl+L 能从接口拉列表挑"},
@@ -33,7 +34,8 @@ var configFields = []configField{
 
 // 表单里各字段的位置。键位和取值的代码都靠它认字段，不写魔法数字
 const (
-	urlField = iota
+	typeField = iota
+	urlField
 	keyField
 	modelField
 	limitField
@@ -81,10 +83,14 @@ type modelsFetchedMsg struct {
 func newConfigForm(mc config.ModelConfig) configForm {
 	apiUrl := strings.TrimSpace(mc.ApiUrl)
 	if apiUrl == "" {
-		// 没填过地址就先摆上内置的那个：DeepSeek / OpenAI 的地址是固定的，少打一遍
+		// 没填过地址就先摆上内置的那个：这几家的地址是固定的，少打一遍
 		apiUrl = config.DefaultApiUrl(mc.Type)
 	}
-	values := []string{apiUrl, mc.ApiKey, mc.Model, strconv.Itoa(mc.Limit())}
+	values := make([]string, len(configFields))
+	values[urlField] = apiUrl
+	values[keyField] = mc.ApiKey
+	values[modelField] = mc.Model
+	values[limitField] = strconv.Itoa(mc.Limit())
 	inputs := make([]textinput.Model, len(configFields))
 	for i, f := range configFields {
 		in := textinput.New()
@@ -95,11 +101,29 @@ func newConfigForm(mc config.ModelConfig) configForm {
 		in.SetVirtualCursor(false)
 		inputs[i] = in
 	}
-	return configForm{inputs: inputs, name: mc.Label(), typ: mc.Type, pickIdx: -1}
+	return configForm{inputs: inputs, name: mc.Label(), typ: normalizeType(mc.Type), pickIdx: -1}
 }
 
-// value 取某个字段去掉首尾空白后的值
+// normalizeType 把类型名归一成内置的写法（大小写不敏感）；没填按 DeepSeek 记，
+// 认不出的类型原样留着——有人会填自家转发网关的名字
+func normalizeType(typ string) string {
+	typ = strings.TrimSpace(typ)
+	if typ == "" {
+		return "DeepSeek"
+	}
+	for _, t := range config.ProviderTypes {
+		if strings.EqualFold(t, typ) {
+			return t
+		}
+	}
+	return typ
+}
+
+// value 取某个字段去掉首尾空白后的值。类型那一格没有输入框，直接给 f.typ
 func (f configForm) value(i int) string {
+	if i == typeField {
+		return strings.TrimSpace(f.typ)
+	}
 	if i < 0 || i >= len(f.inputs) {
 		return ""
 	}
@@ -118,10 +142,8 @@ func (f configForm) modelConfig() (config.ModelConfig, error) {
 		Model:  f.value(modelField),
 	}
 	// 类型先只有 OpenAI 兼容这一套，没写就按 DeepSeek 记下来，配置文件里能看出是什么
-	if strings.TrimSpace(mc.Type) == "" {
-		mc.Type = "DeepSeek"
-	}
-	// 地址留空就用内置的那个：这两家的地址是固定的，没必要逼着人抄一遍
+	mc.Type = normalizeType(mc.Type)
+	// 地址留空就用内置的那个：给几家用的地址是固定的，没必要逼着人抄一遍
 	if mc.ApiUrl == "" {
 		mc.ApiUrl = config.DefaultApiUrl(mc.Type)
 	}
@@ -153,6 +175,9 @@ func (m model) fieldLines() []string {
 		}
 		var body string
 		switch {
+		case i == typeField:
+			// 类型没有输入框：←→ 在内置类型之间换，地址跟着换成对应的内置地址
+			body = f.value(typeField) + hintStyle.Render("  ←→ 切换")
 		case i == f.cur && f.editing:
 			body = f.inputs[i].View()
 		case f.value(i) == "":
@@ -358,6 +383,19 @@ func (m model) handleConfigKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	// 类型那一格没有输入框：←→ 在内置类型之间换，Enter 只说一句怎么换
+	if f.cur == typeField {
+		switch msg.String() {
+		case "left", "h":
+			return m.switchType(-1)
+		case "right", "l":
+			return m.switchType(1)
+		case "enter":
+			f.err = "类型用 ←→ 切换（DeepSeek / OpenAI / MiniMax）"
+			return m, nil
+		}
+	}
+
 	switch msg.String() {
 	case "up", "shift+tab":
 		f.cur = (f.cur - 1 + len(configFields)) % len(configFields)
@@ -386,7 +424,41 @@ func (m model) handleConfigKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// fetchModelList 处理 Ctrl+L：去接口拉一遍模型列表，拉回来直接展开候选让人挑。
+// switchType 把类型换成内置列表里的前（step = -1）或后（step = 1）一个。
+// 地址那格还空着、或者还是旧类型的内置地址时，跟着换成新类型的内置地址——
+// 换了类型地址几乎一定也要换；自己手填过的地址不动。
+// 地址真被换掉了就去接口拉一遍模型列表，配好密钥的话直接能挑模型
+func (m model) switchType(step int) (tea.Model, tea.Cmd) {
+	f := &m.form
+	old := f.value(typeField)
+	idx := 0
+	for i, t := range config.ProviderTypes {
+		if strings.EqualFold(t, old) {
+			idx = i
+			break
+		}
+	}
+	next := config.ProviderTypes[(idx+step+len(config.ProviderTypes))%len(config.ProviderTypes)]
+	if next == old {
+		return m, nil
+	}
+	f.typ = next
+	f.err = ""
+	// 类型换了，之前拉的候选列表是别家的模型名，作废
+	f.models = nil
+	f.pickIdx = -1
+
+	before := f.value(urlField)
+	if before == "" || before == config.DefaultApiUrl(old) {
+		f.inputs[urlField].SetValue(config.DefaultApiUrl(next))
+	}
+	if f.value(urlField) == before {
+		return m, nil
+	}
+	return m.pullModels(false)
+}
+
+
 // 地址或密钥还没填时先提示一句——这时候请求也发不出去
 func (m model) fetchModelList() (tea.Model, tea.Cmd) {
 	f := &m.form

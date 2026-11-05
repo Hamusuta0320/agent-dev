@@ -9,6 +9,27 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// 内置地址按类型给：不写类型按 DeepSeek，大小写和空白都认，认不出的类型返回空串（别瞎猜）
+func TestDefaultApiUrl(t *testing.T) {
+	for _, c := range []struct {
+		typ  string
+		want string
+	}{
+		{"", DefaultDeepSeekApiUrl},
+		{"DeepSeek", DefaultDeepSeekApiUrl},
+		{"openai", DefaultOpenAIApiUrl},
+		{"OpenAI", DefaultOpenAIApiUrl},
+		{"MiniMax", DefaultMiniMaxApiUrl},
+		{"minimax", DefaultMiniMaxApiUrl},
+		{"  MiniMax  ", DefaultMiniMaxApiUrl},
+		{"自家的转发网关", ""},
+	} {
+		if got := DefaultApiUrl(c.typ); got != c.want {
+			t.Fatalf("类型 %q 的内置地址不对: %q，想要 %q", c.typ, got, c.want)
+		}
+	}
+}
+
 // 没填上下文上限的旧配置要退回默认窗口，填了就用填的
 func TestDeepSeekConfigLimit(t *testing.T) {
 	cases := []struct {

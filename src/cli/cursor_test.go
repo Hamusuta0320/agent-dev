@@ -135,8 +135,8 @@ func TestCursorInConfigForm(t *testing.T) {
 	hs.p.Send(tea.KeyPressMsg{Code: tea.KeyEnter})
 	time.Sleep(250 * time.Millisecond)
 
-	// 往下走两格（接口地址 → 密钥 → 模型），回车开始编辑
-	for range 2 {
+	// 往下走到「模型」那一格（类型 → 接口地址 → 密钥 → 模型），回车开始编辑
+	for range modelField {
 		hs.p.Send(tea.KeyPressMsg{Code: tea.KeyDown})
 		time.Sleep(60 * time.Millisecond)
 	}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -172,6 +173,69 @@ func TestConfigFormFetchNeedsKey(t *testing.T) {
 	}
 	if got.(model).form.fetching {
 		t.Fatal("没发请求就别显示进度")
+	}
+}
+
+// 类型那一格用 ←→ 换成内置类型：地址还空着或还是旧类型的内置地址时跟着换，
+// 自己手填过的地址不动；保存时类型写进配置
+func TestConfigFormSwitchType(t *testing.T) {
+	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+	m.cfgPath = filepath.Join(t.TempDir(), "config.yaml")
+	m.state = stateConfig
+	m.form = newConfigForm(config.ModelConfig{Type: "DeepSeek"})
+	if got := m.form.value(typeField); got != "DeepSeek" {
+		t.Fatalf("类型没带出来: %q", got)
+	}
+	if got := m.form.value(urlField); got != config.DefaultDeepSeekApiUrl {
+		t.Fatalf("地址该预填 DeepSeek 的内置地址: %q", got)
+	}
+
+	// → 走一格到 OpenAI，地址跟着换
+	next, _ := m.handleConfigKey(tea.KeyPressMsg{Code: tea.KeyRight})
+	got := next.(model)
+	if v := got.form.value(typeField); v != "OpenAI" {
+		t.Fatalf("→ 之后该是 OpenAI，实际 %q", v)
+	}
+	if v := got.form.value(urlField); v != config.DefaultOpenAIApiUrl {
+		t.Fatalf("地址没跟着换成 OpenAI 的: %q", v)
+	}
+
+	// 再走一格到 MiniMax
+	next, _ = got.handleConfigKey(tea.KeyPressMsg{Code: tea.KeyRight})
+	got = next.(model)
+	if v := got.form.value(typeField); v != "MiniMax" {
+		t.Fatalf("再按一次 → 该是 MiniMax，实际 %q", v)
+	}
+	if v := got.form.value(urlField); v != config.DefaultMiniMaxApiUrl {
+		t.Fatalf("地址没跟着换成 MiniMax 的: %q", v)
+	}
+
+	// 填上密钥和模型存下来，配置里就是这套 MiniMax
+	got.form.inputs[keyField].SetValue("sk-minimax")
+	got.form.inputs[modelField].SetValue("MiniMax-M2")
+	saved, _ := got.saveConfig()
+	mc, err := saved.(model).cfg.CurrentModel()
+	if err != nil {
+		t.Fatalf("保存后读配置失败: %v", err)
+	}
+	if mc.Type != "MiniMax" || mc.ApiUrl != config.DefaultMiniMaxApiUrl || mc.Model != "MiniMax-M2" {
+		t.Fatalf("存下来的配置不对: %+v", mc)
+	}
+
+	// 自己填过的地址不跟着换：换个类型它还是自己的
+	custom := newConfigForm(config.ModelConfig{Type: "DeepSeek", ApiUrl: "https://my.gateway/v1"})
+	m.form = custom
+	next, _ = m.handleConfigKey(tea.KeyPressMsg{Code: tea.KeyRight})
+	if v := next.(model).form.value(urlField); v != "https://my.gateway/v1" {
+		t.Fatalf("手填的地址不该被换掉: %q", v)
+	}
+
+	// ← 从第一个往前绕到最后一个
+	first := newConfigForm(config.ModelConfig{Type: "DeepSeek"})
+	m.form = first
+	next, _ = m.handleConfigKey(tea.KeyPressMsg{Code: tea.KeyLeft})
+	if v := next.(model).form.value(typeField); v != "MiniMax" {
+		t.Fatalf("从 DeepSeek 往前该绕到 MiniMax，实际 %q", v)
 	}
 }
 

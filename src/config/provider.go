@@ -17,12 +17,19 @@ type ProbeConfig struct {
 // DefaultContextLimit 是上下文窗口的默认大小（token）：配置里没填时用它算已用百分比
 const DefaultContextLimit = 128000
 
-// 内置的接口地址。这两家都走 OpenAI 兼容协议，地址是固定的，不用每次手打；
+// 内置的接口地址。这几家都走 OpenAI 兼容协议，地址是固定的，不用每次手打；
 // 手填的地址永远优先，留空时才用这里的
 const (
 	DefaultDeepSeekApiUrl = "https://api.deepseek.com"
 	DefaultOpenAIApiUrl   = "https://api.openai.com/v1"
+	// DefaultMiniMaxApiUrl 是国内站的 OpenAI 兼容地址（海外站是 https://api.minimaxi.com/v1，
+	// 用海外站就在配置里手填那个地址）
+	DefaultMiniMaxApiUrl = "https://api.minimax.chat/v1"
 )
+
+// ProviderTypes 是内置支持的类型，/config 表单按这个顺序切换。
+// 它们都走 OpenAI 兼容协议，差别只在地址和模型名
+var ProviderTypes = []string{"DeepSeek", "OpenAI", "MiniMax"}
 
 // DefaultApiUrl 按协议类型给出内置的接口地址。认不出的类型返回空串：
 // 瞎猜一个地址比让用户自己填更糟
@@ -32,12 +39,14 @@ func DefaultApiUrl(typ string) string {
 		return DefaultDeepSeekApiUrl
 	case "openai":
 		return DefaultOpenAIApiUrl
+	case "minimax":
+		return DefaultMiniMaxApiUrl
 	}
 	return ""
 }
 
-// ModelConfig 是一套模型配置。Type 说明走哪套协议（DeepSeek 和 OpenAI 都是 OpenAI 兼容接口，
-// 只是地址和模型名不同），Name 是它在 Models 列表里的名字，/model 靠它切换。
+// ModelConfig 是一套模型配置。Type 说明走哪套协议（DeepSeek、OpenAI 和 MiniMax 都是 OpenAI
+// 兼容接口，只是地址和模型名不同），Name 是它在 Models 列表里的名字，/model 靠它切换。
 type ModelConfig struct {
 	Name   string `json:"Name,omitempty" yaml:"Name,omitempty"`
 	Type   string `json:"Type" yaml:"Type"`
