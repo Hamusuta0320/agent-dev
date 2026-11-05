@@ -819,6 +819,41 @@ func TestReplayResumeListShowsTitle(t *testing.T) {
 	}
 }
 
+// 运行中排队：敲进去的排进队里，输入框上方真的出现排队那几行，
+// 而且帧变高之后没有叠出残影、也没有把输入框挤出去
+func TestReplayQueueListShowsPrompts(t *testing.T) {
+	// harness 开局就是"正在跑一轮"，这时候回车才是排队
+	hs := newHarness(t, 90, 30)
+	hs.typeText("改一下输入框")
+	hs.p.Send(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	time.Sleep(200 * time.Millisecond)
+	hs.typeText("再补个测试")
+	hs.p.Send(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	time.Sleep(250 * time.Millisecond)
+
+	view := strings.Join(hs.snapshot("排队之后"), "\n")
+	for _, want := range []string{"排队", "2 条", "1. 改一下输入框", "2. 再补个测试", "Ctrl+C 中断"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("排队列表里少了 %q:\n%s", want, view)
+		}
+	}
+
+	// 删掉一条：列表要跟着变，删空的提示打到历史区
+	hs.p.Send(tea.KeyPressMsg(tea.Key{Code: tea.KeyUp}))
+	time.Sleep(80 * time.Millisecond)
+	hs.p.Send(tea.KeyPressMsg(tea.Key{Code: tea.KeyDelete}))
+	time.Sleep(250 * time.Millisecond)
+
+	view = strings.Join(hs.snapshot("删掉一条之后"), "\n")
+	if !strings.Contains(view, "1 条") || !strings.Contains(view, "已删掉排队消息") {
+		t.Fatalf("删掉之后列表该只剩一条:\n%s", view)
+	}
+	if strings.Contains(view, "2. 再补个测试") {
+		t.Fatalf("删掉的那条不该还列着:\n%s", view)
+	}
+}
+
+
 // 待办清单出现在帧里（帧一下变高）或收起（帧一下变矮）的同时又往历史区打内容，
 // 是"帧高变化 + 插行"叠在一起的那一刻：插行的落点按屏幕上那一帧的位置算，
 // 按成另一帧的行数就会把帧顶出屏幕，旧帧的下半截留在屏幕上擦不掉。

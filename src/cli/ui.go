@@ -234,6 +234,13 @@ type model struct {
 	// 发送、切换会话、按 Esc 都会清空
 	attachments []imageAttachment
 
+	// queue 是运行中排队等下一条的提问。一轮跑完（正常结束）会自动接上队头那条，
+	// 不用等用户再敲一遍；中断或出错时留着，发不发由人决定
+	queue []queuedPrompt
+	// queueIdx 是队列里选中的那一条，-1 表示没选（键盘全归输入框）。
+	// 只有运行中按 ↑↓ 会改它，一打字就复位
+	queueIdx int
+
 	// usage 是最后一次请求的上下文占用（总数来自响应里的 usage），
 	// 贴在输入框下面常驻显示，新一轮开始时清零
 	usage domain.ContextUsage
@@ -344,6 +351,7 @@ func newModel(cfg config.GlobalConfig, store *session.Store, workdir string, cur
 		reasoning:    &strings.Builder{},
 		answer:       &strings.Builder{},
 		printSeq:     new(int),
+		queueIdx:     -1,
 		width:        80,
 	}
 }
@@ -610,10 +618,31 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, m.rebuild()
 
 	case "esc":
+		// 选了排队里的某条就先取消选中，键盘还给输入框
+		if m.queueIdx >= 0 {
+			m.queueIdx = -1
+			return m, nil
+		}
 		// 附了图想撤：闲着时 Esc 没别的用处，就用来清空
 		if m.state == stateIdle && len(m.attachments) > 0 {
 			m.attachments = nil
 			return m, m.print(hintStyle.Render("已清空附图"))
+		}
+
+	// 排队消息的编辑和删除。队列空着就完全不拦，键照常给输入框。
+	//
+	// 这里用 Alt+E 而不是 Ctrl+E：textarea 默认把 ctrl+e 绑成"移到行尾"
+	// （bubbles textarea 的 KeyMap.LineEnd），抢了就没人能在多行里一键跳到行尾
+	case "alt+e":
+		if len(m.queue) > 0 {
+			return m.editQueued()
+		}
+
+	case "delete":
+		// 只在明确选中了某条时才拦 Delete：输入框里 Delete 是"删光标后面那个字"，
+		// 手一快就会把正在写的正文删掉
+		if m.queueIdx >= 0 && len(m.queue) > 0 {
+			return m.removeQueued()
 		}
 	}
 
@@ -651,13 +680,49 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	// Alt+↑ / Alt+↓ 挑排队里的某条。用带修饰键的版本是不想占裸的 ↑↓——
+	// 输入框里写着多行内容时，裸 ↑↓ 得留给挪光标，那是写字时更常用的键
+	if m.state == stateRunning && len(m.queue) > 0 {
+		switch msg.String() {
+		case "alt+up":
+			m.moveQueueSel(-1)
+			return m, nil
+		case "alt+down":
+			m.moveQueueSel(1)
+			return m, nil
+		}
+	}
+
+	// 没按 Alt 时，只有输入框空着（或已经选着某条）↑↓ 才归排队：
+	// 空输入框里本来就没东西可挪光标。这么留着是给 Alt+方向键送不到程序的环境兜底
+	// （有的终端会把它接走，见 takesQueueArrows）
+	if m.takesQueueArrows() {
+		switch msg.String() {
+		case "up":
+			m.moveQueueSel(-1)
+			return m, nil
+		case "down":
+			m.moveQueueSel(1)
+			return m, nil
+		}
+	}
+
 	if msg.Code == tea.KeyEnter {
 		if m.state == stateRunning {
-			return m, nil // 运行中不接受新输入
+			// 运行中按回车不再丢弃：排进队里，这一轮结束自动接着发
+			if m.enqueue() {
+				return m, nil
+			}
+			return m, m.print(hintStyle.Render("这一轮还在跑；想排队就先把消息写上"))
 		}
 		if !key.Matches(msg, m.input.KeyMap.InsertNewline) {
 			return m.submit() // 光按 Enter 是发送；Shift+Enter 之类落到下面交给输入框换行
 		}
+	}
+
+	// 一打字就取消排队里的选中：否则用户以为在往输入框写，实际焦点还挂在某条上
+	if msg.Text != "" {
+		m.queueIdx = -1
 	}
 
 	var cmd tea.Cmd
@@ -1372,8 +1437,11 @@ func (m model) submit() (tea.Model, tea.Cmd) {
 		return m, m.print(helpText())
 	case cmdNew:
 		m.cur = domain.NewSession(m.workdir)
-		// 新会话，攒着的图不再属于谁，待办清单同理：它是上一个任务的进度表
+		// 新会话，攒着的图不再属于谁，待办清单同理：它是上一个任务的进度表。
+		// 排队消息也一样——那是排给上一段对话的下一步
 		m.attachments = nil
+		m.queue = nil
+		m.queueIdx = -1
 		tool.ClearTodos()
 		return m, m.print(bannerStyle.Render("新会话 "+m.cur.Id) +
 			hintStyle.Render("，消息 "+fmt.Sprint(len(m.cur.Messages))+" 条"))
@@ -1640,8 +1708,10 @@ func (m model) resume(input string) (tea.Model, tea.Cmd) {
 	}
 	m.cur = next
 	// 换会话了，攒着的图不再属于谁；上下文占用那行也得清掉，它说的是上一个会话
-	// 的用量，留着会让人以为这段历史已经占了那么多窗口
+	// 的用量，留着会让人以为这段历史已经占了那么多窗口。排队消息同理，那是排给上一段对话的
 	m.attachments = nil
+	m.queue = nil
+	m.queueIdx = -1
 	m.usage = domain.ContextUsage{}
 	// 待办清单同理：那是上一个会话里的任务
 	tool.ClearTodos()
@@ -2016,6 +2086,17 @@ func (m model) finish(err error) (tea.Model, tea.Cmd) {
 	if len(out) > 0 {
 		cmds = append(cmds, m.print(strings.Join(out, "\n")))
 	}
+	// 这一轮正常跑完、队里还排着东西：直接接上，排队就是为了不用再敲一遍。
+	// 中断或出错时不动队列——那时候该由人决定还要不要发
+	if err == nil && len(m.queue) > 0 {
+		next, cmd := m.dequeue()
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		if mm, ok := next.(model); ok {
+			return mm, tea.Sequence(cmds...)
+		}
+	}
 	cmds = append(cmds, textarea.Blink)
 	return m, tea.Sequence(cmds...)
 }
@@ -2315,7 +2396,10 @@ func (m model) taskDetailLines() []string {
 // 折行会把整个界面的高度顶乱。
 func (m model) footerLine() string {
 	if m.state == stateRunning {
-		return hintStyle.Render("Ctrl+C 中断")
+		return fitItems([]string{
+			hintStyle.Render("Enter 排队下一条"),
+			hintStyle.Render("Ctrl+C 中断"),
+		}, m.width-1)
 	}
 	return fitItems([]string{
 		hintStyle.Render("Enter 发送"),
@@ -2521,6 +2605,9 @@ func compose(lines []string, width int) string {
 func (m model) activeLines() []string {
 	rows := m.activeRows()
 	out := m.todoLines(rows)
+	// 排队那几行紧跟在清单后面：它是用户刚敲进去、马上要发的东西，
+	// 排在预览之前，槽位不够时裁掉的是预览而不是它
+	out = append(out, m.queueLines()...)
 	if m.state == stateRunning {
 		return append(out, strings.Split(m.runningView(), "\n")...)
 	}
@@ -2531,6 +2618,12 @@ func (m model) activeLines() []string {
 // activeView 裁内容时要给清单留出前面这几行，不能当成可以随便砍的预览
 func (m model) activeTodoRows() int {
 	return len(m.todoLines(m.activeRows()))
+}
+
+// queueRows 是排队那块这一帧占了几行（含标题行），空队列就是 0。
+// 和 activeTodoRows 一样，裁内容时这几行要留住
+func (m model) queueRows() int {
+	return len(m.queueLines())
 }
 
 // idleLines 是闲着时这块槽位放什么。没有内容就返回空——槽位不占行（见 activeView），
@@ -2598,8 +2691,8 @@ func (m model) activeView() string {
 	lines := m.foldLines(m.activeLines())
 	if len(lines) > rows {
 		if m.state == stateRunning {
-			// 清单那几行不能被砍：它是这一屏最要紧的信息，砍了等于没有
-			keep := min(m.activeTodoRows()+1, rows)
+			// 清单和排队那几行不能被砍：它是这一屏最要紧的信息，砍了等于没有
+			keep := min(m.activeTodoRows()+1+m.queueRows(), rows)
 			kept := make([]string, 0, rows)
 			kept = append(kept, lines[:keep]...)
 			kept = append(kept, lines[len(lines)-(rows-keep):]...)
