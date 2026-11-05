@@ -1,15 +1,31 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"hamusuta/agent-dev/src/config"
 	"hamusuta/agent-dev/src/domain"
+	"hamusuta/agent-dev/src/tool"
 
 	tea "charm.land/bubbletea/v2"
 )
+
+// setTodos 把一份清单装进界面读的那份待办里，走工具那条正经路径（清单只由
+// TodoWrite 维护，测试也别绕过它自己塞）
+func setTodos(t *testing.T, items []tool.TodoItem) {
+	t.Helper()
+	args, err := json.Marshal(tool.TodoArgs{Intent: "测试用", Todos: items})
+	if err != nil {
+		t.Fatalf("准备清单失败: %v", err)
+	}
+	if _, err := (tool.TodoTool{}).Execute(t.Context(), args); err != nil {
+		t.Fatalf("准备清单失败: %v", err)
+	}
+}
 
 // 屏幕上叠出好几份界面时（终端矮、历史又长的时候会发生），按 Ctrl+L 应该能
 // 把旧内容整体顶出去，只剩干净的一帧。
@@ -100,25 +116,90 @@ func TestActiveRowsShrinksWithTerminal(t *testing.T) {
 // 一次 print 最多能带几行，必须真的按帧高算：帧高要是数成 frameLines 的元素个数，
 // 就会少算好几行（输入框上方那块是一个整块多行字符串），一次想打的行数超过终端
 // 剩下的行数，插行落点就错了，屏幕上叠出旧帧（两份输入框、两行上下文占用）。
+//
+// 帧高还要取"屏幕上那一帧"和"即将画上去的新帧"里高的那个：渲染器插行时是按屏幕上
+// 那一帧的位置往上数的，清单刚收起时屏幕上那帧还高着，只按新帧算就会多打一大截。
 func TestPrintRowsLeavesRoomAboveFrame(t *testing.T) {
-	for _, h := range []int{12, 14, 16, 18, 20, 24, 30, 40} {
+	// 屏幕上那一帧比即将画的新帧高时按高的算：比如确认框顶掉输入框之后又回主界面，
+	// 新帧矮下去，可屏幕上那一帧还在原位，插行的落点是按它数的
+	const h = 30
+	m := newModel(safeConfig(), nil, ".", domain.NewSession("."))
+	m.width, m.height = 100, h
+	m.screenRows = m.frameRows() + 3 // 屏幕上那帧比新帧高 3 行
+	if got, want := m.printRows(), h-m.screenRows-1; got != want {
+		t.Errorf("屏幕上那一帧更高时，一次该只带 %d 行，实际 %d 行", want, got)
+	}
+	// 两帧一样高时就是"终端高 - 帧高 - 1"
+	m.screenRows = m.frameRows()
+	if got, want := m.printRows(), h-m.frameRows()-1; got != want {
+		t.Errorf("两帧一样高时该带 %d 行，实际 %d 行", want, got)
+	}
+
+	for _, height := range []int{12, 14, 16, 18, 20, 24, 30, 40} {
 		m := newModel(safeConfig(), nil, ".", domain.NewSession("."))
-		m.width, m.height = 80, h
+		m.width, m.height = 80, height
 
 		rows := m.frameRows()
 		// 帧高 = 固定那几行 + 输入框上方槽位，多一行少一行都不对
 		if want := chromeRows + m.activeRows(); rows != want {
 			t.Errorf("高 %d：帧高算出来 %d 行，按 chrome(%d)+槽位(%d) 应该是 %d 行",
-				h, rows, chromeRows, m.activeRows(), want)
+				height, rows, chromeRows, m.activeRows(), want)
 		}
 		// 帧高 + 一次能带的行数 + 一行余量，不能超过终端高，否则插行会顶出屏幕。
 		// 终端矮到帧本身就快占满时（槽位已经收到 1 行）没法再让，只要求至少能打一行
 		room := m.printRows()
 		if room < 1 {
-			t.Errorf("高 %d：一次打印连一行都带不了", h)
+			t.Errorf("高 %d：一次打印连一行都带不了", height)
 		}
-		if rows+room+1 > h && room > 1 {
-			t.Errorf("高 %d：帧 %d 行、一次想打 %d 行，加起来超出终端", h, rows, room)
+		if rows+room+1 > height && room > 1 {
+			t.Errorf("高 %d：帧 %d 行、一次想打 %d 行，加起来超出终端", height, rows, room)
+		}
+	}
+}
+
+// 待办清单不能自己把帧撑高：清单从槽位额度里分位置，帧高和有清单前一模一样。
+//
+// 这条是地基——帧高一会儿高一会儿矮，inline 渲染的插行账就和屏幕对不上，
+// 屏幕上会叠出旧帧（上半截空槽位、下半截新 footer，中间夹着一行历史）。
+func TestFrameHeightStableWithTodos(t *testing.T) {
+	t.Cleanup(tool.ClearTodos)
+	for _, h := range []int{14, 16, 18, 20, 24, 30} {
+		for _, state := range []uiState{stateIdle, stateRunning} {
+			tool.ClearTodos()
+			m := newModel(safeConfig(), nil, ".", domain.NewSession("."))
+			m.width, m.height, m.state = 80, h, state
+			before := m.frameRows()
+
+			items := make([]tool.TodoItem, 15)
+			for i := range items {
+				items[i] = tool.TodoItem{Content: fmt.Sprintf("第 %d 件事", i+1), Status: tool.TodoPending}
+			}
+			items[5].Status = tool.TodoInProgress
+			setTodos(t, items)
+
+			rows := m.frameRows()
+			if rows != before {
+				t.Errorf("高 %d 状态 %d：有清单之后帧高从 %d 变成了 %d——帧高必须恒定",
+					h, state, before, rows)
+			}
+			// 清单列出来了，但没把别的内容挤没。终端太矮时只列得下标题，
+			// 那时至少要看到进度总量（"待办 x/y"）
+			view := stripANSI(m.activeView())
+			if m.activeTodoRows() > 1 {
+				if !strings.Contains(view, "第 6 件事") {
+					t.Errorf("高 %d 状态 %d：清单没显示出来:\n%s", h, state, view)
+				}
+			} else if !strings.Contains(view, "待办 ") {
+				t.Errorf("高 %d 状态 %d：清单连标题都没有:\n%s", h, state, view)
+			}
+			// 整帧仍然塞得进终端，且给历史区留出了行
+			if rows > h {
+				t.Errorf("高 %d：帧占了 %d 行，比终端还高", h, rows)
+			}
+			if h >= 18 && rows > h-reserveHistoryRows {
+				t.Errorf("高 %d：帧占了 %d 行，只给历史留了 %d 行（至少要 %d 行）",
+					h, rows, h-rows, reserveHistoryRows)
+			}
 		}
 	}
 }

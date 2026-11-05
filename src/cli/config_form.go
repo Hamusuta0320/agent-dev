@@ -52,6 +52,8 @@ func newConfigForm(mc config.ModelConfig) configForm {
 		in.Prompt = ""
 		in.Placeholder = f.hint
 		in.SetValue(values[i])
+		// 光标交给终端画，理由和主输入框一样：输入法的候选框跟着终端光标走
+		in.SetVirtualCursor(false)
 		inputs[i] = in
 	}
 	return configForm{inputs: inputs, name: mc.Label(), typ: mc.Type}
@@ -98,12 +100,7 @@ func (m model) fieldLines() []string {
 	out := []string{
 		bannerStyle.Render("模型配置") + hintStyle.Render("  "+modelFormTitle(f)+" · "+m.cfgPathLabel()),
 	}
-	width := 0
-	for _, fld := range configFields {
-		if w := lipgloss.Width(fld.label); w > width {
-			width = w
-		}
-	}
+	width := configLabelWidth()
 	for i, fld := range configFields {
 		label := fld.label + strings.Repeat(" ", width-lipgloss.Width(fld.label)+2)
 		mark := "  "
@@ -127,6 +124,34 @@ func (m model) fieldLines() []string {
 		out = append(out, errStyle.Render("  "+f.err))
 	}
 	return out
+}
+
+// configLabelWidth 是表单里最长的那个标签有多宽，几行的值都对齐在它后面
+func configLabelWidth() int {
+	width := 0
+	for _, fld := range configFields {
+		if w := lipgloss.Width(fld.label); w > width {
+			width = w
+		}
+	}
+	return width
+}
+
+// formCursor 是正在编辑的那一格里的光标位置。表单每行是"两格标记 + 标签 + 值"，
+// 值前面那几格要加到 textinput 给的偏移上；行号则是标题下面第 cur 行
+func (m model) formCursor() *tea.Cursor {
+	f := &m.form
+	if !f.editing {
+		return nil
+	}
+	c := f.inputs[f.cur].Cursor()
+	if c == nil {
+		return nil
+	}
+	// 两格标记 + 标签（补到最长那个再加两格空格）
+	x := 2 + configLabelWidth() + 2 + c.X
+	// 标题占一行，字段从第二行开始
+	return m.placedCursor(c, x, 1+f.cur+c.Y)
 }
 
 // cfgPathLabel 是展示给用户看的配置文件路径，尽量给绝对路径

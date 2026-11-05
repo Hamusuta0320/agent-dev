@@ -66,16 +66,21 @@ const (
 	// maxResumeList 是 /resume 列表最多列几个会话，再多就折成一句"还有 N 个"
 	maxResumeList = 10
 	// maxActiveRows 是输入框上方那块会变的内容最多占几行：跑任务时是状态、工具调用
-	// 和预览的尾巴，闲着时是补全候选。7 行正好放得下全部命令候选。
+	// 和预览的尾巴，闲着时是补全候选或别的常驻信息。待办清单也从这块里分位置。
 	//
-	// 但它是上限不是定值，实际占几行由 activeRows() 按终端高度算——帧一旦高到快
+	// 它是上限不是定值，实际占几行由 activeRows() 按终端高度算——帧一旦高到快
 	// 占满屏幕，inline 渲染的滚动账就算不对了，屏幕上会叠出好几份界面。
-	maxActiveRows = 7
+	// 10 行 = 待办清单（标题 + 5 条）再留 4 行给状态和预览。
+	maxActiveRows = 10
 	// minActiveRows 是再挤也要给这块留的行数，不然运行状态完全看不见
 	minActiveRows = 1
-	// chromeRows 是帧里除这块以外固定占掉的行数：待办 + 任务栏 + 附图 +
+	// maxTodoRows 是待办清单最多列几行（不含标题那一行），多出来的滚动
+	maxTodoRows = 5
+	// todoMinRest 是清单之外的内容至少留几行：运行中的状态行最要紧，不能全被清单吃掉
+	todoMinRest = 2
+	// chromeRows 是帧里除输入框上方那块以外固定占掉的行数：任务栏 + 附图 +
 	// 输入框（上边框 + 3 行内容 + 下边框）+ 上下文占用 + 按键提示
-	chromeRows = 10
+	chromeRows = 9
 	// reserveHistoryRows 是帧上方至少留给历史区的行数。这块不能是 0：print
 	// 是靠"光标此刻在最后一屏的底部"来插行的，帧顶到终端顶上时这个前提就废了
 	reserveHistoryRows = 3
@@ -131,6 +136,12 @@ type eventMsg domain.Event
 
 // doneMsg 表示这一轮跑完了
 type doneMsg struct{ err error }
+
+// printedMsg 表示"刚往历史区打了一批内容"，用来把被插行弄丢的真光标放回输入框
+type printedMsg struct{}
+
+// cursorReleaseMsg 表示"重画完了，真光标可以交回去了"（见 cursorHold）
+type cursorReleaseMsg struct{}
 
 // taskTickMsg 只用来让界面自己动一下：后台任务在跑的时候，耗时那栏每秒得刷新
 type taskTickMsg struct{}
@@ -229,8 +240,19 @@ type model struct {
 	// contextLimit 是配置里的上下文窗口大小，用来算已用百分比
 	contextLimit int
 
+	// cursorHold 为 true 表示这一小会儿别报真光标位置：终端刚改过尺寸，屏幕上
+	// 内容被重排过，渲染器那本账要等整帧重画完才对得回来（见 WindowSizeMsg）
+	cursorHold bool
+	// printSeq 是"往历史区打了几批内容"的计数，只有一个用处：让帧内容每打一次就换
+	// 个样子（见 printMark），逼渲染器重画一帧、把真光标摆回输入框。
+	// 用指针是因为 model 到处按值复制，打在副本上的 print 也得让所有副本看到同一个数
+	printSeq *int
 	// height 是终端高度，用来算输入框上方那块最多能占几行（activeRows）
 	height int
+	// screenRows 是屏幕上此刻这一帧有几行（上一条消息处理完的样子）。帧高不是常数了：
+	// 待办清单出现或收起、确认框顶掉输入框，都会让它变。往上插历史行时渲染器是按
+	// 屏幕上那一帧的位置算的，所以插多少行要按"这两帧里高的那个"来限（见 printRows）
+	screenRows int
 	// started 表示开场白已经打过了：等第一次收到窗口尺寸再打，只打一次
 	started bool
 	// tasksTicking 表示"后台任务耗时"的定时刷新已经转起来了，避免重复起定时器
@@ -272,6 +294,9 @@ func newModel(cfg config.GlobalConfig, store *session.Store, workdir string, cur
 	input.SetStyles(styles)
 	// Enter 留给"发送"，换行改用 Shift+Enter（终端不区分修饰键时 Ctrl+J 也能换行）
 	input.KeyMap.InsertNewline = key.NewBinding(key.WithKeys("shift+enter", "ctrl+j"))
+	// 光标交给终端画：输入法（IME）的候选框跟着终端的真光标走，跟着画出来的方块走不了。
+	// 关掉虚拟光标之后 textarea 的 Cursor() 才有值，View 里把它的位置报给终端
+	input.SetVirtualCursor(false)
 	// 窗口尺寸还不知道，先给个占位宽度；收到 WindowSizeMsg 会按真实宽度重设
 	input.SetWidth(76 - boxOverhead)
 	input.Focus()
@@ -312,6 +337,7 @@ func newModel(cfg config.GlobalConfig, store *session.Store, workdir string, cur
 		quiet:        cfg.QuietMode(),
 		reasoning:    &strings.Builder{},
 		answer:       &strings.Builder{},
+		printSeq:     new(int),
 		width:        80,
 	}
 }
@@ -358,6 +384,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if !ok {
 		return next, cmd
 	}
+	// 这一帧马上就要画到屏幕上了，记下它有几行：下一条消息里的 print 要按它限额
+	// （渲染器插行时算的是屏幕上那一帧的位置）
+	mm.screenRows = mm.frameRows()
 	return mm.withTaskTicker(cmd)
 }
 
@@ -380,10 +409,19 @@ func taskTick() tea.Cmd {
 	return tea.Tick(time.Second, func(time.Time) tea.Msg { return taskTickMsg{} })
 }
 
+// cursorReleaseTime 是改尺寸之后连着藏几帧光标：渲染器要攒够一次重画（60fps，
+// 一帧 16ms），留三帧余量
+const cursorReleaseTime = 50 * time.Millisecond
+
+// cursorRelease 是"再过一会儿把真光标交回去"
+func cursorRelease() tea.Cmd {
+	return tea.Tick(cursorReleaseTime, func(time.Time) tea.Msg { return cursorReleaseMsg{} })
+}
+
 func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		prevWidth := m.width
+		prevWidth, prevHeight := m.width, m.height
 		m.width = max(msg.Width, 24)
 		m.height = max(msg.Height, 10)
 		// 输入框能放字的宽度 = 框总宽(width-4) 减去边框内边距(boxOverhead)
@@ -394,17 +432,36 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.started = true
 			return m, tea.Sequence(m.print(m.startupText()), textarea.Blink)
 		}
-		if m.width != prevWidth {
-			// 宽度一变，终端会把屏幕上已经画出来的行重新折行，渲染器记的行数就对不上了
-			// （inline 用的是相对光标，没法回到原位擦），旧帧会留在屏幕上。
-			// 先打一屏空行把老内容顶出去，再清屏重画
-			return m, tea.Sequence(m.print(strings.Repeat("\n", m.height)), m.rebuild())
+		if m.width != prevWidth || m.height != prevHeight {
+			// 尺寸一变，渲染器记的那本账（帧在第几行、光标在哪）就作废了：终端已经把
+			// 屏幕上的内容重排过，而 inline 用的是相对光标，挪一格的落点全靠这本账。
+			// 这里干脆把账本清零重来：先打一屏空行把老内容顶出去，再清屏重画。
+			// 重画是逐行写出去的，写的同时账本也就对回来了。
+			//
+			// 光标这一小会儿先藏起来：账没对回来的时候报位置，它只会把光标摆错地方，
+			// 接着按错位置去擦、去画，屏幕上就留下一截旧帧。
+			m.cursorHold = true
+			return m, tea.Sequence(
+				m.print(strings.Repeat("\n", m.height)),
+				m.rebuild(),
+				cursorRelease(),
+			)
 		}
 		return m, nil
 
 	case taskTickMsg:
 		// 这一拍用掉了，交给外层的 withTaskTicker 决定要不要再续一拍
 		m.tasksTicking = false
+		return m, nil
+
+	case printedMsg:
+		// 刚插过行，真光标被渲染器扔到帧顶上去了。换个帧标记让它重画一帧，
+		// 重画时才会按 View.Cursor 把光标摆回输入框（见 printMark）
+		*m.printSeq++
+		return m, nil
+
+	case cursorReleaseMsg:
+		m.cursorHold = false
 		return m, nil
 
 	case tea.KeyPressMsg:
@@ -2006,30 +2063,104 @@ func fitItems(items []string, limit int) string {
 	return out
 }
 
-// todoLine 是输入框上方常驻的待办摘要，一条待办都没有时整行空着（行数恒定，见 View）
-func (m model) todoLine() string {
-	return todoLine(tool.CurrentTodos(), m.width-4)
+// todoLines 是待办清单在这块槽位里占的那几行：标题一行，下面逐条列出来。
+// 一条待办都没有时一行不占，整块位置让给别的内容。
+//
+// 行数由 todoBudget(rows) 决定——它必须留在 activeRows() 这块固定额度里，
+// 不能自己撑高帧：帧高一变，inline 渲染的插行和重绘就按旧账算，屏幕上会叠出残影。
+func (m model) todoLines(rows int) []string {
+	return todoLines(tool.CurrentTodos(), m.width-4, todoBudget(rows))
 }
 
-// todoLine 把待办清单压成一行，纯函数，方便直接拿造的数据测。
-// limit > 0 时保证不超过这么宽：折行会把界面高度顶乱，宁可截断
-func todoLine(items []tool.TodoItem, limit int) string {
+// todoBudget 是清单最多列几条（不含标题行）。整块槽位就 rows 行，得给清单之外的
+// 内容留出 todoMinRest 行：运行中的状态行、空闲时的补全候选都比清单更急
+func todoBudget(rows int) int {
+	return min(maxTodoRows, max(rows-todoMinRest, 0))
+}
+
+// todoLines 把待办清单渲染成"标题 + 最多 rows 条"，纯函数，方便直接拿造的数据测。
+//
+// 任务一多就滚动：窗口以手上正在做的那一项开头往后取 rows 条，后面不够就往前补，
+// 所以进行中的那条永远在窗口里（15 条做到第 6 条，列的就是 6-10）。标题行末尾
+// 交代窗口落在第几条到第几条，省得以为清单就这几项。
+//
+// 每一行都不超过 limit 宽：折行会把界面高度顶乱，宁可截断。
+func todoLines(items []tool.TodoItem, limit, rows int) []string {
 	if len(items) == 0 {
-		return ""
+		return nil
 	}
 	done, running := tool.TodoCounts(items)
-	out := hintStyle.Render("待办 ") + statusStyle.Render(fmt.Sprintf("%d/%d", done, len(items)))
+	title := hintStyle.Render("待办 ") + statusStyle.Render(fmt.Sprintf("%d/%d", done, len(items)))
 	if running > 0 {
-		out += hintStyle.Render(fmt.Sprintf(" · %d 项进行中", running))
+		title += hintStyle.Render(fmt.Sprintf(" · %d 项进行中", running))
 	}
-	// 手上这（或下一）项是什么，一眼能看到，不用去翻历史区
-	if cur := tool.TodoCurrent(items); cur != "" {
-		out += hintStyle.Render(" · ") + toolStyle.Render(firstLines(cur, 40))
+	if rows <= 0 {
+		// 一行都匀不出来（终端太矮）：只留标题，进度总量还看得见
+		return []string{clipLine(title, limit)}
 	}
-	if limit > 0 && lipgloss.Width(out) > limit {
-		out = ansi.Truncate(out, limit, "…")
+
+	start, end := todoWindow(items, rows)
+	if start > 0 || end < len(items) {
+		title += hintStyle.Render(fmt.Sprintf(" · 第 %d-%d 项", start+1, end))
+	}
+	out := []string{clipLine(title, limit)}
+
+	for i := start; i < end; i++ {
+		it := items[i]
+		mark, style := "[ ]", hintStyle
+		switch it.Status {
+		case tool.TodoCompleted:
+			mark, style = "[x]", toolOKStyle
+		case tool.TodoInProgress:
+			mark, style = "[~]", promptStyle
+		}
+		// 手上这项前面点一下，扫一眼就知道做到哪了
+		head := "  "
+		if it.Status == tool.TodoInProgress {
+			head = "▸ "
+		}
+		out = append(out, clipLine(style.Render(fmt.Sprintf("%s%s %d. %s",
+			head, mark, i+1, it.Content)), limit))
 	}
 	return out
+}
+
+// todoWindow 是滚动窗口的起止下标：以手上正在做的那一项为第一行往后取 rows 条，
+// 后面不够就往前补（做到倒数第 2 条时列的是最后 rows 条）。
+// 手上那一项：有进行中的就是它；没有就是第一条还没做的；全做完了停在最后。
+func todoWindow(items []tool.TodoItem, rows int) (start, end int) {
+	if rows <= 0 || len(items) <= rows {
+		return 0, min(rows, len(items))
+	}
+	cur := -1
+	for i, it := range items {
+		if it.Status == tool.TodoInProgress {
+			cur = i
+			break
+		}
+	}
+	if cur < 0 {
+		for i, it := range items {
+			if it.Status != tool.TodoCompleted {
+				cur = i
+				break
+			}
+		}
+	}
+	if cur < 0 {
+		cur = len(items) - 1
+	}
+	// 窗口贴着末尾时往前补，保证凑满 rows 条
+	cur = min(cur, len(items)-rows)
+	return cur, cur + rows
+}
+
+// clipLine 把一行截到 limit 宽以内，limit <= 0 表示不限
+func clipLine(line string, limit int) string {
+	if limit <= 0 || lipgloss.Width(line) <= limit {
+		return line
+	}
+	return ansi.Truncate(line, limit, "…")
 }
 
 // tasksLine 是输入框上方常驻的后台任务栏，
@@ -2215,7 +2346,11 @@ func (m model) View() tea.View {
 	if m.quitting {
 		return tea.NewView("")
 	}
-	return tea.NewView(compose(m.frameLines(), m.width))
+	v := tea.NewView(compose(m.frameLines(), m.width) + printMark(*m.printSeq))
+	// 告诉终端真光标该待在哪儿。输入法打字的候选框是跟着终端光标走的，不报位置的话
+	// 光标就停在渲染器最后一次落笔的地方——界面右下角那行按键提示后面，候选框跟着飞过去
+	v.Cursor = m.cursorTarget()
+	return v
 }
 
 // frameLines 按当前状态把这一帧的行拼出来。
@@ -2238,10 +2373,11 @@ func (m model) configFrameLines() []string {
 		hintStyle.Render("↑↓ 选字段 · Enter 编辑 · Ctrl+S 保存 · Esc 返回"))
 }
 
-// approvalFrameLines 是确认框：它顶替输入框，这一刻只能回答 y / a / n
+// approvalFrameLines 是确认框：它顶替输入框，这一刻只能回答 y / a / n。
+// 清单照旧从槽位额度里分，不额外撑高这一帧
 func (m model) approvalFrameLines() []string {
 	var lines []string
-	if line := m.todoLine(); line != "" {
+	for _, line := range m.todoLines(m.activeRows()) {
 		lines = append(lines, m.wrap(line))
 	}
 	if line := m.tasksLine(); line != "" {
@@ -2257,21 +2393,104 @@ func (m model) approvalFrameLines() []string {
 }
 
 // mainFrameLines 是平常那一屏。
-// 待办、任务栏、附图、上下文占用这四行有没有内容都占着一行：只有贴在最下面的
-// 输入框位置稳定，帧高才稳定。
+//
+// 帧高必须恒定，这是整块界面的地基：inline 渲染靠"光标此刻在最后一屏的底部、帧顶
+// 就在上面几行"来插历史行和重绘，帧高一会儿高一会儿矮，那本账就对不上，屏幕上会
+// 叠出旧帧（上半截空空槽位、下半截新 footer，中间还夹着一行历史）。
+// 所以槽位永远占满 activeRows() 行（见 activeView），待办清单也从这块额度里分。
 func (m model) mainFrameLines() []string {
-	return []string{
-		m.todoLine(),
-		m.tasksLine(),
-		// 运行进度和补全候选共用这块固定行数的位置，紧挨着输入框
-		m.activeView(),
-		// 附图那行贴着输入框：贴进来、挂在下一条提问上的图就在这儿
-		m.attachmentsLine(),
-		boxStyle.Width(m.width - 4).Render(m.input.View()),
-		// 上下文占用挂在输入框下面：紧挨着输入框看得见，又不占上面那块常驻槽位
-		m.usageLine(),
-		m.footerLine(),
+	return append(m.mainPrefixLines(), m.inputBox(), m.usageLine(), m.footerLine())
+}
+
+// mainPrefixLines 是输入框上面的那几块，从上到下：槽位（清单+进度）、任务栏、附图
+func (m model) mainPrefixLines() []string {
+	return append([]string{m.activeView()}, m.tasksLine(), m.attachmentsLine())
+}
+
+// inputBox 是贴在最下面的输入框：一圈圆角框套着三行 textarea
+func (m model) inputBox() string {
+	return boxStyle.Width(m.width - 4).Render(m.input.View())
+}
+
+// cursorTarget 是这一帧里真光标该落在哪儿（坐标从帧左上角算起），nil 表示藏起来。
+//
+// 打字的地方都得给：输入法的候选框跟的是终端光标，不是我们在屏幕上画的那个方块。
+// 不报位置时终端光标留在渲染器最后落笔的地方（界面最下面那行提示的末尾），
+// 打拼音时候选框就飞到输入框外面去了。
+func (m model) cursorTarget() *tea.Cursor {
+	if m.cursorHold {
+		// 刚改过尺寸，渲染器那本账还没对回来，这会儿报位置只会把光标摆错地方
+		return nil
 	}
+	switch m.state {
+	case stateIdle, stateRunning:
+		return m.inputCursor()
+	case stateConfig:
+		return m.formCursor()
+	}
+	// 确认框里那句话的光标是手画的竖线，还没接管真光标
+	return nil
+}
+
+// inputCursor 是输入框里那个光标的位置：textarea 给的是相对自己的坐标，
+// 加上外面那圈圆角框的偏移（左边 1 格边框 + 1 格内边距，上面 1 行上边框）
+func (m model) inputCursor() *tea.Cursor {
+	c := m.input.Cursor()
+	if c == nil {
+		return nil
+	}
+	return m.placedCursor(c, c.X+boxOverhead/2, rowsOf(m.mainPrefixLines())+1+c.Y)
+}
+
+// placedCursor 照着组件给的光标做一份，只把位置换掉
+func (m model) placedCursor(from *tea.Cursor, x, y int) *tea.Cursor {
+	out := *from // 形状、闪不闪跟着组件走
+	// 颜色留空：让终端用它自己的光标色。终端配色深浅不一，写死一个颜色反而可能看不见
+	out.Color = nil
+	out.X, out.Y = m.clampCursor(x, y)
+	return &out
+}
+
+// clampCursor 把光标夹在帧里面：帧外的地方不存在，报出去终端会跑到屏幕别处去
+func (m model) clampCursor(x, y int) (int, int) {
+	if rows := m.frameRows(); rows > 0 {
+		y = min(max(y, 0), rows-1)
+	} else {
+		y = max(y, 0)
+	}
+	if m.width > 1 {
+		x = min(max(x, 0), m.width-1)
+	} else {
+		x = max(x, 0)
+	}
+	return x, y
+}
+
+// rowsOf 数一串渲染好的行在屏幕上到底占几行。不能数元素个数：有的元素本身就带换行
+// （输入框上方那块、折过行的预览），按个数数会数少好几行
+func rowsOf(lines []string) int {
+	n := 0
+	for _, line := range lines {
+		n += strings.Count(line, "\n") + 1
+	}
+	return n
+}
+
+// printMarkStates 是帧标记最多能换多少种样子，够一连串打印在同一个重绘间隔里用
+const printMarkStates = 24
+
+// printMark 是贴在帧末尾的一小串零宽转义，每打一批历史就换一个样子（内容上多一个
+// 0;）。它一个像素都不上屏，唯一的作用是让帧内容"变了"：
+//
+// 渲染器对内容没变的帧是直接跳过的，跳过时连光标都不会去摆。而往历史区插行的时候
+// 它又把自认为的光标位置写成了帧的左上角（cursedRenderer.insertAbove 里那句
+// SetPosition(0,0)），所以刚打完历史行又不重画的话，真光标就留在帧顶上——
+// 输入法打字的候选框是跟着真光标走的，于是跑到界面左上角去。
+//
+// 用 SGR 复位（0;0;…m）当填充是因为它不产生任何字符：终端只当一次"样式归零"，
+// 屏幕上什么都不变。
+func printMark(seq int) string {
+	return "\x1b[" + strings.Repeat("0;", seq%printMarkStates) + "0m"
 }
 
 // compose 把一帧的行收成最终画面，是整块界面唯一的出口。
@@ -2298,13 +2517,22 @@ func compose(lines []string, width int) string {
 	return strings.Join(out, "\n")
 }
 
-// activeLines 是输入框上方那块会变的内容：跑任务时是状态、工具调用和预览尾巴，
-// 闲着时是补全候选或别的常驻信息。行数不定，由 activeView 整理成固定行数。
+// activeLines 是输入框上方那块的全部内容，总共占 activeRows() 行：
+// 待办清单排在最前面（最多 todoBudget 条），后面是跑任务时的状态/预览，
+// 或者闲着时的补全候选、上一轮回答。
 func (m model) activeLines() []string {
+	rows := m.activeRows()
+	out := m.todoLines(rows)
 	if m.state == stateRunning {
-		return strings.Split(m.runningView(), "\n")
+		return append(out, strings.Split(m.runningView(), "\n")...)
 	}
-	return m.idleLines()
+	return append(out, m.idleLines()...)
+}
+
+// activeTodoRows 是清单这一帧占了几行（含标题），没有清单就是 0。
+// activeView 裁内容时要给清单留出前面这几行，不能当成可以随便砍的预览
+func (m model) activeTodoRows() int {
+	return len(m.todoLines(m.activeRows()))
 }
 
 // idleLines 是闲着时这块槽位放什么。这块高度恒定（见 activeRows()）却又不能空着，
@@ -2356,19 +2584,21 @@ func (m model) hintLines() []string {
 }
 
 // activeView 把这块内容整理成固定的 activeRows() 行，始终贴着输入框：
-// 跑任务时内容超了就先砍中间（留下第一行的状态或工具标题，以及最新的几行预览），
-// 闲着时按顺序留着前面的候选；都不够就在顶上补空行。
-// 这块的高度一旦跟着内容上下变，Bubble Tea 就会在屏幕底部留白，输入框立刻离地，
-// 所以这里必须恒定。单行也不能比终端还宽——超了终端会自己折行，实际用的行数
+// 跑任务时内容超了就先砍中间（留下清单和状态/工具标题，以及最新的几行预览），
+// 闲着时按顺序留着前面的内容；都不够就在顶上补空行。
+// 这块的高度一旦跟着内容上下变，inline 渲染的插行账就和屏幕对不上，屏幕上会叠出
+// 残影，所以这里必须恒定。单行也不能比终端还宽——超了终端会自己折行，实际用的行数
 // 就比这里记的多，屏幕从那一行起全错位。
 func (m model) activeView() string {
 	rows := m.activeRows()
 	lines := m.foldLines(m.activeLines())
 	if len(lines) > rows {
 		if m.state == stateRunning {
+			// 清单那几行不能被砍：它是这一屏最要紧的信息，砍了等于没有
+			keep := min(m.activeTodoRows()+1, rows)
 			kept := make([]string, 0, rows)
-			kept = append(kept, lines[0])
-			kept = append(kept, lines[len(lines)-(rows-1):]...)
+			kept = append(kept, lines[:keep]...)
+			kept = append(kept, lines[len(lines)-(rows-keep):]...)
 			lines = kept
 		} else {
 			lines = lines[:rows]
@@ -2467,19 +2697,45 @@ func (m model) block(title string, titleStyle lipgloss.Style, text string, maxLi
 // 折完还要按"一次最多插几行"切开，分几次打（见 printRows）：一次插的行数超过帧顶
 // 上方空着的行数，帧就被顶出屏幕，屏幕上留下半截擦不掉的旧帧——看着就是两份输入框、
 // 两行上下文占用叠在一起。
+//
+// 最后还要跟一个 printed：插行的时候渲染器以为光标就在帧的左上角（见
+// cursedRenderer.insertAbove 里的 SetPosition(0,0)），真光标就被扔在那儿了。
 func (m *model) print(text string) tea.Cmd {
 	lines := strings.Split(m.fitWidth(text), "\n")
 	rows := m.printRows()
 	if rows <= 0 || len(lines) <= rows {
-		return tea.Println(strings.Join(lines, "\n"))
+		return tea.Sequence(printChunk(strings.Join(lines, "\n")), printed())
 	}
-	cmds := make([]tea.Cmd, 0, len(lines)/rows+1)
+	cmds := make([]tea.Cmd, 0, len(lines)/rows+2)
 	for len(lines) > 0 {
 		n := min(rows, len(lines))
-		cmds = append(cmds, tea.Println(strings.Join(lines[:n], "\n")))
+		cmds = append(cmds, printChunk(strings.Join(lines[:n], "\n")))
 		lines = lines[n:]
 	}
-	return tea.Sequence(cmds...)
+	return tea.Sequence(append(cmds, printed())...)
+}
+
+// printChunk 把一块内容包成一次"打到历史区"。
+//
+// 整块只有一个空行时塞一个空格进去：渲染器对空字符串的插行是原地返回的
+// （cursedRenderer.insertAbove 里 len(str)==0 就直接 return），一行都插不进去。
+// 而"打一屏空行把老内容顶出去"这招正是靠插空行干活的（见 WindowSizeMsg），
+// 顶不出去，改完尺寸屏幕上就会留下旧帧。这一个空格会被紧接着的擦行指令擦掉，
+// 屏幕上看到的仍然是一行空白。
+func printChunk(text string) tea.Cmd {
+	if text == "" {
+		text = " "
+	}
+	return tea.Println(text)
+}
+
+// printed 是"这批历史行已经打出去了"，紧跟在 Println 后面到。
+//
+// 它只干一件事：把帧内容换一个样子（见 printMark），逼渲染器重画一帧。渲染器对
+// "内容没变"的帧是直接跳过的，跳过的同时也就不会去摆光标——刚打完历史行时不重画，
+// 真光标就留在帧左上角，输入法打字的候选框跟着跑到界面顶上。
+func printed() tea.Cmd {
+	return func() tea.Msg { return printedMsg{} }
 }
 
 // printRows 是一次 tea.Println 最多能带几行；<= 0 表示不限（还不知道终端多高）。
@@ -2488,12 +2744,15 @@ func (m *model) print(text string) tea.Cmd {
 // 位置往上数 offset 行去插，offset 一旦超过帧顶那一行，光标就从屏幕顶上顶出去了，
 // 插行的落点全错，旧帧的下半截留在屏幕上再也不会被擦（两份输入框、两行上下文占用）。
 //
-// 帧顶上方能空出几行 = 终端高 - 帧高，再减一行余量。
+// 帧顶上方能空出几行 = 终端高 - 帧高 - 1 行余量。帧高取屏幕上那一帧和即将画上去
+// 的这一帧里高的那个：待办清单刚出现时新帧更高，清单刚收起时屏幕上那一帧更高，
+// 只有两个都算上，插行的落点才总是落在屏幕里面。
 func (m model) printRows() int {
 	if m.height <= 0 {
 		return 0
 	}
-	room := m.height - m.frameRows() - 1
+	rows := max(m.frameRows(), m.screenRows)
+	room := m.height - rows - 1
 	if room < 1 {
 		return 1
 	}

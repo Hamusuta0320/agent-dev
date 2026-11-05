@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -103,28 +104,95 @@ func TestModelLabelWithoutConfig(t *testing.T) {
 	}
 }
 
-// 待办摘要行：没有待办就不占内容，有限宽时绝不折行
-func TestTodoLine(t *testing.T) {
-	if line := todoLine(nil, 0); line != "" {
-		t.Fatalf("没有待办时不该有这一行: %q", line)
+// 待办清单：没有待办就一行不占；有的逐条列出来，每行都不超过限宽（折行会把界面顶乱）
+func TestTodoLines(t *testing.T) {
+	if lines := todoLines(nil, 0, maxTodoRows); lines != nil {
+		t.Fatalf("没有待办时不该有这一块: %v", lines)
 	}
 
 	items := []tool.TodoItem{
 		{Content: "读代码", Status: tool.TodoCompleted},
 		{Content: "改配置", Status: tool.TodoInProgress},
 	}
-	line := stripANSI(todoLine(items, 0))
-	for _, want := range []string{"待办", "1/2", "1 项进行中", "改配置"} {
-		if !strings.Contains(line, want) {
-			t.Fatalf("待办行里少了 %q: %q", want, line)
+	lines := stripANSI(strings.Join(todoLines(items, 0, maxTodoRows), "\n"))
+	for _, want := range []string{"待办", "1/2", "1 项进行中", "[x] 1. 读代码", "[~] 2. 改配置"} {
+		if !strings.Contains(lines, want) {
+			t.Fatalf("待办清单里少了 %q:\n%s", want, lines)
 		}
+	}
+	// 装得下时不提"第几条到第几条"，那只会让人以为还有更多
+	if strings.Contains(lines, "项 ·") || strings.Contains(lines, "第 1-2 项") {
+		t.Fatalf("全部列出来了还报窗口范围:\n%s", lines)
 	}
 
 	// 窄终端里只能截断：折行会把界面高度顶乱
 	for limit := 10; limit <= 60; limit += 10 {
-		if w := lipgloss.Width(todoLine(items, limit)); w > limit {
-			t.Fatalf("限宽 %d 时待办行宽 %d，超了: %q", limit, w, stripANSI(todoLine(items, limit)))
+		for _, line := range todoLines(items, limit, maxTodoRows) {
+			if w := lipgloss.Width(line); w > limit {
+				t.Fatalf("限宽 %d 时有 %d 格宽的行，超了: %q", limit, w, stripANSI(line))
+			}
 		}
+	}
+}
+
+// 待办一多就滚动：窗口以正在做的那一项开头，最多 maxTodoRows 条，前后放不下的折掉。
+// 15 条做到第 6 条，列的就是 6-10。
+func TestTodoWindowScrolls(t *testing.T) {
+	build := func(n, cur int) []tool.TodoItem {
+		items := make([]tool.TodoItem, n)
+		for i := range items {
+			status := tool.TodoPending
+			switch {
+			case cur < 0 || i < cur:
+				status = tool.TodoCompleted
+			case i == cur:
+				status = tool.TodoInProgress
+			}
+			items[i] = tool.TodoItem{Content: fmt.Sprintf("第 %d 项", i+1), Status: status}
+		}
+		return items
+	}
+
+	for _, c := range []struct {
+		name      string
+		items     []tool.TodoItem
+		wantFirst string
+		wantLast  string
+		wantRange string
+	}{
+		{"做到第 6 条", build(15, 5), "[~] 6. 第 6 项", "[ ] 10. 第 10 项", "第 6-10 项"},
+		{"做到第 1 条", build(15, 0), "[~] 1. 第 1 项", "[ ] 5. 第 5 项", "第 1-5 项"},
+		{"做到第 13 条", build(15, 12), "[x] 11. 第 11 项", "[ ] 15. 第 15 项", "第 11-15 项"},
+		{"全做完了", build(15, -1), "[x] 11. 第 11 项", "[x] 15. 第 15 项", "第 11-15 项"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			lines := todoLines(c.items, 0, maxTodoRows)
+			// 标题 + 5 条
+			if len(lines) != 1+maxTodoRows {
+				t.Fatalf("应该列出标题 + %d 条，实际 %d 行:\n%s",
+					maxTodoRows, len(lines), stripANSI(strings.Join(lines, "\n")))
+			}
+			body := stripANSI(strings.Join(lines, "\n"))
+			for _, want := range []string{c.wantFirst, c.wantLast, c.wantRange} {
+				if !strings.Contains(body, want) {
+					t.Fatalf("少了 %q:\n%s", want, body)
+				}
+			}
+			// 只有窗口里那几条露头，窗口外的一条都不能出现
+			start, end := todoWindow(c.items, maxTodoRows)
+			for i, it := range c.items {
+				entry := fmt.Sprintf("%d. %s", i+1, it.Content)
+				if got, want := strings.Contains(body, entry), i >= start && i < end; got != want {
+					t.Fatalf("第 %d 项（窗口 %d-%d）该不该显示弄反了:\n%s",
+						i+1, start+1, end, body)
+				}
+			}
+		})
+	}
+
+	// 终端矮到列不下一行时只留标题，进度总量还看得见
+	if lines := todoLines(build(15, 5), 0, 0); len(lines) != 1 {
+		t.Fatalf("一行都匀不出来时该只留标题，实际 %d 行", len(lines))
 	}
 }
 

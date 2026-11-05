@@ -11,6 +11,7 @@ import (
 	"hamusuta/agent-dev/src/config"
 	"hamusuta/agent-dev/src/domain"
 	"hamusuta/agent-dev/src/session"
+	"hamusuta/agent-dev/src/tool"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -361,10 +362,25 @@ func (hs *harness) sync() {
 	}
 }
 
+// settle 等到程序不再往外吐字节为止。打印被切成多块之后，一次事件会引起好几轮
+// 插行 + 重绘，固定 sleep 一个值很容易在"还没画完"的时候就去断言了
+func (hs *harness) settle() {
+	hs.t.Helper()
+	last := -1
+	for range 60 {
+		hs.sync()
+		if hs.fed == last {
+			return
+		}
+		last = hs.fed
+		time.Sleep(15 * time.Millisecond)
+	}
+}
+
 // snapshot 返回当前屏幕，并断言屏幕上没有留下上一帧的痕迹
 func (hs *harness) snapshot(what string) []string {
 	hs.t.Helper()
-	hs.sync()
+	hs.settle()
 	lines := hs.scr.screen()
 
 	var problems []string
@@ -388,6 +404,18 @@ func (hs *harness) snapshot(what string) []string {
 	if running > 0 && idle > 0 {
 		problems = append(problems, "运行中提示和空闲提示同时在场")
 	}
+	// 空闲槽位的内容（上一轮回答、命令提示）和运行中提示同时在场，就是"一旧一新
+	// 两帧叠在一起"：上半截是还没擦掉的旧帧，下半截是新帧
+	if running > 0 {
+		for i, line := range lines {
+			if strings.Contains(line, "上一轮回答") || strings.Contains(line, "命令  /help") {
+				problems = append(problems, fmt.Sprintf(
+					"第 %d 行是空闲槽位的内容（%q），可这一帧是运行中——旧帧没擦掉",
+					i, strings.TrimSpace(line)))
+				break
+			}
+		}
+	}
 
 	// 2. 屏幕不能是空的
 	empty := true
@@ -399,6 +427,21 @@ func (hs *harness) snapshot(what string) []string {
 	}
 	if empty {
 		problems = append(problems, "屏幕是空的")
+	}
+
+	// 3. 帧是贴着屏幕底画的：footer（最后那行按键提示）后面不该再有任何内容。
+	// 出现了就说明有帧被插穿——历史行插到了帧内部，或者旧帧的下半截留在下面
+	for i, line := range lines {
+		if !strings.Contains(line, "Ctrl+C 中断") && !strings.Contains(line, "Ctrl+C 退出") {
+			continue
+		}
+		for j := i + 1; j < len(lines); j++ {
+			if rest := strings.TrimSpace(lines[j]); rest != "" {
+				problems = append(problems, fmt.Sprintf(
+					"footer（第 %d 行）后面还有内容：第 %d 行 %q", i, j, rest))
+				break
+			}
+		}
 	}
 
 	// 3. 框的上下边框各只能有一次，不然就是旧框没擦掉
@@ -712,7 +755,9 @@ func TestReplayResumeRendersHistory(t *testing.T) {
 		t.Fatalf("准备会话失败: %v", err)
 	}
 
-	hs := newHarnessStore(t, 80, 30, false, store)
+	// 终端给高一点：输入框上方那块最多 mxActiveRows 行，帧占掉一大半，
+	// 矮终端上这段历史的前几行会被顶出屏幕（那是对的，这里要验的是"重打出来了"）
+	hs := newHarnessStore(t, 80, 40, false, store)
 	hs.send(doneMsg{}) // 这一轮跑完了，回到空闲才能敲命令
 	time.Sleep(200 * time.Millisecond)
 
@@ -729,5 +774,87 @@ func TestReplayResumeRendersHistory(t *testing.T) {
 		if !strings.Contains(view, want) {
 			t.Fatalf("恢复后屏幕上少了 %q:\n%s", want, view)
 		}
+	}
+}
+
+// 待办清单出现在帧里（帧一下变高）或收起（帧一下变矮）的同时又往历史区打内容，
+// 是"帧高变化 + 插行"叠在一起的那一刻：插行的落点按屏幕上那一帧的位置算，
+// 按成另一帧的行数就会把帧顶出屏幕，旧帧的下半截留在屏幕上擦不掉。
+func TestReplayTodoListChangesFrame(t *testing.T) {
+	t.Cleanup(tool.ClearTodos)
+	for _, size := range []struct{ w, h int }{{80, 24}, {60, 18}, {100, 30}} {
+		t.Run(fmt.Sprintf("%dx%d", size.w, size.h), func(t *testing.T) {
+			tool.ClearTodos()
+			hs := newHarness(t, size.w, size.h)
+			hs.send(eventMsg(domain.Event{Kind: domain.EventUsage, Usage: probeUsage()}))
+
+			// 清单出现：15 条做到第 6 条，同一时刻工具结果还要打十来行出去
+			items := make([]tool.TodoItem, 15)
+			for i := range items {
+				items[i] = tool.TodoItem{
+					Content: fmt.Sprintf("第 %d 件事", i+1),
+					Status:  tool.TodoPending,
+				}
+			}
+			for i := range 5 {
+				items[i].Status = tool.TodoCompleted
+			}
+			items[5].Status = tool.TodoInProgress
+			setTodos(t, items)
+
+			body := make([]string, 0, printToolResultLines)
+			for i := range printToolResultLines {
+				body = append(body, fmt.Sprintf("清单第 %d 行输出", i))
+			}
+			hs.send(eventMsg(domain.Event{
+				Kind:   domain.EventToolResult,
+				Text:   strings.Join(body, "\n"),
+				Call:   domain.ToolCall{Id: "t1", Name: "TodoWrite", Arguments: `{"intent":"列清单"}`},
+				Status: domain.ToolStatusSuccess,
+			}))
+
+			view := strings.Join(hs.snapshot("清单出现之后"), "\n")
+			// 窗口从正在做的那条开头往后连着列，条数不超过上限（终端矮就少列几条）
+			for _, want := range []string{"待办 5/15", "6. 第 6 件事"} {
+				if !strings.Contains(view, want) {
+					t.Fatalf("清单出现后屏幕上少了 %q:\n%s", want, view)
+				}
+			}
+			shown := 0
+			for i := 6; i <= len(items); i++ {
+				if !strings.Contains(view, fmt.Sprintf("%d. 第 %d 件事", i, i)) {
+					break
+				}
+				shown++
+			}
+			if shown < 1 || shown > maxTodoRows {
+				t.Fatalf("窗口里该列 1 到 %d 条，实际 %d 条:\n%s", maxTodoRows, shown, view)
+			}
+			if strings.Contains(view, "1. 第 1 件事") {
+				t.Fatalf("清单该滚到第 6 条起，第 1 条不该还露头:\n%s", view)
+			}
+
+			// 清单收起：帧一下矮下来，同时又要打十来行进历史区。
+			// 这个方向最容易算错——按矮下来的新帧算，一次能打的行数会大出一大截，
+			// 而屏幕上那一帧还是高的，插行的落点就从屏幕顶上顶出去了
+			tool.ClearTodos()
+			body = body[:0]
+			for i := range printToolResultLines {
+				body = append(body, fmt.Sprintf("收尾第 %d 行输出", i))
+			}
+			hs.send(eventMsg(domain.Event{
+				Kind:   domain.EventToolResult,
+				Text:   strings.Join(body, "\n"),
+				Call:   domain.ToolCall{Id: "c2", Name: "Bash", Arguments: `{"command":"go test ./..."}`},
+				Status: domain.ToolStatusSuccess,
+			}))
+			view = strings.Join(hs.snapshot("清单收起之后"), "\n")
+			if strings.Contains(view, "第 6 件事") {
+				t.Fatalf("清单清掉了，界面上还留着:\n%s", view)
+			}
+			if !strings.Contains(view, fmt.Sprintf("收尾第 %d 行输出", printToolResultLines-1)) {
+				t.Fatalf("清单收起时那几行内容没打进历史区:\n%s", view)
+			}
+		})
 	}
 }
