@@ -163,19 +163,20 @@ func (m model) queueLines() []string {
 	end := min(start+maxQueueRows, len(m.queue))
 
 	limit := m.width - 1
-	title := hintStyle.Render("排队 ") + statusStyle.Render(fmt.Sprint(len(m.queue))) +
-		hintStyle.Render(" 条")
+	// 标题和条目都走排队的黄色，"怎么改怎么删"那截还是灰的提示色：
+	// 黄色只用来标"这是排着队的消息"，掺进操作说明就分不清了
+	title := queueStyle.Render("排队 " + fmt.Sprint(len(m.queue)) + " 条")
 	// 窗口不是全部时在标题里交代落在第几条到第几条，省得以为就排了这几条
 	if start > 0 || end < len(m.queue) {
-		title += hintStyle.Render(fmt.Sprintf("（%d-%d）", start+1, end))
+		title += queueStyle.Render(fmt.Sprintf("（%d-%d）", start+1, end))
 	}
 	title += hintStyle.Render(" · Alt+↑↓ 选 · Alt+E 改 · Del 删")
 
 	out := []string{clipLine(title, limit)}
 	for i := start; i < end; i++ {
-		mark, style := "  ", hintStyle
+		mark, style := "  ", queueStyle
 		if i == sel {
-			mark, style = "▸ ", promptStyle
+			mark, style = "▸ ", queueSelStyle
 		}
 		out = append(out, clipLine(style.Render(fmt.Sprintf("%s%d. %s", mark, i+1, queueLabel(m.queue[i]))), limit))
 	}

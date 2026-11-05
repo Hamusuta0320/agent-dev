@@ -118,7 +118,12 @@ var (
 	toolResStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	errStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
 	hintStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-	boxStyle     = lipgloss.NewStyle().
+	// 排队那几条用黄色：它们是"刚敲进去、还没发出去"的东西，和灰底的提示、
+	// 绿底的输入标记都不是一回事，扫一眼就能分清屏幕上哪块是等着的消息
+	queueStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
+	// queueSelStyle 是排队里被选中的那条：同样黄色，加粗，配前面的 ▸
+	queueSelStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
+	boxStyle      = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("238")).
 			Padding(0, 1)

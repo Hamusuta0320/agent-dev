@@ -395,6 +395,36 @@ func TestFinishKeepsQueueOnAbort(t *testing.T) {
 	}
 }
 
+// 排队那几条用黄色标出来：和旁边灰色的提示、绿色的输入标记分得开，
+// 选中的那条黄色加粗；操作说明那截仍然是灰的
+func TestQueueLinesUseOwnColor(t *testing.T) {
+	m := runningModel()
+	m.queue = []queuedPrompt{{text: "第一条"}, {text: "第二条"}}
+	m.queueIdx = 1
+
+	if queueStyle.Render("x") == hintStyle.Render("x") {
+		t.Fatal("排队消息该有自己的颜色，不能和提示色一样")
+	}
+	if queueSelStyle.Render("x") == queueStyle.Render("x") {
+		t.Fatal("选中的那条要能看出区别")
+	}
+
+	lines := m.queueLines()
+	for i, want := range map[int]string{
+		0: queueStyle.Render("排队 2 条"),
+		1: queueStyle.Render("  1. 第一条"),
+		2: queueSelStyle.Render("▸ 2. 第二条"),
+	} {
+		if !strings.HasPrefix(lines[i], want) {
+			t.Fatalf("第 %d 行的样式不对，想要以 %q 开头，实际 %q", i, want, lines[i])
+		}
+	}
+	// 操作说明那截还是灰的：黄色只用来标"这是排着队的消息"
+	if tail := hintStyle.Render(" · Alt+↑↓ 选 · Alt+E 改 · Del 删"); !strings.HasSuffix(lines[0], tail) {
+		t.Fatalf("操作说明该是提示色: %q", lines[0])
+	}
+}
+
 // 排队列表要看得见哪几条在等、哪条被选中，太长的消息压成一行
 func TestQueueLines(t *testing.T) {
 	m := runningModel()
