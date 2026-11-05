@@ -998,34 +998,37 @@ func tryAnswer(reply chan domain.ApprovalAnswer) (domain.ApprovalAnswer, bool) {
 	}
 }
 
-// 输入框上方那块（补全候选 / 运行进度）的高度必须恒定：它一变矮，Bubble Tea
-// 的 inline 渲染就会错位，屏幕上留着上一帧的残影
-func TestActiveViewKeepsHeight(t *testing.T) {
+// 输入框上方那块按内容占行，但永远不超过 activeRows() 这个上限：
+// 内容再多也只是裁，帧高不许顶到屏幕上去（顶上去 print 的插行账就错了）
+func TestActiveViewCapsRows(t *testing.T) {
 	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
 	m.width, m.height = 80, 30
+	m.cur.Messages = []domain.SessionMessage{{Role: "user", Content: "问点什么"}}
 
-	lines := func() int { return strings.Count(m.activeView(), "\n") + 1 }
-	if got := lines(); got != m.activeRows() {
-		t.Fatalf("闲着时这块也应该是 %d 行，实际 %d 行", m.activeRows(), got)
+	lines := func() int {
+		if v := m.activeView(); v != "" {
+			return strings.Count(v, "\n") + 1
+		}
+		return 0
 	}
-	idle := viewRows(m)
+	// 闲着又没有别的东西：一行不占
+	if got := lines(); got != 0 {
+		t.Fatalf("闲着时这块不该占行，实际 %d 行", got)
+	}
 
-	// 补全候选占几行也不该改变这块的高度
+	// 补全候选该占它自己的行数，也不超上限
 	m.input.SetValue("/")
-	if got := lines(); got != m.activeRows() {
-		t.Fatalf("有补全候选时这块应该是 %d 行，实际 %d 行", m.activeRows(), got)
+	if got, cap := lines(), m.activeRows(); got == 0 || got > cap {
+		t.Fatalf("有补全候选时该占 1..%d 行，实际 %d 行", cap, got)
 	}
 
-	// 跑任务时状态、思考和回答越长，这块也还是同样的高度
+	// 跑任务时内容越长越是只裁到上限
 	m.state = stateRunning
 	m.status = "思考中…"
 	m.reasoning.WriteString(strings.Repeat("想了很久\n", 40))
 	m.answer.WriteString(strings.Repeat("回答很长\n", 40))
-	if got := lines(); got != m.activeRows() {
-		t.Fatalf("运行中这块应该是 %d 行，实际 %d 行", m.activeRows(), got)
-	}
-	if got := viewRows(m); got != idle {
-		t.Fatalf("跑起来之后界面总行数应该还是 %d 行，实际 %d 行", idle, got)
+	if got, cap := lines(), m.activeRows(); got != cap {
+		t.Fatalf("运行中内容超了就该正好裁到上限 %d 行，实际 %d 行", cap, got)
 	}
 	// 状态行不能被裁掉，够长的时候还要留出预览的尾巴
 	view := stripANSI(m.activeView())
@@ -1036,67 +1039,49 @@ func TestActiveViewKeepsHeight(t *testing.T) {
 		t.Fatalf("应该留出最新的预览:\n%s", view)
 	}
 
-	// 多个工具同时在跑也一样
+	// 多个工具同时在跑也一样守着上限
 	m.pending = []pendingCall{
 		{id: "1", lines: m.toolCallLines(domain.ToolCall{Name: "Read", Arguments: `{"path":"a.go"}`})},
 		{id: "2", lines: m.toolCallLines(domain.ToolCall{Name: "Grep", Arguments: `{"pattern":"x"}`})},
 	}
-	if got := lines(); got != m.activeRows() {
-		t.Fatalf("有工具在跑时这块应该是 %d 行，实际 %d 行", m.activeRows(), got)
+	if got, cap := lines(), m.activeRows(); got != cap {
+		t.Fatalf("有工具在跑时该裁到上限 %d 行，实际 %d 行", cap, got)
 	}
 }
 
-// 闲着时这块不能空着：上一轮回答的尾巴挂在这儿，高度还是恒定的
-func TestIdleSlotShowsLastAnswer(t *testing.T) {
+// 闲着时没有内容要摆，这块就一行都不占：界面紧贴着历史区往下排，
+// 不为了对齐留一片空白，也不再把上一轮回答的尾巴挂回来
+func TestIdleSlotTakesNoRows(t *testing.T) {
 	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
 	m.width, m.height = 80, 30
+	// 聊过一轮之后
+	m.cur.Messages = []domain.SessionMessage{{Role: "user", Content: "问点什么"}, {Role: "assistant", Content: "答了"}}
 
-	// 还没回答过时这块摆的是提示，不该真的空着
-	if view := stripANSI(m.activeView()); !strings.Contains(view, "/help") {
-		t.Fatalf("还没回答过时该摆提示:\n%s", view)
-	}
-
-	m.lastAnswer = "第一行\n" + strings.Repeat("中间这段会被挤掉\n", 20) + "最后一行"
-	if got := strings.Count(m.activeView(), "\n") + 1; got != m.activeRows() {
-		t.Fatalf("这块应该恒定 %d 行，实际 %d 行", m.activeRows(), got)
-	}
-	view := stripANSI(m.activeView())
-	if !strings.Contains(view, "上一轮回答（结尾）") {
-		t.Fatalf("放不下时该说明只显示了结尾:\n%s", view)
-	}
-	if !strings.Contains(view, "最后一行") {
-		t.Fatalf("应该留着回答的尾巴:\n%s", view)
-	}
-	if strings.Contains(view, "第一行") {
-		t.Fatalf("开头那几行应该被挤掉:\n%s", view)
+	if view := m.activeView(); view != "" {
+		t.Fatalf("闲着又没有别的信息时这块不该占行，实际:\n%s", view)
 	}
 
-	// 输入 / 之后补全候选优先，别让回答尾巴占着位置
+	// 输入 / 之后补全候选还是要摆出来
 	m.input.SetValue("/")
-	if view := stripANSI(m.activeView()); strings.Contains(view, "上一轮回答") {
-		t.Fatalf("有补全候选时不该再显示回答尾巴:\n%s", view)
-	}
-	// 超长的一行要折好，不能把槽位撑破
-	m.input.SetValue("")
-	m.lastAnswer = strings.Repeat("很长的一句话", 40)
-	if got := strings.Count(m.activeView(), "\n") + 1; got != m.activeRows() {
-		t.Fatalf("长行折行后这块还是 %d 行，实际 %d 行", m.activeRows(), got)
+	if view := m.activeView(); view == "" {
+		t.Fatalf("有补全候选时该摆候选")
 	}
 }
 
-// 槽位没别的东西可放时摆一份提示：常用命令、按键。工具说明不在这儿列
+// 还没聊过的会话摆一份提示：常用命令、按键。工具说明不在这儿列
 func TestIdleSlotShowsHints(t *testing.T) {
 	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
 	m.width, m.height = 80, 30
 
-	if got := strings.Count(m.activeView(), "\n") + 1; got != m.activeRows() {
-		t.Fatalf("摆提示时这块也该恒定 %d 行，实际 %d 行", m.activeRows(), got)
-	}
 	view := stripANSI(m.activeView())
 	for _, want := range []string{"/help", "/config", "/mode", "Enter 发送", "Ctrl+V 贴图"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("提示里该提到 %q:\n%s", want, view)
 		}
+	}
+	// 提示就是它自己的行数，不再补空行凑高度
+	if got, want := strings.Count(m.activeView(), "\n")+1, len(m.hintLines()); m.activeView() != "" && got != want {
+		t.Fatalf("摆提示时该占 %d 行，实际 %d 行", want, got)
 	}
 
 	// 工具说明不再摆在这块，换模式也不该把工具名列出来
@@ -1105,11 +1090,11 @@ func TestIdleSlotShowsHints(t *testing.T) {
 		t.Fatalf("提示里不该再列工具:\n%s", view)
 	}
 
-	// 有上一轮回答时先显示回答，提示让位
+	// 聊过之后提示让位，这块也不留空行
 	m.mode = domain.ModeAsk
-	m.lastAnswer = "刚才说到这儿"
-	if view := stripANSI(m.activeView()); strings.Contains(view, "/config") {
-		t.Fatalf("有回答时不该再占位置摆提示:\n%s", view)
+	m.cur.Messages = []domain.SessionMessage{{Role: "user", Content: "问点什么"}}
+	if view := stripANSI(m.activeView()); view != "" {
+		t.Fatalf("聊过之后不该再占位置摆提示:\n%s", view)
 	}
 }
 
@@ -1209,26 +1194,27 @@ func TestTasksLineInView(t *testing.T) {
 		(!strings.Contains(idleView, "已跑") && !strings.Contains(idleView, "耗时")) {
 		t.Fatalf("闲时槽位里该有任务 id 和时长:\n%s", idleView)
 	}
-	if got := strings.Count(m.activeView(), "\n") + 1; got != m.activeRows() {
-		t.Fatalf("有任务时这块也该恒定 %d 行，实际 %d 行", m.activeRows(), got)
+	if got, cap := strings.Count(m.activeView(), "\n")+1, m.activeRows(); got > cap {
+		t.Fatalf("有任务时这块该占任务自己的行数、不超上限 %d，实际 %d 行", cap, got)
 	}
 }
 
-// 界面高度必须恒定：上下文占用、后台任务栏有内容没内容都占同一行。
-// 行数一变，Bubble Tea 的 inline 渲染就会错位，屏幕上留着上一帧的残影
-func TestViewHeightStable(t *testing.T) {
+// 帧高不再要求恒定（输入框上方那块有内容就占行、没内容就不占），但两条不变量还在：
+// 帧高不能顶到屏幕上去（顶上去 print 的插行账就错了，屏幕上叠出残影），
+// 每一行也不能宽到让终端自己折行（终端一折，程序记的帧高就和屏幕对不上）。
+func TestViewHeightWithinTerminal(t *testing.T) {
 	t.Cleanup(tool.StopAllTasks)
 
 	// 窄终端也跑一遍：这一行放不下时只能裁内容，不能折成两行
 	for _, width := range []int{50, 80, 100} {
 		m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
 		m.width, m.height = width, 30
-		want := viewRows(m)
 
 		check := func(what string) {
 			t.Helper()
-			if got := viewRows(m); got != want {
-				t.Fatalf("宽 %d %s：界面该还是 %d 行，实际 %d 行", width, what, want, got)
+			if got, cap := viewRows(m), m.height-reserveHistoryRows; got > cap {
+				t.Fatalf("宽 %d %s：帧占了 %d 行，超过上限 %d 行（帧顶到屏幕顶上，插行会算错）",
+					width, what, got, cap)
 			}
 			for i, line := range strings.Split(m.View().Content, "\n") {
 				if w := lipgloss.Width(line); w >= m.width {
@@ -1248,7 +1234,7 @@ func TestViewHeightStable(t *testing.T) {
 		}
 		check("有上下文占用")
 
-		// 起个后台任务：任务栏冒出来，行数还是不变
+		// 起个后台任务：任务栏冒出来
 		if _, err := (tool.BashTool{}).Execute(nil, []byte(`{"command":"echo hi","background":true}`)); err != nil {
 			t.Fatalf("起后台任务失败: %v", err)
 		}

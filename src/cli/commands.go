@@ -180,7 +180,7 @@ func helpText() string {
 		"  只读模式不给写类工具；完全授权模式不再问",
 		"",
 		bannerStyle.Render("输入"),
-		"  Enter 发送，Shift+Enter 换行（Ctrl+J 也行），粘贴多行文本会当成一次输入",
+		"  Enter 发送，" + newlineHint() + "（终端不认修饰键时 Shift+Enter 和 Enter 是同一个键），粘贴多行文本会当成一次输入",
 		"  输入以 / 开头时会列出可补全的命令，↑↓ 选择、Tab 或 Enter 补全",
 		"  Tab 被终端接走时（比如 VS Code 集成终端），改用 Ctrl+Space 或 → 补全",
 		"",

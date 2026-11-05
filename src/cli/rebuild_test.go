@@ -140,10 +140,11 @@ func TestPrintRowsLeavesRoomAboveFrame(t *testing.T) {
 		m.width, m.height = 80, height
 
 		rows := m.frameRows()
-		// 帧高 = 固定那几行 + 输入框上方槽位，多一行少一行都不对
-		if want := chromeRows + m.activeRows(); rows != want {
-			t.Errorf("高 %d：帧高算出来 %d 行，按 chrome(%d)+槽位(%d) 应该是 %d 行",
-				height, rows, chromeRows, m.activeRows(), want)
+		// 帧高 = 固定那几行 + 输入框上方那块的实际行数，多一行少一行都不对
+		// （那块现在按内容占行，没内容就 0 行）
+		if want := chromeRows + m.activeRows(); rows > want {
+			t.Errorf("高 %d：帧高算出来 %d 行，比 chrome(%d)+槽位上限(%d) 还高",
+				height, rows, chromeRows, m.activeRows())
 		}
 		// 帧高 + 一次能带的行数 + 一行余量，不能超过终端高，否则插行会顶出屏幕。
 		// 终端矮到帧本身就快占满时（槽位已经收到 1 行）没法再让，只要求至少能打一行
@@ -157,18 +158,17 @@ func TestPrintRowsLeavesRoomAboveFrame(t *testing.T) {
 	}
 }
 
-// 待办清单不能自己把帧撑高：清单从槽位额度里分位置，帧高和有清单前一模一样。
+// 清单会占几行，但不能把帧撑到顶出屏幕：帧高有上限，超了就是渲染错位的源头。
 //
-// 这条是地基——帧高一会儿高一会儿矮，inline 渲染的插行账就和屏幕对不上，
-// 屏幕上会叠出旧帧（上半截空槽位、下半截新 footer，中间夹着一行历史）。
-func TestFrameHeightStableWithTodos(t *testing.T) {
+// 帧高本身允许变（输入框上方那块按内容占行），所以这里不比对"有清单前后等高"，
+// 只守两条：清单真的排出来了，且整帧仍然给历史区留下 reserveHistoryRows 行。
+func TestFrameHeightCappedWithTodos(t *testing.T) {
 	t.Cleanup(tool.ClearTodos)
 	for _, h := range []int{14, 16, 18, 20, 24, 30} {
 		for _, state := range []uiState{stateIdle, stateRunning} {
 			tool.ClearTodos()
 			m := newModel(safeConfig(), nil, ".", domain.NewSession("."))
 			m.width, m.height, m.state = 80, h, state
-			before := m.frameRows()
 
 			items := make([]tool.TodoItem, 15)
 			for i := range items {
@@ -178,10 +178,6 @@ func TestFrameHeightStableWithTodos(t *testing.T) {
 			setTodos(t, items)
 
 			rows := m.frameRows()
-			if rows != before {
-				t.Errorf("高 %d 状态 %d：有清单之后帧高从 %d 变成了 %d——帧高必须恒定",
-					h, state, before, rows)
-			}
 			// 清单列出来了，但没把别的内容挤没。终端太矮时只列得下标题，
 			// 那时至少要看到进度总量（"待办 x/y"）
 			view := stripANSI(m.activeView())

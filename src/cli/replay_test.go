@@ -314,8 +314,6 @@ func newHarnessWith(t *testing.T, w, h int, quiet bool) *harness {
 // 其余用例传 nil 就行
 func newHarnessStore(t *testing.T, w, h int, quiet bool, store *session.Store) *harness {
 	t.Helper()
-	pr, pw := io.Pipe()
-	t.Cleanup(func() { _ = pw.Close() })
 
 	// 摆成"正在跑一轮"：下面要验的是渲染，不是真的去连模型。
 	// runner 的 channel 没人写，waitEvent 会挂在后台，不影响画面。
@@ -324,6 +322,15 @@ func newHarnessStore(t *testing.T, w, h int, quiet bool, store *session.Store) *
 	m.state = stateRunning
 	m.runner = &runner{ch: make(chan domain.Event, 8)}
 	m.status = "回答中…"
+	return newHarnessModel(t, w, h, m)
+}
+
+// newHarnessModel 用给定的 model 起一个程序：有些用例要先摆好开局状态
+// （比如"会话已经聊过几轮"），再回放看屏幕
+func newHarnessModel(t *testing.T, w, h int, m model) *harness {
+	t.Helper()
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { _ = pw.Close() })
 
 	out := &strings.Builder{}
 	p := tea.NewProgram(&m,
@@ -404,11 +411,11 @@ func (hs *harness) snapshot(what string) []string {
 	if running > 0 && idle > 0 {
 		problems = append(problems, "运行中提示和空闲提示同时在场")
 	}
-	// 空闲槽位的内容（上一轮回答、命令提示）和运行中提示同时在场，就是"一旧一新
-	// 两帧叠在一起"：上半截是还没擦掉的旧帧，下半截是新帧
+	// 空闲槽位的内容（命令提示）和运行中提示同时在场，就是"一旧一新两帧叠在一起"：
+	// 上半截是还没擦掉的旧帧，下半截是新帧
 	if running > 0 {
 		for i, line := range lines {
-			if strings.Contains(line, "上一轮回答") || strings.Contains(line, "命令  /help") {
+			if strings.Contains(line, "命令  /help") {
 				problems = append(problems, fmt.Sprintf(
 					"第 %d 行是空闲槽位的内容（%q），可这一帧是运行中——旧帧没擦掉",
 					i, strings.TrimSpace(line)))
@@ -568,7 +575,6 @@ func TestComposeClampsEveryLine(t *testing.T) {
 		m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
 		m.width = width
 		m.usage = probeUsage()
-		m.lastAnswer = strings.Repeat("很长的上一轮回答", 8) // 顺手压下空闲槽位的长内容
 
 		frame := compose(m.frameLines(), width)
 		for i, line := range strings.Split(frame, "\n") {
@@ -854,6 +860,80 @@ func TestReplayTodoListChangesFrame(t *testing.T) {
 			}
 			if !strings.Contains(view, fmt.Sprintf("收尾第 %d 行输出", printToolResultLines-1)) {
 				t.Fatalf("清单收起时那几行内容没打进历史区:\n%s", view)
+			}
+		})
+	}
+}
+
+// 输入框上方那块不是恒定高度之后，多出一条会让帧变矮的路：聊过一轮之后命令提示
+// 收起来（有提示 5 行 → 0 行）。这里把开局的两种状态都回放一遍，确认帧矮下去
+// 以后旧帧的行被擦干净，历史区照常往上接。
+func TestReplayActiveSlotCollapses(t *testing.T) {
+	for _, size := range []struct{ w, h int }{{80, 24}, {60, 18}, {100, 30}} {
+		t.Run(fmt.Sprintf("%dx%d", size.w, size.h), func(t *testing.T) {
+			// 一开局是"正在跑"（harness 就是这么摆的），槽位里只有状态行
+			hs := newHarness(t, size.w, size.h)
+			view := strings.Join(hs.snapshot("运行中"), "\n")
+			if !strings.Contains(view, "回答中") {
+				t.Fatalf("运行中该有状态行:\n%s", view)
+			}
+			if strings.Contains(view, "命令  /help") {
+				t.Fatalf("运行中不该摆命令提示:\n%s", view)
+			}
+			// 一轮结束：帧从"状态行"换成空闲内容（命令提示，或者任务详情——
+			// 别的用例可能留着后台任务的登记），帧高变了也不能留下两份
+			hs.send(doneMsg{})
+			view = strings.Join(hs.snapshot("空闲下来"), "\n")
+			if !strings.Contains(view, "Ctrl+C 退出") {
+				t.Fatalf("空闲下来之后 footer 没切回来:\n%s", view)
+			}
+			// 没有任务要摊开时，槽位摆的才是命令提示
+			if len(tool.TaskSnapshots()) == 0 && !strings.Contains(view, "命令  /help") {
+				t.Fatalf("还没聊过、又没有后台任务时该摆命令提示:\n%s", view)
+			}
+		})
+	}
+
+	for _, size := range []struct{ w, h int }{{80, 24}, {60, 18}, {100, 30}} {
+		t.Run("聊过之后"+fmt.Sprintf("%dx%d", size.w, size.h), func(t *testing.T) {
+			// 已经聊过几轮：输入框上方一行都不占，帧比开场矮 5 行
+			cur := domain.NewSession(".")
+			cur.Messages = []domain.SessionMessage{
+				{Role: domain.RoleUser, Content: "之前问过一句话"},
+				{Role: domain.RoleAssistant, Content: "之前答过一段"},
+			}
+			m := newModel(config.GlobalConfig{Mode: "full"}, nil, ".", cur)
+			m.quiet = false // 和 newHarness 一致：这个用例要验工具正文打进历史区
+			m.state = stateRunning
+			m.runner = &runner{ch: make(chan domain.Event, 8)}
+			m.status = "回答中…"
+
+			hs := newHarnessModel(t, size.w, size.h, m)
+			view := strings.Join(hs.snapshot("聊过的会话开局"), "\n")
+			if strings.Contains(view, "命令  /help") {
+				t.Fatalf("聊过的会话不该再占位置摆提示:\n%s", view)
+			}
+
+			// 同一帧还要往历史区插行，插完仍然不能留残影
+			call := domain.ToolCall{Id: "t1", Name: "Bash", Arguments: `{"command":"go test ./..."}`}
+			hs.send(eventMsg(domain.Event{Kind: domain.EventToolCall, Call: call}))
+			body := make([]string, 0, printToolResultLines)
+			for i := range printToolResultLines {
+				body = append(body, fmt.Sprintf("结果第 %d 行", i))
+			}
+			hs.send(eventMsg(domain.Event{
+				Kind:   domain.EventToolResult,
+				Text:   strings.Join(body, "\n"),
+				Call:   call,
+				Status: domain.ToolStatusSuccess,
+			}))
+			hs.send(doneMsg{})
+			view = strings.Join(hs.snapshot("插行之后空闲"), "\n")
+			if !strings.Contains(view, fmt.Sprintf("结果第 %d 行", printToolResultLines-1)) {
+				t.Fatalf("工具结果没打进历史区:\n%s", view)
+			}
+			if strings.Contains(view, "命令  /help") {
+				t.Fatalf("空闲槽位不该再有提示（旧帧没擦掉）:\n%s", view)
 			}
 		})
 	}

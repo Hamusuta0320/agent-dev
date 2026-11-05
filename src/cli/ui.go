@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -68,8 +69,9 @@ const (
 	// maxActiveRows 是输入框上方那块会变的内容最多占几行：跑任务时是状态、工具调用
 	// 和预览的尾巴，闲着时是补全候选或别的常驻信息。待办清单也从这块里分位置。
 	//
-	// 它是上限不是定值，实际占几行由 activeRows() 按终端高度算——帧一旦高到快
-	// 占满屏幕，inline 渲染的滚动账就算不对了，屏幕上会叠出好几份界面。
+	// 它是上限不是定值：实际占几行由内容自己决定（没内容就一行不占），
+	// 再由 activeRows() 按终端高度压到更低——帧一旦高到快占满屏幕，inline 渲染的
+	// 滚动账就算不对了，屏幕上会叠出好几份界面。
 	// 10 行 = 待办清单（标题 + 5 条）再留 4 行给状态和预览。
 	maxActiveRows = 10
 	// minActiveRows 是再挤也要给这块留的行数，不然运行状态完全看不见
@@ -86,11 +88,12 @@ const (
 	reserveHistoryRows = 3
 )
 
-// activeRows 算出输入框上方那块内容实际能占几行。
+// activeRows 是输入框上方那块内容最多能占几行（上限，不是固定高度）。
 //
-// 它必须随终端高度收缩：帧高一旦逼近屏幕高度，每次 print 往上方插行时算出来的
-// 滚动量就偏了，屏幕上会留下好几份叠在一起的界面（状态行、输入框边框、上下文占用
-// 各出现好几遍）。宁可少显示几行预览，也不能让帧把屏幕占满。
+// 实际占几行由内容自己决定（见 activeView），这里只管住天花板：帧高一旦逼近屏幕
+// 高度，每次 print 往上方插行时算出来的滚动量就偏了，屏幕上会留下好几份叠在一起的
+// 界面（状态行、输入框边框、上下文占用各出现好几遍）。宁可少显示几行预览，
+// 也不能让帧把屏幕占满。
 func (m model) activeRows() int {
 	if m.height <= 0 {
 		return maxActiveRows
@@ -227,9 +230,6 @@ type model struct {
 	reasoning      *strings.Builder
 	answer         *strings.Builder
 	reasoningShown bool
-	// lastAnswer 是上一轮回答的原文：闲着时输入框上方那块槽位拿它的尾巴填上，
-	// 免得空一大片。answer 每轮结束就 Reset 了，所以单独留一份
-	lastAnswer string
 	// attachments 是贴进来、等着随下一条提问一起发出去的图片。
 	// 发送、切换会话、按 Esc 都会清空
 	attachments []imageAttachment
@@ -292,7 +292,13 @@ func newModel(cfg config.GlobalConfig, store *session.Store, workdir string, cur
 	styles.Focused.CursorLine = lipgloss.NewStyle()
 	styles.Blurred = styles.Focused
 	input.SetStyles(styles)
-	// Enter 留给"发送"，换行改用 Shift+Enter（终端不区分修饰键时 Ctrl+J 也能换行）
+	// Enter 留给"发送"，换行用 Shift+Enter / Ctrl+J。
+	// Windows 上真正能用的只有 Ctrl+J：bubbletea 给 stdin 开了
+	// ENABLE_VIRTUAL_TERMINAL_INPUT（见 bubbletea/v2 tty_windows.go 的 initInput），
+	// ultraviolet 在这个分支里只把每个按键的字符交给解码器、把 ControlKeyState
+	// 整个丢掉（terminal_reader_windows.go 的 serializeWin32InputRecords），
+	// 于是 Shift+Enter 和 Enter 送到这里一模一样，都是 0x0D。Ctrl+J 是 0x0A，
+	// 字节本来就不同，不靠修饰键也分得开。
 	input.KeyMap.InsertNewline = key.NewBinding(key.WithKeys("shift+enter", "ctrl+j"))
 	// 光标交给终端画：输入法（IME）的候选框跟着终端的真光标走，跟着画出来的方块走不了。
 	// 关掉虚拟光标之后 textarea 的 Cursor() 才有值，View 里把它的位置报给终端
@@ -347,13 +353,27 @@ func (m model) Init() tea.Cmd {
 	return textarea.Blink
 }
 
+// newlineHint 是"换行按什么键"这条提示的文案。
+//
+// Windows 上 Shift+Enter 到不了程序：bubbletea 给 stdin 开了
+// ENABLE_VIRTUAL_TERMINAL_INPUT，ultraviolet 在这个模式下只把每个按键的字符
+// 交给解码器、把 ControlKeyState 整个丢掉（来路见 newModel 里 InsertNewline
+// 那段注释），所以 Shift+Enter 进来就是一个普通回车。Ctrl+J 是另一个字节
+// （0x0A，换行符本身），不靠修饰键也分得开，所以 Windows 上只承诺它。
+func newlineHint() string {
+	if runtime.GOOS == "windows" {
+		return "Ctrl+J 换行"
+	}
+	return "Shift+Enter 换行"
+}
+
 // bannerLines 是开场那几行
 func (m model) bannerLines() []string {
 	lines := []string{
 		bannerStyle.Render("agent-dev") + hintStyle.Render("  会话 "+m.cur.Id),
 		hintStyle.Render("模型 ") + statusStyle.Render(m.modelLabel()) +
 			hintStyle.Render(" · 模式 ") + statusStyle.Render(m.mode.Label()) +
-			hintStyle.Render(" · Enter 发送 · Shift+Enter 换行 · /help 看命令"),
+			hintStyle.Render(" · Enter 发送 · "+newlineHint()+" · /help 看命令"),
 	}
 	if inVSCodeTerminal() {
 		// VS Code 集成终端会把 Tab 拿去移动焦点，键根本到不了程序，先把后路写在脸上
@@ -1352,9 +1372,7 @@ func (m model) submit() (tea.Model, tea.Cmd) {
 		return m, m.print(helpText())
 	case cmdNew:
 		m.cur = domain.NewSession(m.workdir)
-		// 新会话，槽位里不该还挂着上个会话的回答，攒着的图也不再属于谁，
-		// 待办清单同理：它是上一个任务的进度表
-		m.lastAnswer = ""
+		// 新会话，攒着的图不再属于谁，待办清单同理：它是上一个任务的进度表
 		m.attachments = nil
 		tool.ClearTodos()
 		return m, m.print(bannerStyle.Render("新会话 "+m.cur.Id) +
@@ -1627,8 +1645,6 @@ func (m model) resume(input string) (tea.Model, tea.Cmd) {
 	m.usage = domain.ContextUsage{}
 	// 待办清单同理：那是上一个会话里的任务
 	tool.ClearTodos()
-	// 空闲槽位换上这份历史里最后一轮的回答，接着聊的时候还看得见
-	m.lastAnswer = next.LastAssistant()
 
 	// 把这段会话重新打进历史区，和当时聊出来的样子一样
 	return m, m.print(m.resumeText(next))
@@ -1922,9 +1938,6 @@ func (m model) handleEvent(ev domain.Event) (tea.Model, tea.Cmd) {
 		if strings.TrimSpace(answer) == "" {
 			answer = ev.Text // provider 没走流式时用整段兜底
 		}
-		if strings.TrimSpace(answer) != "" {
-			m.lastAnswer = answer
-		}
 		out = append(out, m.block("", answerStyle(), answer, 0)...)
 		m.answer.Reset()
 		m.reasoning.Reset()
@@ -1961,10 +1974,6 @@ func (m model) finish(err error) (tea.Model, tea.Cmd) {
 	var out []string
 	out = append(out, m.reasoningBlock()...)
 	out = append(out, m.block("", answerStyle(), m.answer.String(), 0)...)
-	if text := m.answer.String(); strings.TrimSpace(text) != "" {
-		// 打断得早的话 EventAnswerEnd 还没来过，这里补记一份给空闲槽位用
-		m.lastAnswer = text
-	}
 
 	// 工具跑到一半被打断，调用那几行还没打进历史区，补上并标成未完成
 	if len(m.pending) > 0 {
@@ -2298,48 +2307,11 @@ func (m model) footerLine() string {
 	}
 	return fitItems([]string{
 		hintStyle.Render("Enter 发送"),
-		hintStyle.Render("Shift+Enter 换行"),
+		hintStyle.Render(newlineHint()),
 		hintStyle.Render("Ctrl+C 退出"),
 		hintStyle.Render("模型 ") + statusStyle.Render(m.modelLabel()),
 		hintStyle.Render("模式 ") + statusStyle.Render(m.mode.Label()),
 	}, m.width-1)
-}
-
-// lastAnswerLines 把上一轮回答的尾巴放进这块槽位：历史区里的回答会越推越高，
-// 想再看一眼刚才说到哪，扫这儿最快。用暗色，跟真正的回答区分开。
-func (m model) lastAnswerLines() []string {
-	text := strings.TrimSpace(m.lastAnswer)
-	if text == "" {
-		return nil
-	}
-	lines := strings.Split(text, "\n")
-	// 先折行再取尾巴，免得一条超长行折出来把槽位撑破
-	if limit := m.width - 3; limit > 0 {
-		wrapped := make([]string, 0, len(lines))
-		for _, line := range lines {
-			wrapped = append(wrapped, strings.Split(
-				ansi.Wrap(strings.TrimRight(line, "\r"), limit, ""), "\n")...)
-		}
-		lines = wrapped
-	}
-	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
-		lines = lines[:len(lines)-1]
-	}
-	if len(lines) == 0 {
-		return nil
-	}
-
-	title := "上一轮回答"
-	if body := m.activeRows() - 1; len(lines) > body {
-		lines = lines[len(lines)-body:]
-		title = "上一轮回答（结尾）"
-	}
-	out := make([]string, 0, len(lines)+1)
-	out = append(out, hintStyle.Render(title))
-	for _, line := range lines {
-		out = append(out, hintStyle.Render("  "+line))
-	}
-	return out
 }
 
 func (m model) View() tea.View {
@@ -2394,17 +2366,31 @@ func (m model) approvalFrameLines() []string {
 
 // mainFrameLines 是平常那一屏。
 //
-// 帧高必须恒定，这是整块界面的地基：inline 渲染靠"光标此刻在最后一屏的底部、帧顶
-// 就在上面几行"来插历史行和重绘，帧高一会儿高一会儿矮，那本账就对不上，屏幕上会
-// 叠出旧帧（上半截空空槽位、下半截新 footer，中间还夹着一行历史）。
-// 所以槽位永远占满 activeRows() 行（见 activeView），待办清单也从这块额度里分。
+// 输入框上方那块（见 activeView）有几行内容就占几行，没有就不占——界面紧贴着历史区，
+// 不为对齐留空白。帧高因此会随内容变，这是允许的：帧高变化由渲染器自己兜住
+// （变矮时从新帧末行往下擦、变高时整帧重绘，都不碰帧上方的历史区），真正要守的
+// 是"一次往历史区插的行数不超过帧顶上方空着的行数"，那条由 printRows 管。
 func (m model) mainFrameLines() []string {
-	return append(m.mainPrefixLines(), m.inputBox(), m.usageLine(), m.footerLine())
+	lines := append(m.mainPrefixLines(), m.inputBox())
+	// 还没请求过模型时没有上下文占用，这行就不占位置（空字符串会变成一行空白）
+	for _, line := range []string{m.usageLine(), m.footerLine()} {
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
 }
 
-// mainPrefixLines 是输入框上面的那几块，从上到下：槽位（清单+进度）、任务栏、附图
+// mainPrefixLines 是输入框上面的那几块，从上到下：槽位（清单+进度）、任务栏、附图。
+// 每块没内容就不占行——空字符串塞进行长列表里会变成一行空白。
 func (m model) mainPrefixLines() []string {
-	return append([]string{m.activeView()}, m.tasksLine(), m.attachmentsLine())
+	var lines []string
+	for _, line := range []string{m.activeView(), m.tasksLine(), m.attachmentsLine()} {
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
 }
 
 // inputBox 是贴在最下面的输入框：一圈圆角框套着三行 textarea
@@ -2517,9 +2503,9 @@ func compose(lines []string, width int) string {
 	return strings.Join(out, "\n")
 }
 
-// activeLines 是输入框上方那块的全部内容，总共占 activeRows() 行：
+// activeLines 是输入框上方那块的全部内容，最多 activeRows() 行（实际几行看内容）：
 // 待办清单排在最前面（最多 todoBudget 条），后面是跑任务时的状态/预览，
-// 或者闲着时的补全候选、上一轮回答。
+// 或者闲着时的补全候选、后台任务详情、命令提示。
 func (m model) activeLines() []string {
 	rows := m.activeRows()
 	out := m.todoLines(rows)
@@ -2535,9 +2521,10 @@ func (m model) activeTodoRows() int {
 	return len(m.todoLines(m.activeRows()))
 }
 
-// idleLines 是闲着时这块槽位放什么。这块高度恒定（见 activeRows()）却又不能空着，
-// 就按"最有用"的顺序挑一样填：补全候选最要紧，其次是把后台任务摊开看，
-// 再其次是上一轮回答的尾巴，实在什么都没有就摆一份提示。
+// idleLines 是闲着时这块槽位放什么。没有内容就返回空——槽位不占行（见 activeView），
+// 界面紧贴着历史区往下排，不为了对齐留一片空白。
+// 有东西时按"最有用"的顺序挑一样：补全候选最要紧，其次是把后台任务摊开看，
+// 都没有就在还没聊过的会话里摆一份提示。
 func (m model) idleLines() []string {
 	if lines := m.completionLines(); len(lines) > 0 {
 		return lines
@@ -2545,10 +2532,10 @@ func (m model) idleLines() []string {
 	if lines := m.taskDetailLines(); len(lines) > 0 {
 		return lines
 	}
-	if lines := m.lastAnswerLines(); len(lines) > 0 {
-		return lines
+	if m.cur == nil || len(m.cur.Messages) == 0 {
+		return m.hintLines()
 	}
-	return m.hintLines()
+	return nil
 }
 
 // hintLines 是槽位实在没别的东西可放时的提示：有哪些命令、键盘怎么用。
@@ -2563,7 +2550,7 @@ func (m model) hintLines() []string {
 	if len(m.skills) > 0 {
 		raw = append(raw, "技能  /skills 看装了哪些 · 直接 /技能名 就能点名用它")
 	}
-	raw = append(raw, "", "输入  Enter 发送 · Shift+Enter 换行 · Tab 补全 · Ctrl+V 贴图")
+	raw = append(raw, "", "输入  Enter 发送 · "+newlineHint()+" · Tab 补全 · Ctrl+V 贴图")
 	// 窄终端里长行要折，折出来多余的行由 activeView 裁掉，槽位高度仍然恒定
 	limit := m.width - 3
 	out := make([]string, 0, len(raw))
@@ -2583,12 +2570,17 @@ func (m model) hintLines() []string {
 	return out
 }
 
-// activeView 把这块内容整理成固定的 activeRows() 行，始终贴着输入框：
-// 跑任务时内容超了就先砍中间（留下清单和状态/工具标题，以及最新的几行预览），
-// 闲着时按顺序留着前面的内容；都不够就在顶上补空行。
-// 这块的高度一旦跟着内容上下变，inline 渲染的插行账就和屏幕对不上，屏幕上会叠出
-// 残影，所以这里必须恒定。单行也不能比终端还宽——超了终端会自己折行，实际用的行数
-// 就比这里记的多，屏幕从那一行起全错位。
+// activeView 把输入框上方那块内容收成几行，行数就是内容自己的行数：
+// 没内容就是 0 行，界面直接贴着历史区；内容多了才裁到 activeRows() 这个上限。
+// 跑任务时裁法是先砍中间（留下清单和状态/工具标题，以及最新的几行预览），
+// 闲着时按顺序留着前面的内容。
+//
+// 这块的行数会随内容变，帧高也就跟着变。这是可以的：inline 渲染器自己处理帧高
+// 变化（变矮时从新帧末行往下擦，见 ultraviolet 的 partialClear；变高时整帧重绘），
+// 两条路都只动帧自己的行、不碰帧上方的历史区。真正怕的是"一次往历史区插的行数
+// 超过帧顶上方空着的行数"，那个由 printRows 按当前帧高管着，不靠这里凑固定高度。
+// 单行也不能比终端还宽——超了终端会自己折行，实际用的行数就比这里记的多，
+// 屏幕从那一行起全错位。
 func (m model) activeView() string {
 	rows := m.activeRows()
 	lines := m.foldLines(m.activeLines())
@@ -2604,8 +2596,7 @@ func (m model) activeView() string {
 			lines = lines[:rows]
 		}
 	}
-	pad := make([]string, rows-len(lines))
-	return strings.Join(append(pad, lines...), "\n")
+	return strings.Join(lines, "\n")
 }
 
 // foldLines 把超宽的行就地折成多行，宽度未知时原样返回。
