@@ -297,12 +297,21 @@ type harness struct {
 
 func newHarness(t *testing.T, w, h int) *harness {
 	t.Helper()
+	// 回放测试验的是"打印出来的行有没有把界面账算错"，所以默认走详细显示：
+	// 思考过程和工具输出都得真的打进历史区才测得到。精简显示另有用例
+	return newHarnessWith(t, w, h, false)
+}
+
+// newHarnessWith 和 newHarness 一样，quiet 决定这轮回放的是精简显示还是详细显示
+func newHarnessWith(t *testing.T, w, h int, quiet bool) *harness {
+	t.Helper()
 	pr, pw := io.Pipe()
 	t.Cleanup(func() { _ = pw.Close() })
 
 	// 摆成"正在跑一轮"：下面要验的是渲染，不是真的去连模型。
 	// runner 的 channel 没人写，waitEvent 会挂在后台，不影响画面。
 	m := newModel(config.GlobalConfig{Mode: "full"}, nil, ".", domain.NewSession("."))
+	m.quiet = quiet
 	m.state = stateRunning
 	m.runner = &runner{ch: make(chan domain.Event, 8)}
 	m.status = "回答中…"
@@ -573,6 +582,35 @@ func TestReplayShortTerminalLongHistory(t *testing.T) {
 			time.Sleep(200 * time.Millisecond)
 			hs.snapshot("结束")
 		})
+	}
+}
+
+// 精简显示（默认就是它）：历史区只留正文，思考过程和工具输出的内容都不打，
+// 工具调用还是留一行标题，知道刚才在跑什么。
+func TestQuietHidesReasoningAndToolOutput(t *testing.T) {
+	hs := newHarnessWith(t, 80, 30, true)
+	hs.send(eventMsg(domain.Event{Kind: domain.EventReasoning, Text: "先想想要怎么做"}))
+	hs.send(eventMsg(domain.Event{Kind: domain.EventContent, Text: "正文第一段"}))
+	hs.send(eventMsg(domain.Event{
+		Kind:   domain.EventToolResult,
+		Text:   "命令输出的那几行",
+		Call:   domain.ToolCall{Id: "1", Name: "Bash", Arguments: `{"command":"go build ./..."}`},
+		Status: domain.ToolStatusSuccess,
+	}))
+	hs.send(doneMsg{})
+	time.Sleep(200 * time.Millisecond)
+
+	view := strings.Join(hs.snapshot("精简显示"), "\n")
+	for _, banned := range []string{"先想想要怎么做", "命令输出的那几行"} {
+		if strings.Contains(view, banned) {
+			t.Fatalf("精简显示下不该出现 %q:\n%s", banned, view)
+		}
+	}
+	if !strings.Contains(view, "正文第一段") {
+		t.Fatalf("正文本体得留着:\n%s", view)
+	}
+	if !strings.Contains(view, "Bash") {
+		t.Fatalf("工具调用那行标题得留着，不然不知道在跑什么:\n%s", view)
 	}
 }
 

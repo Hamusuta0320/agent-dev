@@ -25,6 +25,7 @@ const (
 	cmdModel
 	cmdSkills
 	cmdTodo
+	cmdQuiet
 	cmdExit
 )
 
@@ -46,6 +47,7 @@ var commandSpecs = []commandSpec{
 	{cmdModel, "/model", "看配置好的几套模型，或切到其中一套（会写回配置文件）"},
 	{cmdSkills, "/skills", "看装了哪些技能，直接 /技能名 就能调用"},
 	{cmdTodo, "/todo", "看这次任务的待办清单"},
+	{cmdQuiet, "/quiet", "切换精简显示：只打正文，不显示思考过程和工具输出（会写回配置）"},
 	{cmdExit, "/exit", "退出（也可以 Ctrl+D）"},
 }
 
@@ -74,6 +76,8 @@ func parseCommand(input string) command {
 		return cmdSkills
 	case "/todo":
 		return cmdTodo
+	case "/quiet":
+		return cmdQuiet
 	case "/exit", "/quit", "exit", "quit":
 		return cmdExit
 	}

@@ -19,6 +19,16 @@ type GlobalConfig struct {
 	Mode string `yaml:"Mode"`
 	// MaxSteps 是一次提问里最多跑多少轮工具调用，不填（或填非正数）按 DefaultMaxSteps
 	MaxSteps int `yaml:"MaxSteps"`
+	// Quiet 是"精简显示"：打开后历史区只打正文，思考过程和工具输出的内容都不显示
+	// （工具调用还是留一行标题，知道在跑什么）。不写这个字段时按打开处理——
+	// 用指针是为了区分"没配"和"配了 false"，值用 QuietMode() 取
+	Quiet *bool `yaml:"Quiet,omitempty"`
+}
+
+// QuietMode 返回精简显示开关，默认打开：没写过 Quiet 的配置也按精简来，
+// 想看思考过程和工具输出就打 /quiet off
+func (c GlobalConfig) QuietMode() bool {
+	return c.Quiet == nil || *c.Quiet
 }
 
 // Steps 返回一次提问最多跑多少轮工具调用，没配或配了非正数时退回默认值

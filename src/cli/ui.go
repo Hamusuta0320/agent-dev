@@ -229,15 +229,18 @@ type model struct {
 	// contextLimit 是配置里的上下文窗口大小，用来算已用百分比
 	contextLimit int
 
-	// height 是终端高度，开场时靠它把输入框顶到屏幕底部
+	// height 是终端高度，用来算输入框上方那块最多能占几行（activeRows）
 	height int
-	// started 表示开场白已经打过了：得等知道窗口高度才能算要补多少空行
+	// started 表示开场白已经打过了：等第一次收到窗口尺寸再打，只打一次
 	started bool
 	// tasksTicking 表示"后台任务耗时"的定时刷新已经转起来了，避免重复起定时器
 	tasksTicking bool
 
 	// mode 是当前工作模式，决定给模型哪些工具、写操作要不要问
 	mode domain.Mode
+	// quiet 是精简显示：历史区只打正文，思考过程和工具输出的内容都不打
+	// （工具调用那行标题还在，知道在跑什么）
+	quiet bool
 	// approval 是正在等用户确认的那项写操作，为 nil 表示没有在等
 	approval *approvalState
 
@@ -306,6 +309,7 @@ func newModel(cfg config.GlobalConfig, store *session.Store, workdir string, cur
 		form:         newConfigForm(current),
 		contextLimit: current.Limit(),
 		mode:         mode,
+		quiet:        cfg.QuietMode(),
 		reasoning:    &strings.Builder{},
 		answer:       &strings.Builder{},
 		width:        80,
@@ -313,8 +317,7 @@ func newModel(cfg config.GlobalConfig, store *session.Store, workdir string, cur
 }
 
 func (m model) Init() tea.Cmd {
-	// 开场白要等拿到窗口高度再打：顺手补一段空行，把输入框顶到屏幕底部，
-	// 之后会话再长，输入框也一直贴着底边
+	// 开场白留到第一次收到窗口尺寸时再打（见 WindowSizeMsg），这里只管让光标闪起来
 	return textarea.Blink
 }
 
@@ -337,21 +340,10 @@ func (m model) bannerLines() []string {
 	return lines
 }
 
-// startupText 是开场白加上一段空行。空行的数量按"开场白 + 界面 + 空行 = 终端高度"算，
-// 这样界面正好落在屏幕最后几行，输入框就贴底了。
+// startupText 是开场白。只打 bannerLines 那几行，不再往上补空行：界面就跟在
+// 开场白下面，会话长了自然往下滚，输入框不用贴底。
 func (m model) startupText() string {
-	lines := m.bannerLines()
-	text := strings.Join(lines, "\n")
-	// 界面本身占几行（输入框边框、上下文占用、提示行……），不足就往上补空行
-	if pad := m.height - len(lines) - m.viewLines(); pad > 0 {
-		text += strings.Repeat("\n", pad)
-	}
-	return text
-}
-
-// viewLines 数当前界面占几行，用来算开场要补多少空行
-func (m model) viewLines() int {
-	return strings.Count(m.View().Content, "\n") + 1
+	return strings.Join(m.bannerLines(), "\n")
 }
 
 // inVSCodeTerminal 判断是不是跑在 VS Code 的集成终端里
@@ -391,15 +383,22 @@ func taskTick() tea.Cmd {
 func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		prevWidth := m.width
 		m.width = max(msg.Width, 24)
 		m.height = max(msg.Height, 10)
 		// 输入框能放字的宽度 = 框总宽(width-4) 减去边框内边距(boxOverhead)
 		m.input.SetWidth(max(m.width-4-boxOverhead, 20))
 		m.resizeForm()
 		if !m.started {
-			// 第一次知道窗口多大：这时候打开场白，才算得准要补多少空行
+			// 第一次知道窗口多大：这时候打开场白，界面排版已经就绪，只打这一次
 			m.started = true
 			return m, tea.Sequence(m.print(m.startupText()), textarea.Blink)
+		}
+		if m.width != prevWidth {
+			// 宽度一变，终端会把屏幕上已经画出来的行重新折行，渲染器记的行数就对不上了
+			// （inline 用的是相对光标，没法回到原位擦），旧帧会留在屏幕上。
+			// 先打一屏空行把老内容顶出去，再清屏重画
+			return m, tea.Sequence(m.print(strings.Repeat("\n", m.height)), m.rebuild())
 		}
 		return m, nil
 
@@ -1317,6 +1316,8 @@ func (m model) submit() (tea.Model, tea.Cmd) {
 		return m, m.print(skillsText(m.skills))
 	case cmdTodo:
 		return m, m.print(todoText(tool.CurrentTodos()))
+	case cmdQuiet:
+		return m.toggleQuiet(input)
 	}
 
 	return m.runSkill(input)
@@ -1334,6 +1335,38 @@ func (m model) runSkill(input string) (tea.Model, tea.Cmd) {
 		return m.startRun(input, input, m.takeAttachments())
 	}
 	return m, m.print(unknownCommandText(firstField(input), m.skills))
+}
+
+// toggleQuiet 处理 /quiet：切换"精简显示"，并写回配置文件，下次启动还是这个设置。
+// 不带参数就取反；带 on/off 就直接设成那一个。
+func (m model) toggleQuiet(input string) (tea.Model, tea.Cmd) {
+	want := !m.quiet
+	switch arg := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(input), "/quiet"))); arg {
+	case "on", "1", "true", "开":
+		want = true
+	case "off", "0", "false", "关":
+		want = false
+	}
+	m.quiet = want
+
+	out := bannerStyle.Render("精简显示 已开")
+	if !want {
+		out = bannerStyle.Render("精简显示 已关")
+	}
+	out += hintStyle.Render("  " + quietHint(want))
+	// 写回配置失败不影响本次运行，说明一下就行
+	if err := config.SaveQuiet(m.cfgPath, want); err != nil {
+		out += "\n" + hintStyle.Render("（没能写回配置: "+err.Error()+"，本次运行仍然生效）")
+	}
+	return m, m.print(out)
+}
+
+// quietHint 是一句话说明精简显示开着/关着时历史区里有什么
+func quietHint(quiet bool) string {
+	if quiet {
+		return "只打正文：思考过程和工具输出的内容都不显示，工具调用只留一行标题"
+	}
+	return "思考过程、工具输出都会打进历史区；/quiet 可以切回来"
 }
 
 // switchMode 处理 /mode：不带参数就报当前模式和可选项，带了就切过去并写回配置，
@@ -1713,10 +1746,7 @@ func (m model) handleEvent(ev domain.Event) (tea.Model, tea.Cmd) {
 		m.status = "思考中…"
 
 	case domain.EventContent:
-		if !m.reasoningShown {
-			out = append(out, m.block("思考", thinkStyle, m.reasoning.String(), printReasoningLines)...)
-			m.reasoningShown = true
-		}
+		out = append(out, m.reasoningBlock()...)
 		m.answer.WriteString(ev.Text)
 		m.status = "回答中…"
 
@@ -1731,10 +1761,7 @@ func (m model) handleEvent(ev domain.Event) (tea.Model, tea.Cmd) {
 		out = append(out, hintStyle.Render("· "+ev.Text))
 
 	case domain.EventAnswerEnd:
-		if !m.reasoningShown {
-			out = append(out, m.block("思考", thinkStyle, m.reasoning.String(), printReasoningLines)...)
-			m.reasoningShown = true
-		}
+		out = append(out, m.reasoningBlock()...)
 		answer := m.answer.String()
 		if strings.TrimSpace(answer) == "" {
 			answer = ev.Text // provider 没走流式时用整段兜底
@@ -1754,7 +1781,10 @@ func (m model) handleEvent(ev domain.Event) (tea.Model, tea.Cmd) {
 
 	case domain.EventToolResult:
 		out = append(out, m.toolResultLines(ev, m.takePending(ev.Call))...)
-		out = append(out, m.block("", toolResStyle, ev.Text, printToolResultLines)...)
+		// 精简显示下工具输出的内容不打进历史区，只留上面那行标题和状态
+		if !m.quiet {
+			out = append(out, m.block("", toolResStyle, ev.Text, printToolResultLines)...)
+		}
 		if len(m.pending) > 0 {
 			m.status = fmt.Sprintf("还有 %d 个工具在跑…", len(m.pending))
 		} else {
@@ -1773,9 +1803,7 @@ func (m model) handleEvent(ev domain.Event) (tea.Model, tea.Cmd) {
 // finish 收尾：把没来得及打的内容补上，回到输入状态
 func (m model) finish(err error) (tea.Model, tea.Cmd) {
 	var out []string
-	if !m.reasoningShown {
-		out = append(out, m.block("思考", thinkStyle, m.reasoning.String(), printReasoningLines)...)
-	}
+	out = append(out, m.reasoningBlock()...)
 	out = append(out, m.block("", answerStyle(), m.answer.String(), 0)...)
 	if text := m.answer.String(); strings.TrimSpace(text) != "" {
 		// 打断得早的话 EventAnswerEnd 还没来过，这里补记一份给空闲槽位用
@@ -2281,13 +2309,27 @@ func (m model) runningView() string {
 		b.WriteString(statusStyle.Render(m.spin.View() + " " + m.status))
 	}
 
-	if tail := tailLines(m.reasoning.String(), previewReasoningLines); tail != "" {
+	if tail := tailLines(m.reasoning.String(), previewReasoningLines); tail != "" && !m.quiet {
 		b.WriteString("\n" + thinkStyle.Render(m.wrap("  "+tail)))
 	}
 	if tail := tailLines(m.answer.String(), previewAnswerLines); tail != "" {
 		b.WriteString("\n" + m.wrap("  "+tail))
 	}
 	return b.String()
+}
+
+// reasoningBlock 是这一轮攒下来的思考内容，只在第一次被叫到时给出（之后 reasoningShown
+// 记成已显示，免得回答开头、结尾各打一遍）。精简显示下思考整段不打，但仍然标记成
+// 已显示——不然后面每来一段回答都会再判断一次。
+func (m *model) reasoningBlock() []string {
+	if m.reasoningShown {
+		return nil
+	}
+	m.reasoningShown = true
+	if m.quiet {
+		return nil
+	}
+	return m.block("思考", thinkStyle, m.reasoning.String(), printReasoningLines)
 }
 
 // block 把一段可能很长的文本整理成"标题 + 缩进正文"，maxLines 为 0 表示不截断。
@@ -2347,7 +2389,7 @@ func (m *model) rebuild() tea.Cmd {
 
 // fitWidth 把每一行折到终端宽度以内。留一列余量，避免正好写满最后一列，
 // 有的终端写满后会把光标挂在行尾，下一个字符就多折出一行。
-// 空行原样保留，行数不变——开场白靠空行把输入框顶到屏幕底部。
+// 空行原样保留，行数不变——打出去几行就是几行，终端那边的账才对得上。
 func (m model) fitWidth(text string) string {
 	limit := m.width - 1
 	if limit <= 0 {

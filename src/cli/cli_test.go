@@ -239,7 +239,7 @@ func TestWithMark(t *testing.T) {
 // 输入以 / 开头时列出能补全的命令，打全了就不再提示
 func TestSuggestCommands(t *testing.T) {
 	cases := map[string][]string{
-		"/":     {"/help", "/new", "/resume", "/session", "/config", "/mode", "/model", "/skills", "/todo", "/exit"},
+		"/":     {"/help", "/new", "/resume", "/session", "/config", "/mode", "/model", "/skills", "/todo", "/quiet", "/exit"},
 		"/c":    {"/config"},
 		"/re":   {"/resume"},
 		"/se":   {"/session"},
@@ -473,6 +473,11 @@ func stripANSI(s string) string {
 	return ansiRe.ReplaceAllString(s, "")
 }
 
+// viewRows 数界面这会儿占了几行：View 按换行切行，行数就是 \n 的个数 + 1
+func viewRows(m model) int {
+	return strings.Count(m.View().Content, "\n") + 1
+}
+
 // 打进历史区的每一行都不能超过终端宽度：tea.Println 是直接写终端的，
 // 行太宽终端会自己折行，程序记的行数就和屏幕对不上，界面从此错位
 func TestPrintNeverExceedsWidth(t *testing.T) {
@@ -496,7 +501,7 @@ func TestPrintNeverExceedsWidth(t *testing.T) {
 		}
 	}
 
-	// 空行得原样留着：开场白靠补空行把输入框顶到屏幕底部
+	// 空行得原样留着：打出去几行就是几行，行数不能凭空变
 	if !strings.Contains(got, "\n\n") {
 		t.Fatalf("空行不该被吃掉: %q", got)
 	}
@@ -994,7 +999,7 @@ func tryAnswer(reply chan domain.ApprovalAnswer) (domain.ApprovalAnswer, bool) {
 }
 
 // 输入框上方那块（补全候选 / 运行进度）的高度必须恒定：它一变矮，Bubble Tea
-// 就会把腾出来的行空在屏幕底下，输入框立刻离了屏幕底边
+// 的 inline 渲染就会错位，屏幕上留着上一帧的残影
 func TestActiveViewKeepsHeight(t *testing.T) {
 	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
 	m.width, m.height = 80, 30
@@ -1003,7 +1008,7 @@ func TestActiveViewKeepsHeight(t *testing.T) {
 	if got := lines(); got != m.activeRows() {
 		t.Fatalf("闲着时这块也应该是 %d 行，实际 %d 行", m.activeRows(), got)
 	}
-	idle := m.viewLines()
+	idle := viewRows(m)
 
 	// 补全候选占几行也不该改变这块的高度
 	m.input.SetValue("/")
@@ -1019,7 +1024,7 @@ func TestActiveViewKeepsHeight(t *testing.T) {
 	if got := lines(); got != m.activeRows() {
 		t.Fatalf("运行中这块应该是 %d 行，实际 %d 行", m.activeRows(), got)
 	}
-	if got := m.viewLines(); got != idle {
+	if got := viewRows(m); got != idle {
 		t.Fatalf("跑起来之后界面总行数应该还是 %d 行，实际 %d 行", idle, got)
 	}
 	// 状态行不能被裁掉，够长的时候还要留出预览的尾巴
@@ -1108,31 +1113,25 @@ func TestIdleSlotShowsHints(t *testing.T) {
 	}
 }
 
-// 开场白要把输入框顶到屏幕底部：开场白 + 界面 + 空行正好铺满一屏
-func TestStartupTextFillsScreen(t *testing.T) {
-	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
-	got, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
-	m = got.(model)
+// 开场白就是开场那几行，不再往上补空行去把输入框顶到屏幕底部：
+// 打了几行就是几行，跟终端高度无关
+func TestStartupTextNoPadding(t *testing.T) {
+	for _, h := range []int{3, 12, 30, 60} {
+		m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+		m.width, m.height = 100, h
 
-	text := m.startupText()
-	// 数一下开场白一共占几行：tea.Println 按换行切行，行数就是 \n 的个数 + 1
-	printed := strings.Count(text, "\n") + 1
-	if total := printed + m.viewLines(); total != m.height {
-		t.Fatalf("开场白 + 界面应该正好铺满 %d 行，实际 %d 行（开场白 %d + 界面 %d）",
-			m.height, total, printed, m.viewLines())
-	}
-	// 开场白本身还得在，不能被算没了
-	if !strings.Contains(stripANSI(text), "agent-dev") {
-		t.Fatalf("开场白丢了:\n%s", text)
-	}
-}
-
-// 终端太矮塞不下开场白时不要倒贴空行
-func TestStartupTextTinyTerminal(t *testing.T) {
-	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
-	m.width, m.height = 80, 3
-	if text := m.startupText(); strings.Contains(text, "\n\n") {
-		t.Fatalf("矮终端不该补空行: %q", text)
+		text := stripANSI(m.startupText())
+		if got, want := strings.Count(text, "\n")+1, len(m.bannerLines()); got != want {
+			t.Fatalf("高 %d：开场白该是 %d 行，实际 %d 行: %q", h, want, got, text)
+		}
+		// 不能有任何一段空行，也不能以空行开头
+		if strings.Contains(text, "\n\n") || strings.HasPrefix(text, "\n") || strings.HasSuffix(text, "\n") {
+			t.Fatalf("高 %d：开场白不该补空行: %q", h, text)
+		}
+		// 开场白本身还得在，不能被算没了
+		if !strings.Contains(text, "agent-dev") {
+			t.Fatalf("高 %d：开场白丢了:\n%s", h, text)
+		}
 	}
 }
 
@@ -1224,11 +1223,11 @@ func TestViewHeightStable(t *testing.T) {
 	for _, width := range []int{50, 80, 100} {
 		m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
 		m.width, m.height = width, 30
-		want := m.viewLines()
+		want := viewRows(m)
 
 		check := func(what string) {
 			t.Helper()
-			if got := m.viewLines(); got != want {
+			if got := viewRows(m); got != want {
 				t.Fatalf("宽 %d %s：界面该还是 %d 行，实际 %d 行", width, what, want, got)
 			}
 			for i, line := range strings.Split(m.View().Content, "\n") {
