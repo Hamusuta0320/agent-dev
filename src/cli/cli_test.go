@@ -1469,6 +1469,121 @@ func TestResumeSession(t *testing.T) {
 	}
 }
 
+// 恢复会话要把这段历史重新打一遍：提问、思考、回答、工具调用和结果按原来的顺序排开，
+// 和当时一轮轮聊出来的样子一致
+func TestResumeRendersHistory(t *testing.T) {
+	s := &domain.Session{Id: "20240102-000000-0001"}
+	s.AppendUser("上次问的问题")
+	s.AppendAssistant("上次的回答", "上次的思考", nil)
+
+	ok := domain.ToolCall{Id: "c1", Name: "Bash", Arguments: `{"command":"go build ./...","intent":"编译一下"}`}
+	s.AppendAssistant("", "", []domain.ToolCall{ok})
+	s.AppendToolResult(ok, "exit_code: 0\n编译过了")
+
+	// 被中断的那次调用：只有调用、没有结果
+	lost := domain.ToolCall{Id: "c2", Name: "Read", Arguments: `{"path":"src/cli/ui.go"}`}
+	s.AppendAssistant("", "", []domain.ToolCall{lost})
+
+	// 失败的那次调用：core 把原因写成"执行失败: …"开头
+	bad := domain.ToolCall{Id: "c3", Name: "Bash", Arguments: `{"command":"go test ./..."}`}
+	s.AppendAssistant("", "", []domain.ToolCall{bad})
+	s.AppendToolResult(bad, "执行失败: 找不到 go 命令")
+
+	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+	m.width = 80
+	m.quiet = false // 详细显示：思考和工具输出都要真的打出来
+	lines := m.historyLines(s)
+	text := stripANSI(strings.Join(lines, "\n"))
+
+	// 顺序得和当时跑的一致：提问 → 思考 → 回答 → 工具调用 → 结果
+	order := []string{"上次问的问题", "上次的思考", "上次的回答", "go build ./...", "编译过了",
+		"Read", "未完成", "src/cli/ui.go", "go test ./...", "执行失败: 找不到 go 命令"}
+	last := -1
+	for _, want := range order {
+		at := strings.Index(text, want)
+		if at < 0 {
+			t.Fatalf("重打的历史里少了 %q:\n%s", want, text)
+		}
+		if at < last {
+			t.Fatalf("%q 的顺序不对:\n%s", want, text)
+		}
+		last = at
+	}
+
+	// 工具结果贴在调用下面只打一次，别再单拎出来打第二遍
+	if n := strings.Count(text, "编译过了"); n != 1 {
+		t.Fatalf("工具结果打了两遍（%d 次）:\n%s", n, text)
+	}
+
+	// 圆圈按当时的结果上色：成功绿，失败和没跑完的红。
+	// 细节行里也有同样的命令，所以只认以圆圈开头的那行
+	green, red := doneMark(domain.ToolStatusSuccess), doneMark(domain.ToolStatusFailed)
+	greenTitles, redTitles := 0, 0
+	for _, line := range lines {
+		switch {
+		case strings.HasPrefix(line, green):
+			greenTitles++
+			if !strings.Contains(line, "Bash") || !strings.Contains(line, "编译一下") {
+				t.Fatalf("绿圈该贴在成功的那次调用上: %q", line)
+			}
+		case strings.HasPrefix(line, red):
+			redTitles++
+			if !strings.Contains(line, "Bash") && !strings.Contains(line, "Read") {
+				t.Fatalf("红圈该贴在失败或没跑完的那次调用上: %q", line)
+			}
+		}
+	}
+	if greenTitles != 1 || redTitles != 2 {
+		t.Fatalf("圆圈数量不对：绿 %d 个、红 %d 个", greenTitles, redTitles)
+	}
+}
+
+// 精简显示下恢复会话同样只留正文和工具行的标题，思考和工具输出不打
+func TestResumeHistoryQuiet(t *testing.T) {
+	s := &domain.Session{Id: "20240102-000000-0001"}
+	s.AppendUser("上次问的问题")
+	call := domain.ToolCall{Id: "c1", Name: "Bash", Arguments: `{"command":"go build ./..."}`}
+	s.AppendAssistant("上次的回答", "上次的思考", []domain.ToolCall{call})
+	s.AppendToolResult(call, "命令输出的那几行")
+
+	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+	m.width = 80
+	m.quiet = true
+	text := stripANSI(strings.Join(m.historyLines(s), "\n"))
+
+	for _, banned := range []string{"上次的思考", "命令输出的那几行"} {
+		if strings.Contains(text, banned) {
+			t.Fatalf("精简显示下不该出现 %q:\n%s", banned, text)
+		}
+	}
+	for _, want := range []string{"上次问的问题", "上次的回答", "Bash"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("精简显示下还得留着 %q:\n%s", want, text)
+		}
+	}
+}
+
+// 恢复之后打进历史区的那一段：历史在前，恢复说明垫在最后，随时看得见
+func TestResumeText(t *testing.T) {
+	store := session.NewStore(filepath.Join(t.TempDir(), "sessions"))
+	s := domain.NewSession(".")
+	s.AppendUser("那次聊到的地方")
+	s.AppendAssistant("那次给的回答", "", nil)
+
+	m := newModel(config.GlobalConfig{}, store, ".", domain.NewSession("."))
+	m.width = 80
+	text := stripANSI(m.resumeText(s))
+
+	if i, j := strings.Index(text, "那次聊到的地方"), strings.Index(text, "已恢复会话"); i < 0 || j < 0 || i > j {
+		t.Fatalf("历史该在恢复说明前面:\n%s", text)
+	}
+	for _, want := range []string{"那次给的回答", "共 2 条消息", s.Id} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("恢复说明里少了 %q:\n%s", want, text)
+		}
+	}
+}
+
 // /resume 不带参数的列表：最近的在最前，当前会话要标出来
 func TestResumeListText(t *testing.T) {
 	cur := &domain.Session{Id: "20240102-000000-0001"}

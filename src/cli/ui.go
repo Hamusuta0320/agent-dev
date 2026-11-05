@@ -1534,7 +1534,8 @@ func todoText(items []tool.TodoItem) string {
 
 // resume 处理 /resume：不带参数列出现有会话，带参数就切过去。
 // 参数可以是列表里的序号（1 是最新的），也可以是完整的会话 id。
-// 恢复只换 m.cur，下一句提问就接着这段历史往下聊，会话文件也接着往同一个 id 里写。
+// 切过去之后把这段会话重新打进历史区（见 historyLines），让人一眼看到聊到哪儿了；
+// 下一句提问就接着这段历史往下聊，会话文件也接着往同一个 id 里写。
 func (m model) resume(input string) (tea.Model, tea.Cmd) {
 	arg := ""
 	if fields := strings.Fields(input); len(fields) > 1 {
@@ -1563,19 +1564,35 @@ func (m model) resume(input string) (tea.Model, tea.Cmd) {
 		next.Id = id
 	}
 	m.cur = next
-	// 换会话了，旧回答的尾巴不该还挂在槽位里，攒着的图也不再属于谁，
-	// 待办清单同理：那是上一个会话里的任务
-	m.lastAnswer = ""
+	// 换会话了，攒着的图不再属于谁；上下文占用那行也得清掉，它说的是上一个会话
+	// 的用量，留着会让人以为这段历史已经占了那么多窗口
 	m.attachments = nil
+	m.usage = domain.ContextUsage{}
+	// 待办清单同理：那是上一个会话里的任务
 	tool.ClearTodos()
-	out := bannerStyle.Render("已恢复会话 "+next.Id) +
-		hintStyle.Render(fmt.Sprintf("，共 %d 条消息，目录 %s", len(next.Messages), m.store.Dir))
+	// 空闲槽位换上这份历史里最后一轮的回答，接着聊的时候还看得见
+	m.lastAnswer = next.LastAssistant()
+
+	// 把这段会话重新打进历史区，和当时聊出来的样子一样
+	return m, m.print(m.resumeText(next))
+}
+
+// resumeText 是恢复会话之后打进历史区的那一整段：先把这段历史重打一遍，
+// 末尾跟一行说明（恢复成了哪个会话、共几条消息）。
+// 说明放在最后是为了随时看得见——历史一长，顶上那行早就被顶出屏幕了。
+func (m model) resumeText(next *domain.Session) string {
+	out := m.historyLines(next)
+	if len(out) > 0 {
+		out = append(out, "")
+	}
+	out = append(out, bannerStyle.Render("已恢复会话 "+next.Id)+
+		hintStyle.Render(fmt.Sprintf("，共 %d 条消息，目录 %s", len(next.Messages), m.store.Dir)))
 	// 别的目录里开的会话也照样能接着聊，只是工具仍按当前目录跑，提一句免得误会
 	if next.WorkDir != "" && next.WorkDir != m.workdir {
-		out += "\n" + hintStyle.Render("  这个会话是在 "+next.WorkDir+" 开的；继续聊时工具还是在当前目录 "+
-			m.workdir+" 里跑")
+		out = append(out, hintStyle.Render("  这个会话是在 "+next.WorkDir+" 开的；继续聊时工具还是在当前目录 "+
+			m.workdir+" 里跑"))
 	}
-	return m, m.print(out)
+	return strings.Join(out, "\n")
 }
 
 // pickSession 把 /resume 的参数认成一个会话 id：纯数字按列表序号算，其余按 id 精确匹配
@@ -1637,6 +1654,88 @@ func sizeText(n int64) string {
 	default:
 		return fmt.Sprintf("%dB", n)
 	}
+}
+
+// historyLines 把一份已存的会话重新渲染成历史区的样子：提问、思考、回答、
+// 工具调用和它的结果按原来的顺序排开，和当时这一轮跑完打出去的内容一致。
+//
+// 会话文件里只存了内容、调用参数和结果文本，没存工具状态和耗时，所以圆圈按结果
+// 的开头认（core 失败时固定写成"错误: …"或"执行失败: …"），耗时不显示——
+// 那是当时的过程信息，重打一遍历史也不必编一个出来。
+// 精简显示（quiet）下思考过程和工具输出同样不打，和当时跑的规矩一致。
+func (m model) historyLines(s *domain.Session) []string {
+	if s == nil {
+		return nil
+	}
+	// 工具结果按调用 id 对回去，好贴在对应那次调用的下面
+	results := make(map[string]domain.SessionMessage, len(s.Messages))
+	for _, msg := range s.Messages {
+		if msg.Role == domain.RoleTool && msg.ToolCallId != "" {
+			results[msg.ToolCallId] = msg
+		}
+	}
+	// used 记下哪些结果已经跟着调用一起打过了，轮到那条 tool 消息时跳过
+	used := make(map[string]bool, len(results))
+
+	var out []string
+	for _, msg := range s.Messages {
+		switch msg.Role {
+		case domain.RoleUser:
+			// 只有图片没有文字的提问也要留着，那也是一条正经提问
+			if msg.Content == "" && len(msg.Images) == 0 {
+				continue
+			}
+			out = append(out, promptStyle.Render(m.fitWidth(msg.Content)))
+			if len(msg.Images) > 0 {
+				out = append(out, hintStyle.Render(fmt.Sprintf("  （附 %d 张图片）", len(msg.Images))))
+			}
+		case domain.RoleAssistant:
+			if !m.quiet {
+				out = append(out, m.block("思考", thinkStyle, msg.Reasoning, printReasoningLines)...)
+			}
+			out = append(out, m.block("", answerStyle(), msg.Content, 0)...)
+			for _, call := range msg.ToolCalls {
+				out = append(out, m.historyCallLines(call, results[call.Id])...)
+				used[call.Id] = true
+			}
+		case domain.RoleTool:
+			// 已经贴在调用下面的结果不再打第二遍
+			if used[msg.ToolCallId] {
+				continue
+			}
+			// 对不上调用的结果（比如会话是别的版本写的）也别丢，单独打一份
+			if !m.quiet {
+				out = append(out, m.block("", toolResStyle, msg.Content, printToolResultLines)...)
+			}
+		}
+	}
+	return out
+}
+
+// historyCallLines 渲染历史里的一次工具调用：圆圈 + 标题行 + 细节行，结果紧跟在后面。
+// 没有结果说明那一轮当时被打断了，和 finish 里的处理一样标成未完成。
+func (m model) historyCallLines(call domain.ToolCall, res domain.SessionMessage) []string {
+	lines := m.toolCallLines(call)
+	if res.Role == "" {
+		out := withMark(lines, doneMark(domain.ToolStatusFailed))
+		out[0] += hintStyle.Render("  · 未完成")
+		return out
+	}
+	out := withMark(lines, doneMark(historyStatus(res.Content)))
+	if !m.quiet {
+		out = append(out, m.block("", toolResStyle, res.Content, printToolResultLines)...)
+	}
+	return out
+}
+
+// historyStatus 按工具结果的内容反推当时的状态：core 失败时一定以这两句开头，
+// 成功的结果不会带这个前缀（见 core.executeTool）；命令自己退出码非零不算失败，
+// 那种情况结果是 exit_code，本来也标成成功。
+func historyStatus(content string) domain.ToolStatus {
+	if strings.HasPrefix(content, "错误: ") || strings.HasPrefix(content, "执行失败: ") {
+		return domain.ToolStatusFailed
+	}
+	return domain.ToolStatusSuccess
 }
 
 // startRun 把提问丢给 core.Loop，用 goroutine + channel 把过程事件送回 UI。

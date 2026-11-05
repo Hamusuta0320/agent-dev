@@ -3,12 +3,14 @@ package main
 import (
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"hamusuta/agent-dev/src/config"
 	"hamusuta/agent-dev/src/domain"
+	"hamusuta/agent-dev/src/session"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -304,13 +306,19 @@ func newHarness(t *testing.T, w, h int) *harness {
 
 // newHarnessWith 和 newHarness 一样，quiet 决定这轮回放的是精简显示还是详细显示
 func newHarnessWith(t *testing.T, w, h int, quiet bool) *harness {
+	return newHarnessStore(t, w, h, quiet, nil)
+}
+
+// newHarnessStore 是带会话目录的版本：/resume 这类要读写会话的用例用它，
+// 其余用例传 nil 就行
+func newHarnessStore(t *testing.T, w, h int, quiet bool, store *session.Store) *harness {
 	t.Helper()
 	pr, pw := io.Pipe()
 	t.Cleanup(func() { _ = pw.Close() })
 
 	// 摆成"正在跑一轮"：下面要验的是渲染，不是真的去连模型。
 	// runner 的 channel 没人写，waitEvent 会挂在后台，不影响画面。
-	m := newModel(config.GlobalConfig{Mode: "full"}, nil, ".", domain.NewSession("."))
+	m := newModel(config.GlobalConfig{Mode: "full"}, store, ".", domain.NewSession("."))
 	m.quiet = quiet
 	m.state = stateRunning
 	m.runner = &runner{ch: make(chan domain.Event, 8)}
@@ -638,5 +646,38 @@ func TestReplayNoResidueUnderRapidPrint(t *testing.T) {
 	view := strings.Join(hs.snapshot("检查内容"), "\n")
 	if !strings.Contains(view, "结果 11") {
 		t.Fatalf("最后一条工具结果没显示出来:\n%s", view)
+	}
+}
+
+// /resume 恢复会话之后要把这段历史重新打一遍：屏幕上真的能看到上次的提问、思考和回答，
+// 同时帧（输入框、底部提示）不能因为这一大段打印叠出残影
+func TestReplayResumeRendersHistory(t *testing.T) {
+	store := session.NewStore(filepath.Join(t.TempDir(), "sessions"))
+	old := domain.NewSession(".")
+	old.AppendUser("上次问的那个问题")
+	call := domain.ToolCall{Id: "c1", Name: "Bash", Arguments: `{"command":"go build ./...","intent":"编译一下"}`}
+	old.AppendAssistant("上次给的回答", "上次的思考", []domain.ToolCall{call})
+	old.AppendToolResult(call, "exit_code: 0\n编译过了")
+	if err := store.Save(old); err != nil {
+		t.Fatalf("准备会话失败: %v", err)
+	}
+
+	hs := newHarnessStore(t, 80, 30, false, store)
+	hs.send(doneMsg{}) // 这一轮跑完了，回到空闲才能敲命令
+	time.Sleep(200 * time.Millisecond)
+
+	// 敲 /resume 1 回车
+	for _, r := range "/resume 1" {
+		hs.p.Send(tea.KeyPressMsg(tea.Key{Code: r, Text: string(r)}))
+		time.Sleep(10 * time.Millisecond)
+	}
+	hs.p.Send(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	time.Sleep(300 * time.Millisecond)
+
+	view := strings.Join(hs.snapshot("恢复会话后"), "\n")
+	for _, want := range []string{"上次问的那个问题", "上次的思考", "上次给的回答", "编译过了", "已恢复会话"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("恢复后屏幕上少了 %q:\n%s", want, view)
+		}
 	}
 }
