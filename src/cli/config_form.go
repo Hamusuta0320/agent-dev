@@ -29,6 +29,7 @@ var configFields = []configField{
 	{"接口地址", "例如 https://api.deepseek.com，留空就用内置地址"},
 	{"密钥", "sk- 开头的那串"},
 	{"模型", "例如 deepseek-chat；Ctrl+L 能从接口拉列表挑"},
+	{"思考强度", "←→ 切换（默认 / minimal / low / medium / high），默认不发这个参数"},
 	{"上下文上限", "模型的上下文窗口（token），可填 128000、128k、1M（1M = 1024k）"},
 }
 
@@ -38,6 +39,7 @@ const (
 	urlField
 	keyField
 	modelField
+	effortField
 	limitField
 )
 
@@ -69,6 +71,9 @@ type configForm struct {
 	// 类型也先固定，保存时原样带回去
 	name string
 	typ  string
+	// effort 是思考强度档位（config.EffortLevels 里的一项，空串表示不发这个参数）。
+	// 和类型一样没有输入框，←→ 在档位之间切
+	effort string
 }
 
 // modelsFetchedMsg 是拉模型列表的结果回来了。apiUrl / seq 记着这次拉的是哪个地址、
@@ -101,7 +106,13 @@ func newConfigForm(mc config.ModelConfig) configForm {
 		in.SetVirtualCursor(false)
 		inputs[i] = in
 	}
-	return configForm{inputs: inputs, name: mc.Label(), typ: normalizeType(mc.Type), pickIdx: -1}
+	return configForm{
+		inputs:  inputs,
+		name:    mc.Label(),
+		typ:     normalizeType(mc.Type),
+		effort:  strings.ToLower(strings.TrimSpace(mc.ReasoningEffort)),
+		pickIdx: -1,
+	}
 }
 
 // normalizeType 把类型名归一成内置的写法（大小写不敏感）；没填按 DeepSeek 记，
@@ -119,10 +130,13 @@ func normalizeType(typ string) string {
 	return typ
 }
 
-// value 取某个字段去掉首尾空白后的值。类型那一格没有输入框，直接给 f.typ
+// value 取某个字段去掉首尾空白后的值。类型和思考强度这两格没有输入框，直接给字段本身
 func (f configForm) value(i int) string {
 	if i == typeField {
 		return strings.TrimSpace(f.typ)
+	}
+	if i == effortField {
+		return strings.TrimSpace(f.effort)
 	}
 	if i < 0 || i >= len(f.inputs) {
 		return ""
@@ -135,11 +149,12 @@ func (f configForm) value(i int) string {
 // 按 1024 进制换算）则返回错误，交给界面提示
 func (f configForm) modelConfig() (config.ModelConfig, error) {
 	mc := config.ModelConfig{
-		Name:   f.name,
-		Type:   f.typ,
-		ApiUrl: f.value(urlField),
-		ApiKey: f.value(keyField),
-		Model:  f.value(modelField),
+		Name:            f.name,
+		Type:            f.typ,
+		ApiUrl:          f.value(urlField),
+		ApiKey:          f.value(keyField),
+		Model:           f.value(modelField),
+		ReasoningEffort: f.value(effortField),
 	}
 	// 类型先只有 OpenAI 兼容这一套，没写就按 DeepSeek 记下来，配置文件里能看出是什么
 	mc.Type = normalizeType(mc.Type)
@@ -178,6 +193,9 @@ func (m model) fieldLines() []string {
 		case i == typeField:
 			// 类型没有输入框：←→ 在内置类型之间换，地址跟着换成对应的内置地址
 			body = f.value(typeField) + hintStyle.Render("  ←→ 切换")
+		case i == effortField:
+			// 思考强度也没有输入框：←→ 在档位之间换，"默认"表示不发这个参数
+			body = config.EffortLabel(f.value(effortField)) + hintStyle.Render("  ←→ 切换")
 		case i == f.cur && f.editing:
 			body = f.inputs[i].View()
 		case f.value(i) == "":
@@ -396,6 +414,19 @@ func (m model) handleConfigKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	// 思考强度也一样：←→ 在档位之间换，没有输入框可编辑
+	if f.cur == effortField {
+		switch msg.String() {
+		case "left", "h":
+			return m.switchEffort(-1)
+		case "right", "l":
+			return m.switchEffort(1)
+		case "enter":
+			f.err = "思考强度用 ←→ 切换（" + strings.Join(config.EffortLabels(), " / ") + "）"
+			return m, nil
+		}
+	}
+
 	switch msg.String() {
 	case "up", "shift+tab":
 		f.cur = (f.cur - 1 + len(configFields)) % len(configFields)
@@ -456,6 +487,24 @@ func (m model) switchType(step int) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	return m.pullModels(false)
+}
+
+// switchEffort 把思考强度换成档位表里的前（step = -1）或后（step = 1）一个。
+// 配置里存了个表外的值（手改过配置文件）时，从第一档开始找，仍然能往下切
+func (m model) switchEffort(step int) (tea.Model, tea.Cmd) {
+	f := &m.form
+	old := f.value(effortField)
+	idx := 0
+	for i, level := range config.EffortLevels {
+		if strings.EqualFold(level, old) {
+			idx = i
+			break
+		}
+	}
+	next := config.EffortLevels[(idx+step+len(config.EffortLevels))%len(config.EffortLevels)]
+	f.effort = next
+	f.err = ""
+	return m, nil
 }
 
 

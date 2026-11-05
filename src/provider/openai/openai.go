@@ -41,6 +41,9 @@ type AIRequestMessage struct {
 	ToolChoice    string          `json:"tool_choice,omitempty"` // auto,none,required
 	Stream        bool            `json:"stream"`
 	StreamOptions *StreamOptions  `json:"stream_options,omitempty"`
+	// ReasoningEffort 是思考强度（minimal/low/medium/high）。留空不带这个字段：
+	// 认不认它全看各家接口，没配的人不该因为多一个字段被拒
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 }
 
 // StreamOptions 只为了拿到用量：流式接口默认不报 usage，要多要一次

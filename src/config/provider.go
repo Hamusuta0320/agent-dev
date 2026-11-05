@@ -31,6 +31,41 @@ const (
 // 它们都走 OpenAI 兼容协议，差别只在地址和模型名
 var ProviderTypes = []string{"DeepSeek", "OpenAI", "MiniMax"}
 
+// EffortLevels 是"思考强度"的档位，从省到费排。/config 里用 ←→ 在这个表里循环，
+// 空串表示压根不发这个参数（模型用自家默认值）——那是最保险的一档，
+// 因为认不认 reasoning_effort 全看各家接口
+var EffortLevels = []string{"", "minimal", "low", "medium", "high"}
+
+// ParseEffort 把配置里的思考强度归一成小写档位名。留空是合法的（不发这个参数），
+// 写了表外的值就报错：悄悄塞给接口换回一个 400，比在这里说清楚糟得多
+func ParseEffort(effort string) (string, error) {
+	want := strings.ToLower(strings.TrimSpace(effort))
+	for _, level := range EffortLevels {
+		if want == level {
+			return level, nil
+		}
+	}
+	return "", fmt.Errorf("思考强度只认 %s（留空表示按模型默认）", strings.Join(EffortLabels(), " / "))
+}
+
+// EffortLabels 是档位的显示名：空档叫"默认"，其余就是档位名本身
+func EffortLabels() []string {
+	out := make([]string, 0, len(EffortLevels))
+	for _, level := range EffortLevels {
+		out = append(out, EffortLabel(level))
+	}
+	return out
+}
+
+// EffortLabel 是一个档位给人看的名字
+func EffortLabel(effort string) string {
+	level := strings.ToLower(strings.TrimSpace(effort))
+	if level == "" {
+		return "默认"
+	}
+	return level
+}
+
 // DefaultApiUrl 按协议类型给出内置的接口地址。认不出的类型返回空串：
 // 瞎猜一个地址比让用户自己填更糟
 func DefaultApiUrl(typ string) string {
@@ -55,6 +90,9 @@ type ModelConfig struct {
 	ApiKey string `json:"ApiKey" yaml:"ApiKey"`
 	// ContextLimit 是模型的上下文窗口（token），只用来算"上下文已用百分比"；不填时按 DefaultContextLimit
 	ContextLimit int `json:"ContextLimit" yaml:"ContextLimit"`
+	// ReasoningEffort 是思考强度（OpenAI 兼容协议里的 reasoning_effort），档位见 EffortLevels。
+	// 留空就不发这个参数，让模型用它自己的默认值
+	ReasoningEffort string `json:"ReasoningEffort,omitempty" yaml:"ReasoningEffort,omitempty"`
 }
 
 // DeepSeekConfig 是配置里只有一套模型时的老名字，现在和 ModelConfig 是同一个类型

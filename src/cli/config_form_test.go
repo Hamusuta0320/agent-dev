@@ -239,6 +239,87 @@ func TestConfigFormSwitchType(t *testing.T) {
 	}
 }
 
+// 思考强度那一格用 ←→ 换档位，空档（默认）不发这个参数；选中的档位存进配置
+func TestConfigFormSwitchEffort(t *testing.T) {
+	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+	m.cfgPath = filepath.Join(t.TempDir(), "config.yaml")
+	m.state = stateConfig
+	m.form = newConfigForm(config.ModelConfig{Type: "DeepSeek"})
+	m.form.cur = effortField
+	if got := m.form.value(effortField); got != "" {
+		t.Fatalf("没配过的思考强度该是默认档: %q", got)
+	}
+	if text := stripANSI(strings.Join(m.fieldLines(), "\n")); !strings.Contains(text, "思考强度") ||
+		!strings.Contains(text, "默认") {
+		t.Fatalf("表单里该有思考强度这一行，默认档显示成\"默认\":\n%s", text)
+	}
+
+	// 没有输入框可编辑：Enter 只提示一句怎么换，不进编辑态
+	pressed, _ := m.handleConfigKey(tea.KeyPressMsg{Code: tea.KeyEnter})
+	got := pressed.(model)
+	if got.form.editing {
+		t.Fatal("思考强度没有输入框，不该进编辑态")
+	}
+	if !strings.Contains(got.form.err, "←→") {
+		t.Fatalf("该提示用 ←→ 切: %q", got.form.err)
+	}
+
+	// → 一档一档往上加
+	next, _ := got.handleConfigKey(tea.KeyPressMsg{Code: tea.KeyRight})
+	got = next.(model)
+	if v := got.form.value(effortField); v != "minimal" {
+		t.Fatalf("→ 之后该是 minimal，实际 %q", v)
+	}
+	for _, want := range []string{"low", "medium", "high"} {
+		next, _ = got.handleConfigKey(tea.KeyPressMsg{Code: tea.KeyRight})
+		got = next.(model)
+		if v := got.form.value(effortField); v != want {
+			t.Fatalf("继续按 → 该是 %q，实际 %q", want, v)
+		}
+	}
+	// 到头再往前绕回默认档
+	next, _ = got.handleConfigKey(tea.KeyPressMsg{Code: tea.KeyRight})
+	got = next.(model)
+	if v := got.form.value(effortField); v != "" {
+		t.Fatalf("high 之后再按 → 该绕回默认，实际 %q", v)
+	}
+	// ← 从默认绕到最后一档
+	next, _ = got.handleConfigKey(tea.KeyPressMsg{Code: tea.KeyLeft})
+	got = next.(model)
+	if v := got.form.value(effortField); v != "high" {
+		t.Fatalf("从默认往前该绕到 high，实际 %q", v)
+	}
+
+	// 存下来：配置里带着思考强度，重建的表单也还是这一档
+	got.form.inputs[keyField].SetValue("sk-effort")
+	got.form.inputs[modelField].SetValue("deepseek-reasoner")
+	saved, _ := got.saveConfig()
+	mc, err := saved.(model).cfg.CurrentModel()
+	if err != nil {
+		t.Fatalf("保存后读配置失败: %v", err)
+	}
+	if mc.ReasoningEffort != "high" {
+		t.Fatalf("思考强度没存进配置: %+v", mc)
+	}
+	if v := saved.(model).form.value(effortField); v != "high" {
+		t.Fatalf("保存后表单里该还是 high，实际 %q", v)
+	}
+
+	// /model 列表里能看出这套模型配了什么思考强度
+	if hint := modelHint(mc); !strings.Contains(hint, "思考 high") {
+		t.Fatalf("/model 的说明里该带上思考强度: %q", hint)
+	}
+
+	// 配置里手写了个表外的档位：不崩，照样能往下切
+	odd := newConfigForm(config.ModelConfig{Type: "DeepSeek", ReasoningEffort: "weird"})
+	odd.cur = effortField
+	m.form = odd
+	next, _ = m.handleConfigKey(tea.KeyPressMsg{Code: tea.KeyRight})
+	if v := next.(model).form.value(effortField); v != "minimal" {
+		t.Fatalf("表外的档位该从第一档接着走，实际 %q", v)
+	}
+}
+
 // 候选列表的窗口：选中的那个始终在可见范围里
 func TestPickWindow(t *testing.T) {
 	for _, c := range []struct {

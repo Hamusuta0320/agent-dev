@@ -26,6 +26,7 @@ const (
 	cmdSkills
 	cmdTodo
 	cmdQuiet
+	cmdEffort
 	cmdExit
 )
 
@@ -42,9 +43,10 @@ var commandSpecs = []commandSpec{
 	{cmdNew, "/new", "开一个新会话"},
 	{cmdResume, "/resume", "恢复以前的会话：不带参数列出来，带序号或 id 切过去"},
 	{cmdSession, "/session", "看当前会话 id 和消息条数"},
-	{cmdConfig, "/config", "配置当前这套模型：地址（留空用内置的）、密钥、模型名；Ctrl+L 拉模型列表"},
+	{cmdConfig, "/config", "配置当前这套模型：地址（留空用内置的）、密钥、模型名、思考强度；Ctrl+L 拉模型列表"},
 	{cmdMode, "/mode", "看或切换工作模式：只读 / 编辑需授权 / 完全授权"},
 	{cmdModel, "/model", "看配置好的几套模型，或切到其中一套（会写回配置文件）"},
+	{cmdEffort, "/effort", "看或调整思考强度：默认 / minimal / low / medium / high（会写回配置文件）"},
 	{cmdSkills, "/skills", "看装了哪些技能，直接 /技能名 就能调用"},
 	{cmdTodo, "/todo", "看这次任务的待办清单"},
 	{cmdQuiet, "/quiet", "切换精简显示：只打正文，不显示思考过程和工具输出（会写回配置）"},
@@ -72,6 +74,8 @@ func parseCommand(input string) command {
 		return cmdMode
 	case "/model":
 		return cmdModel
+	case "/effort":
+		return cmdEffort
 	case "/skills":
 		return cmdSkills
 	case "/todo":
@@ -204,6 +208,9 @@ func helpText() string {
 		"  /config 里类型用 ←→ 在 DeepSeek / OpenAI / MiniMax 之间换（都走 OpenAI 兼容协议），",
 		"  接口地址留空就用该类型内置的（如 https://api.deepseek.com），也可以手填覆盖；",
 		"  地址和密钥填好后按 Ctrl+L 能从接口拉模型列表，↑↓ 挑、Enter 采用，也可以直接手填模型名",
+		"  思考强度用 ←→ 在 默认 / minimal / low / medium / high 之间换，会作为 reasoning_effort 发给接口；",
+		"  留\"默认\"就不发这个参数（认不认它看各家接口，OpenAI 系的 low/medium/high 最通用）",
+		"  不想开表单就直接打 /effort：不带参数看当前这档，/effort high、/effort 默认 就地改",
 		"  /model 列出配置好的几套模型，/model 名字切过去（会写回配置文件，重启还是它）",
 		"  配置文件在用户目录下的 .agent-dev/config.yaml，跟工作区无关；Models 下可以写好几套，",
 		"  Current 指定默认用哪套；只写老格式的 Provider 段也能跑，/config 保存一次就会补齐两条",

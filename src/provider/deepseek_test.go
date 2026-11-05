@@ -295,3 +295,70 @@ func TestChatSendsImageParts(t *testing.T) {
 		t.Fatalf("没图的消息 content 应该还是字符串，实际 %T", second["content"])
 	}
 }
+
+// 配了思考强度就作为 reasoning_effort 发出去，没配就压根不带这个字段
+func TestChatSendsReasoningEffort(t *testing.T) {
+	cases := []struct {
+		name   string
+		effort string
+		want   string // 空表示请求体里不该有这个字段
+	}{
+		{"没配就不发", "", ""},
+		{"配了就发", "high", "high"},
+		{"大小写和空白都归一", "  Medium ", "medium"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var got map[string]any
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Errorf("请求体不是 JSON: %v", err)
+				}
+				got = body
+				writeStream(w, "好")
+			}))
+			t.Cleanup(srv.Close)
+
+			p, err := NewDeepSeek(config.DeepSeekConfig{
+				ApiUrl:          srv.URL,
+				ApiKey:          "test-key",
+				Model:           "test-model",
+				ReasoningEffort: c.effort,
+			})
+			if err != nil {
+				t.Fatalf("造 provider 失败: %v", err)
+			}
+			if _, err := p.Chat(context.Background(), testMessages(), nil, nil); err != nil {
+				t.Fatalf("请求失败: %v", err)
+			}
+
+			sent, ok := got["reasoning_effort"]
+			if c.want == "" {
+				if ok {
+					t.Fatalf("没配思考强度就别发这个字段，实际 %v", sent)
+				}
+				return
+			}
+			if sent != c.want {
+				t.Fatalf("reasoning_effort 应该是 %q，实际 %v", c.want, sent)
+			}
+		})
+	}
+}
+
+// 思考强度写错了在造 provider 的时候就说清楚，别等接口回一个 400 让人猜
+func TestNewDeepSeekRejectsBadEffort(t *testing.T) {
+	_, err := NewDeepSeek(config.DeepSeekConfig{
+		ApiUrl:          "https://api.deepseek.com",
+		ApiKey:          "sk-1",
+		Model:           "deepseek-chat",
+		ReasoningEffort: "很努力",
+	})
+	if err == nil {
+		t.Fatal("表外的思考强度该报错")
+	}
+	if !strings.Contains(err.Error(), "ReasoningEffort") || !strings.Contains(err.Error(), "minimal") {
+		t.Fatalf("报错得说清是哪一项、有哪些档位: %v", err)
+	}
+}

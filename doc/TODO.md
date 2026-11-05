@@ -46,6 +46,11 @@
       新增 `provider.New(config.ModelConfig)`，Type 认 DeepSeek / OpenAI（都是 OpenAI 兼容接口）。
 - [ ] 还差一家：Anthropic 那套 `/v1/messages` 协议和 OpenAI 兼容接口不一样，得单独实现一个
       provider 并在 `provider.New` 里分派。
+- [x] 思考强度（`reasoning_effort`）：`ModelConfig.ReasoningEffort` 存档位
+      （minimal / low / medium / high，留空表示不发这个参数），`/config` 里用 ←→ 切，
+      也可以直接打命令：`/effort` 看当前这档，`/effort high`、`/effort 默认` 就地改并写回配置。
+      请求体由 `src/provider/deepseek.go` 拼。写错档位在造 provider 时就报错，
+      不至于让接口回一个 400 让人猜。各家认不认这个字段不一样，所以默认不动它。
 
 ### 待办跟踪
 

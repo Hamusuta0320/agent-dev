@@ -380,6 +380,7 @@ func (m model) bannerLines() []string {
 	lines := []string{
 		bannerStyle.Render("agent-dev") + hintStyle.Render("  会话 "+m.cur.Id),
 		hintStyle.Render("模型 ") + statusStyle.Render(m.modelLabel()) +
+			hintStyle.Render(" · 思考 ") + statusStyle.Render(m.effortLabel()) +
 			hintStyle.Render(" · 模式 ") + statusStyle.Render(m.mode.Label()) +
 			hintStyle.Render(" · Enter 发送 · "+newlineHint()+" · /help 看命令"),
 	}
@@ -1464,6 +1465,8 @@ func (m model) submit() (tea.Model, tea.Cmd) {
 		return m.switchMode(input)
 	case cmdModel:
 		return m.switchModel(input)
+	case cmdEffort:
+		return m.adjustEffort(input)
 	case cmdSkills:
 		return m, m.print(skillsText(m.skills))
 	case cmdTodo:
@@ -1583,6 +1586,106 @@ func (m model) switchModel(input string) (tea.Model, tea.Cmd) {
 	return m, m.print(out)
 }
 
+// adjustEffort 处理 /effort：不带参数就报当前档位和可选项，带了就改成那一档并写回配置，
+// 下一轮请求就带上新的 reasoning_effort，不用重启。
+// 改的是当前生效的那套模型（/model 切过去的那套），不是别的
+func (m model) adjustEffort(input string) (tea.Model, tea.Cmd) {
+	arg := ""
+	if fields := strings.Fields(input); len(fields) > 1 {
+		arg = strings.Join(fields[1:], " ")
+	}
+	cur, err := m.cfg.CurrentModel()
+	if err != nil {
+		return m, m.print(errStyle.Render("调整思考强度失败: " + err.Error()))
+	}
+	if arg == "" {
+		return m, m.print(effortText(cur))
+	}
+
+	level, ok := effortArg(arg)
+	if !ok {
+		return m, m.print(errStyle.Render(fmt.Sprintf(
+			"认不出思考强度 %q；可选 %s（/effort 看看当前是什么）", arg, strings.Join(config.EffortLabels(), " / "))))
+	}
+
+	// 名字先补齐，和 SaveModels 写回时补的一致，两边才认得出是同一套
+	models := m.cfg.AvailableModels()
+	for i := range models {
+		if strings.TrimSpace(models[i].Name) == "" {
+			models[i].Name = models[i].Label()
+		}
+	}
+	// 当前这套就是要改的那套：按名字找，找不到（配置刚被改坏）就退回第一套
+	target := 0
+	for i := range models {
+		if strings.EqualFold(models[i].Label(), cur.Label()) {
+			target = i
+			break
+		}
+	}
+	models[target].ReasoningEffort = level
+	m.cfg.Models = models
+	m.cfg.Current = models[target].Label()
+
+	out := bannerStyle.Render("思考强度 ") + statusStyle.Render(config.EffortLabel(level)) +
+		hintStyle.Render("  "+effortHint(level)+" · "+models[target].Label())
+	// 写回配置失败不影响本次运行，说明一下就行
+	if err := config.SaveModels(m.cfgPath, models, m.cfg.Current); err != nil {
+		out += "\n" + hintStyle.Render("（没能写回配置: "+err.Error()+"，本次运行仍然生效）")
+	}
+	return m, m.print(out)
+}
+
+// effortArg 把 /effort 后面那截认成档位。档位名本身之外，"默认/auto/off" 都表示不发这个参数；
+// 认不出来返回 false，让界面提示可选值
+func effortArg(arg string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(arg)) {
+	case "默认", "default", "auto", "off", "none":
+		return "", true
+	}
+	level, err := config.ParseEffort(arg)
+	if err != nil {
+		return "", false
+	}
+	return level, true
+}
+
+// effortText 是 /effort 不带参数时的说明：当前这档标出来，顺便列出有几档、各是什么
+func effortText(cur config.ModelConfig) string {
+	now := config.EffortLabel(cur.ReasoningEffort)
+	title := bannerStyle.Render("思考强度") +
+		hintStyle.Render("  当前 "+now+"（"+cur.Label()+"）")
+	lines := []string{title}
+	for _, level := range config.EffortLevels {
+		mark, style := "  ", hintStyle
+		if config.EffortLabel(level) == now {
+			mark, style = "▸ ", promptStyle
+		}
+		lines = append(lines, style.Render(fmt.Sprintf("%s%-8s %s", mark, config.EffortLabel(level), effortHint(level))))
+	}
+	lines = append(lines,
+		"",
+		hintStyle.Render("  调整：/effort low、/effort high、/effort 默认，会写回配置文件；下次启动还是这档"),
+		hintStyle.Render("  /config 里也能用 ←→ 换，效果一样"))
+	return strings.Join(lines, "\n")
+}
+
+// effortHint 是一句话说明某个档位是什么意思
+func effortHint(level string) string {
+	switch config.EffortLabel(level) {
+	case "minimal":
+		return "几乎不思考，最快，只有认这档的接口支持"
+	case "low":
+		return "想得少一点，快"
+	case "medium":
+		return "均衡"
+	case "high":
+		return "想得最久最深，最慢也最费 token"
+	default:
+		return "不发这个参数，用模型自己的默认"
+	}
+}
+
 // pickModel 把 /model 的参数认成一套配置：名字和模型名都能认，前面几个字对得上也算，
 // 但必须只对上一套——两套以上拿不准时让用户说全
 func pickModel(models []config.ModelConfig, arg string) (config.ModelConfig, bool) {
@@ -1646,6 +1749,9 @@ func modelHint(mc config.ModelConfig) string {
 	}
 	if url := strings.TrimSpace(mc.ApiUrl); url != "" {
 		out += " · " + url
+	}
+	if effort := strings.TrimSpace(mc.ReasoningEffort); effort != "" {
+		out += " · 思考 " + config.EffortLabel(effort)
 	}
 	return out + " · 上下文 " + domain.FormatTokens(mc.Limit())
 }
@@ -2413,6 +2519,7 @@ func (m model) footerLine() string {
 		return fitItems([]string{
 			hintStyle.Render("Enter 排队下一条"),
 			hintStyle.Render("Ctrl+C 中断"),
+			hintStyle.Render("思考 ") + statusStyle.Render(m.effortLabel()),
 		}, m.width-1)
 	}
 	return fitItems([]string{
@@ -2420,6 +2527,7 @@ func (m model) footerLine() string {
 		hintStyle.Render(newlineHint()),
 		hintStyle.Render("Ctrl+C 退出"),
 		hintStyle.Render("模型 ") + statusStyle.Render(m.modelLabel()),
+		hintStyle.Render("思考 ") + statusStyle.Render(m.effortLabel()),
 		hintStyle.Render("模式 ") + statusStyle.Render(m.mode.Label()),
 	}, m.width-1)
 }
@@ -2958,6 +3066,12 @@ func (m model) modelLabel() string {
 		return label
 	}
 	return "未配置"
+}
+
+// effortLabel 是当前生效的思考强度档位，没配（不发这个参数）时显示"默认"。
+// 界面上和模型名摆在一起：同一套模型换个档位，跑出来的东西差别很大，得看得见
+func (m model) effortLabel() string {
+	return config.EffortLabel(m.currentModel().ReasoningEffort)
 }
 
 // deepSeekConfig 从配置里解出当前这套模型。解不出来时返回零值，

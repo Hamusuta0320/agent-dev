@@ -162,12 +162,13 @@ func (p DeepSeekProvider) Chat(ctx context.Context, messages []domain.AIChatMess
 	ctx = contextOrBackground(ctx)
 	// 请求体在几次重试之间是同一份，先序列化好
 	reqBody, err := json.Marshal(openai.AIRequestMessage{
-		Model:         p.Cfg.Model,
-		Messages:      buildMessages(messages),
-		Tools:         buildOpenAITools(tools),
-		ToolChoice:    "auto",
-		Stream:        true,
-		StreamOptions: &openai.StreamOptions{IncludeUsage: true},
+		Model:           p.Cfg.Model,
+		Messages:        buildMessages(messages),
+		Tools:           buildOpenAITools(tools),
+		ToolChoice:      "auto",
+		Stream:          true,
+		StreamOptions:   &openai.StreamOptions{IncludeUsage: true},
+		ReasoningEffort: strings.ToLower(strings.TrimSpace(p.Cfg.ReasoningEffort)),
 	})
 	if err != nil {
 		return domain.ChatResult{}, fmt.Errorf("序列化请求失败: %w", err)
@@ -466,6 +467,12 @@ func NewDeepSeek(dc config.DeepSeekConfig) (DeepSeekProvider, error) {
 		}
 		return DeepSeekProvider{}, fmt.Errorf("模型 %s 的配置不完整：ApiUrl/ApiKey/Model 必填", label)
 	}
+	// 思考强度写错了在这里就说清楚，别等接口回一个 400 让人猜
+	effort, err := config.ParseEffort(dc.ReasoningEffort)
+	if err != nil {
+		return DeepSeekProvider{}, fmt.Errorf("模型 %s 的 ReasoningEffort 有问题: %w", dc.Label(), err)
+	}
+	dc.ReasoningEffort = effort
 	return DeepSeekProvider{
 		Cfg: dc,
 	}, nil
