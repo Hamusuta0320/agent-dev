@@ -82,6 +82,7 @@ const el = {
   // /config 表单
   cfgDialog: $("cfg-dialog"),
   cfgTitle: $("cfg-title"),
+  cfgName: $("cfg-name"),
   cfgType: $("cfg-type"),
   cfgUrl: $("cfg-url"),
   cfgKey: $("cfg-key"),
@@ -94,6 +95,8 @@ const el = {
   cfgPath: $("cfg-path"),
   cfgSave: $("cfg-save"),
   cfgCancel: $("cfg-cancel"),
+  cfgNew: $("cfg-new"),
+  cfgDelete: $("cfg-delete"),
   // 通用确认框（删会话、删工作区都用它）
   confirmDialog: $("confirm-dialog"),
   confirmTitle: $("confirm-title"),
@@ -137,6 +140,10 @@ const state = {
   // quiet 是精简显示：只显示正文，思考过程和工具输出的内容都不显示。
   // 值来自服务端（配置里的 Quiet，没配过时默认就是开着的），/quiet 和顶栏徽标都能切
   quiet: true,
+  // configMode 是配置表单当前的模式："edit" 改当前那套，"new" 新增一套
+  configMode: "edit",
+  // configEditLabel 是正在改的那套的名字，保存时原样带回去（新增时是空串）
+  configEditLabel: "",
   // 文件夹选择器上一次列目录的结果。roots 为 true 时是盘符列表，path 为空
   fs: { path: "", parent: "", roots: false, entries: [], home: "", work_dir: "" },
   // 正在列目录；以及这次列目录的序号，连点过快时用来丢掉过期响应
@@ -1637,7 +1644,12 @@ async function runCommand(text) {
     if (reply.meta) applyMeta(reply.meta);
     switch (reply.kind) {
       case "config":
-        await openConfigDialog();
+        // /model add 回的是"新增一套"，其余（/config）是改当前那套
+        await openConfigDialog(reply.config === "new" ? "new" : "edit");
+        return;
+      case "confirm":
+        // 删除这类不可回退的操作：弹确认框，点了确定才真做
+        await runConfirm(reply);
         return;
       case "session":
         await openSession(reply.session);
@@ -1702,11 +1714,12 @@ async function toggleQuiet(want) {
 }
 
 
-// openConfigDialog 打开模型配置表单：值从服务端取（密钥只告诉"配过没有"）
-async function openConfigDialog() {
+// openConfigDialog 打开模型配置表单：值从服务端取（密钥只告诉"配过没有"）。
+// mode 是 "new" 时拉一张空白表单（新增一套），否则改当前那套
+async function openConfigDialog(mode = "edit") {
   let view;
   try {
-    view = await api("/api/config");
+    view = await api(mode === "new" ? "/api/config?new=1" : "/api/config");
   } catch (err) {
     notice(`打不开配置表单：${err.message}`, true);
     return;
@@ -1716,12 +1729,14 @@ async function openConfigDialog() {
   el.cfgModels.hidden = true;
   el.cfgModels.replaceChildren();
   if (!el.cfgDialog.open) el.cfgDialog.showModal();
-  el.cfgModel.focus();
+  el.cfgName.focus();
 }
 
 // applyConfigView 把服务端给的表单值摆进表单
 function applyConfigView(view) {
   state.configDefaults = view.default_urls || {};
+  state.configMode = view.mode || "edit";
+  state.configEditLabel = view.edit_label || "";
   fillSelect(el.cfgType, view.types || [], (t) => [t, t], view.type);
   // 思考强度的档位是显示名，提交时要换成档位本身（"默认" 就是空串）
   fillSelect(
@@ -1730,6 +1745,7 @@ function applyConfigView(view) {
     (o) => [o.label, o.value],
     view.effort === "默认" ? "" : view.effort,
   );
+  el.cfgName.value = view.name || "";
   el.cfgUrl.value = view.api_url || "";
   el.cfgUrl.placeholder = "留空用该类型内置的地址";
   el.cfgKey.value = "";
@@ -1737,6 +1753,9 @@ function applyConfigView(view) {
   el.cfgModel.value = view.model || "";
   el.cfgLimit.value = view.context_limit || "";
   el.cfgTitle.textContent = view.name ? `当前这套：${view.name}` : "还没有配置模型";
+  // 新增模式下没有"这一套"可删，也不该再开一个新增表单
+  el.cfgDelete.hidden = state.configMode !== "edit";
+  el.cfgNew.hidden = state.configMode === "new";
   const models = view.models || [];
   el.cfgPath.textContent = [view.cfg_path, models.length > 1 ? `共 ${models.length} 套：${models.join("、")}` : ""]
     .filter(Boolean)
@@ -1798,7 +1817,8 @@ async function fetchModelNames() {
   }
 }
 
-// saveConfigForm 把表单交上去。密钥留空就是"不改"——前端拿不到明文，只能这么表达
+// saveConfigForm 把表单交上去。密钥留空就是"不改"——前端拿不到明文，只能这么表达。
+// 新增模式下 new 为 true、edit_label 为空；改现有那套时带着正在改的那套的名字
 async function saveConfigForm() {
   el.cfgSave.disabled = true;
   showConfigError("");
@@ -1806,6 +1826,9 @@ async function saveConfigForm() {
     const data = await api("/api/config", {
       method: "POST",
       body: JSON.stringify({
+        name: el.cfgName.value.trim(),
+        edit_label: state.configEditLabel || "",
+        new: state.configMode === "new",
         type: el.cfgType.value,
         api_url: el.cfgUrl.value.trim(),
         api_key: el.cfgKey.value.trim(),
@@ -1822,6 +1845,50 @@ async function saveConfigForm() {
     showConfigError(err.message);
   } finally {
     el.cfgSave.disabled = false;
+  }
+}
+
+// runConfirm 弹确认框：用户点了确定才真的做那件事。
+// 现在只有删模型走这条路，动作名形如 "del-model:名字"
+async function runConfirm(reply) {
+  const answer = await askConfirm({
+    title: "确认",
+    text: reply.text || "确定要这么做吗？",
+    okLabel: "确定",
+  });
+  if (answer !== "ok") return;
+  const action = reply.confirm || "";
+  if (!action.startsWith("del-model:")) return;
+  const name = action.slice("del-model:".length);
+  try {
+    const data = await api(`/api/config/models?name=${encodeURIComponent(name)}`, { method: "DELETE" });
+    if (data && data.meta) applyMeta(data.meta);
+    notice(`已删掉 ${name}`);
+  } catch (err) {
+    notice(`删不掉：${err.message}`, true);
+  }
+}
+
+// deleteCurrentModel 是配置表单里的「删除这套」：先弹确认框，点了确定才真删
+async function deleteCurrentModel() {
+  const name = (state.configEditLabel || el.cfgName.value || "").trim();
+  if (!name) {
+    showConfigError("还没配过模型，没有能删的");
+    return;
+  }
+  const answer = await askConfirm({
+    title: "删除模型配置",
+    text: `删掉 ${name}？`,
+    okLabel: "删掉",
+  });
+  if (answer !== "ok") return;
+  try {
+    const data = await api(`/api/config/models?name=${encodeURIComponent(name)}`, { method: "DELETE" });
+    if (data && data.meta) applyMeta(data.meta);
+    el.cfgDialog.close();
+    notice(`已删掉 ${name}`);
+  } catch (err) {
+    showConfigError(`删不掉：${err.message}`);
   }
 }
 function bindEvents() {
@@ -1943,6 +2010,8 @@ function bindEvents() {
   });
   el.cfgFetch.addEventListener("click", fetchModelNames);
   el.cfgSave.addEventListener("click", saveConfigForm);
+  el.cfgNew.addEventListener("click", () => openConfigDialog("new"));
+  el.cfgDelete.addEventListener("click", deleteCurrentModel);
   el.cfgCancel.addEventListener("click", () => el.cfgDialog.close());
   el.cfgDialog.addEventListener("cancel", (e) => {
     // Esc 关掉表单只是放弃这次修改，没有副作用，放它过去

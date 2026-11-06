@@ -170,6 +170,12 @@
       `/model` 列出并切换，切换会写回配置；`/config` 改的是当前这套。
       老配置只写 `Provider` 一段照常能跑，保存时会把 Models / Current / Provider 一起写齐。
       新增 `provider.New(config.ModelConfig)`，Type 认 DeepSeek / OpenAI（都是 OpenAI 兼容接口）。
+- [x] `/model add` 新增一套、`/model del 名字` 删掉一套，不用手改 `config.yaml` 了。
+      `/config` 表单多一格「名字」：新增时留空就用模型名，编辑时留空表示不改名；改了就是给这套改名
+      （原地换，不会多出一套）。新增存完不自动切过去，当前那套不动。
+      config 层是三个明确动作 `EditModel` / `AddModel` / `DeleteModel`（替掉了靠名字猜的
+      `ReplaceModel`），终端和浏览器两边共用。删除要二次确认：终端是再打一遍同样的命令，
+      浏览器走确认框；只剩一套时两边都删不掉。
 - [ ] 还差一家：Anthropic 那套 `/v1/messages` 协议和 OpenAI 兼容接口不一样，得单独实现一个
       provider 并在 `provider.New` 里分派。
 - [x] 思考强度（`reasoning_effort`）：`ModelConfig.ReasoningEffort` 存档位

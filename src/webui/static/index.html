@@ -153,10 +153,14 @@
       <span class="dialog-detail" id="cfg-title"></span>
     </div>
     <p class="dialog-detail">
-      改的是当前生效的那套模型，保存后写回配置文件，下一轮请求就用新的，不用重启。
-      接口地址留空用该类型内置的。
+      保存后写回配置文件，下一轮请求就用新的，不用重启。接口地址留空用该类型内置的。
+      名字留空就用模型名；新增时当前用的那套不会跟着换。
     </p>
     <div class="cfg-grid">
+      <label for="cfg-name">名字</label>
+      <input id="cfg-name" class="form-control form-control-sm" autocomplete="off" spellcheck="false"
+             placeholder="留空就用模型名">
+
       <label for="cfg-type">类型</label>
       <select id="cfg-type" class="form-select form-select-sm"></select>
 
@@ -186,6 +190,8 @@
     <div class="dialog-error" id="cfg-error" hidden></div>
     <div class="dialog-actions">
       <span class="dialog-detail me-auto" id="cfg-path"></span>
+      <button type="button" id="cfg-new" class="btn btn-outline-secondary btn-sm">＋ 新增一套</button>
+      <button type="button" id="cfg-delete" class="btn btn-outline-danger btn-sm">删除这套</button>
       <button type="button" id="cfg-cancel" class="btn btn-outline-secondary btn-sm">取消</button>
       <button type="button" id="cfg-save" class="btn btn-primary btn-sm">保存</button>
     </div>
