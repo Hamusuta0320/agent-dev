@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -377,6 +378,115 @@ func TestReadOnlyModeBlocksWrite(t *testing.T) {
 	}
 	if echo.lastArgs != "" {
 		t.Fatalf("只读模式不该执行写类工具: %s", echo.lastArgs)
+	}
+}
+
+// 跑到一半切到"完全授权"，后面同样的写调用不该再问。
+// 浏览器顶栏那个下拉框在这一轮跑着的时候也是能点的，切换得当场见效
+func TestModeSwitchMidRoundStopsAsking(t *testing.T) {
+	var approvals int
+	mode := domain.ModeAsk
+	echo := &fakeTool{mutating: true}
+	session := domain.NewSession("/tmp/demo")
+
+	_, err := Run(domain.Ctx{
+		Prompt:   "改个 bug",
+		Provider: &approveProvider{},
+		Tools:    map[string]domain.Tool{"echo": echo},
+		Context:  context.Background(),
+		WorkDir:  "/tmp/demo",
+		Session:  session,
+		Mode:     domain.ModeAsk,
+		ModeLive: func() domain.Mode { return mode },
+		Emit: func(ev domain.Event) {
+			if ev.Kind != domain.EventApproval {
+				return
+			}
+			approvals++
+			// 第一次确认弹出来之后，用户把模式切成了完全授权
+			mode = domain.ModeFull
+			ev.Reply <- domain.ApprovalAnswer{Allowed: true}
+		},
+	}, session)
+	if err != nil {
+		t.Fatalf("Run 失败: %v", err)
+	}
+	if approvals != 1 {
+		t.Fatalf("切到完全授权之后不该再问，实际问了 %d 次", approvals)
+	}
+	if echo.lastArgs == "" {
+		t.Fatal("允许之后工具应该真的执行")
+	}
+}
+
+// specProvider 记下每次请求发出去的工具名，用来验证切模式后工具清单跟着换
+type specProvider struct {
+	step  int
+	names [][]string
+}
+
+func (p *specProvider) Chat(ctx context.Context, messages []domain.AIChatMessage, tools []domain.ToolSpec, onDelta func(domain.StreamEvent)) (domain.ChatResult, error) {
+	p.step++
+	names := make([]string, 0, len(tools))
+	for _, spec := range tools {
+		names = append(names, spec.Name)
+	}
+	p.names = append(p.names, names)
+	if p.step <= 2 {
+		return domain.ChatResult{
+			ToolCalls: []domain.ToolCall{{Id: fmt.Sprintf("call_%d", p.step), Name: "echo", Arguments: `{}`}},
+		}, nil
+	}
+	return domain.ChatResult{Content: "好了"}, nil
+}
+
+func hasTool(names []string, want string) bool {
+	for _, name := range names {
+		if name == want {
+			return true
+		}
+	}
+	return false
+}
+
+// 从只读切到完全授权：下一步请求就把写类工具带上，模型当场能改东西。
+// 所以调用方得把全套工具递进来（tool.All），不能开跑时就按只读筛掉
+func TestModeSwitchMidRoundAddsWriteTools(t *testing.T) {
+	p := &specProvider{}
+	mode := domain.ModeReadOnly
+	echo := &fakeTool{mutating: true}
+	session := domain.NewSession("/tmp/demo")
+
+	_, err := Run(domain.Ctx{
+		Prompt:   "改个 bug",
+		Provider: p,
+		Tools:    map[string]domain.Tool{"echo": echo},
+		Context:  context.Background(),
+		WorkDir:  "/tmp/demo",
+		Session:  session,
+		Mode:     domain.ModeReadOnly,
+		ModeLive: func() domain.Mode { return mode },
+		Emit: func(ev domain.Event) {
+			// 第一个工具结果回来之后（下一步请求之前）切到完全授权
+			if ev.Kind == domain.EventToolResult {
+				mode = domain.ModeFull
+			}
+		},
+	}, session)
+	if err != nil {
+		t.Fatalf("Run 失败: %v", err)
+	}
+	if len(p.names) < 2 {
+		t.Fatalf("应该请求两次模型，实际 %d 次: %+v", len(p.names), p.names)
+	}
+	if hasTool(p.names[0], "echo") {
+		t.Fatalf("只读模式下不该把写类工具发给模型: %v", p.names[0])
+	}
+	if !hasTool(p.names[1], "echo") {
+		t.Fatalf("切到完全授权后下一步就该带上写类工具: %v", p.names[1])
+	}
+	if echo.lastArgs == "" {
+		t.Fatal("切到完全授权之后，写类工具应该真的执行了")
 	}
 }
 

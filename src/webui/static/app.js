@@ -48,8 +48,11 @@ const el = {
   wsNewName: $("ws-new-name"),
   title: $("title"),
   badgeModel: $("badge-model"),
+  badgeModelName: $("badge-model-name"),
   badgeEffort: $("badge-effort"),
+  badgeEffortLevel: $("badge-effort-level"),
   badgeQuiet: $("badge-quiet"),
+  badgeQuietMode: $("badge-quiet-mode"),
   mode: $("mode"),
   conn: $("conn"),
   connText: $("conn-text"),
@@ -67,6 +70,8 @@ const el = {
   attachments: $("attachments"),
   file: $("file"),
   hint: $("composer-hint"),
+  statusLine: $("turn-status"),
+  statusText: $("turn-status-text"),
   send: $("send"),
   cancel: $("cancel"),
   approval: $("approval"),
@@ -91,6 +96,7 @@ const el = {
   cfgEffort: $("cfg-effort"),
   cfgFetch: $("cfg-fetch"),
   cfgModels: $("cfg-models"),
+  cfgSwitch: $("cfg-switch"),
   cfgError: $("cfg-error"),
   cfgPath: $("cfg-path"),
   cfgSave: $("cfg-save"),
@@ -106,6 +112,10 @@ const el = {
   confirmCancel: $("confirm-cancel"),
 };
 
+// 一次拉多少条历史。几百条一次渲染要 160ms（markdown 解析是大头），
+// 白屏卡在那儿就不像"切会话"了。先给最近这么多，往上翻再要更早的
+const HISTORY_PAGE = 60;
+
 const state = {
   // 当前工作区（服务端算出来的 id）
   workspaceId: null,
@@ -113,6 +123,9 @@ const state = {
   workspaces: [],
   sessionId: null,
   running: false,
+  // statusText 是输入框上方那行"现在在干什么"（连接模型 / 思考中 / 执行 bash…）。
+  // 空串表示这一行收起来了——闲着的时候不该还挂着一句"思考中"
+  statusText: "",
   // status 是服务端给的会话状态（running / waiting / done / idle），
   // 拉快照时更新；接排队消息时用它判断"上一轮是不是正常跑完了"
   status: "idle",
@@ -124,6 +137,13 @@ const state = {
   everConnected: false,
   // 当前这一轮的 DOM 槽位。收到 started 时重建，done/error 时清空
   turn: null,
+  // historyLimit 是这次要拉多少条历史（0 表示全量）。切会话时给 HISTORY_PAGE，
+  // 点"加载更早"往上加——一次渲染几百条 markdown 会卡住主线程
+  historyLimit: HISTORY_PAGE,
+  // historyTotal 不再需要：服务端只告诉我们"上面还有没有"，不给条数
+  // （原始消息数和显示块数不是一个单位，相减会得到假数字）
+  // sessionTitles 是 id → 标题的缓存，只为"点下会话标题立刻变"，不用等 snapshot
+  sessionTitles: new Map(),
   // call_id → 那条工具调用的 DOM，结果回来按 id 对上
   calls: new Map(),
   // 正在等的确认：{id, prompted}
@@ -133,8 +153,7 @@ const state = {
   queue: [],
   // 附图，{mediaType, data, url}
   images: [],
-  // drafts 是每条会话自己的草稿：输入框里的字、附图、排队那几条。
-  // 界面只有一套 DOM，但内容必须按会话分开——不然在 A 里写了一半，切到 B 就看见 A 的字，
+  // drafts 是每条会话自己的草稿：输入框里的字、附图、排队那几条。  // 界面只有一套 DOM，但内容必须按会话分开——不然在 A 里写了一半，切到 B 就看见 A 的字，
   // 更糟的是 B 里一敲回车，把 A 的草稿发出去了
   drafts: new Map(),
   // quiet 是精简显示：只显示正文，思考过程和工具输出的内容都不显示。
@@ -323,7 +342,18 @@ function setRunning(running) {
   el.cancel.hidden = !running;
   el.send.disabled = running;
   el.hint.textContent = running ? "这一轮在跑：Enter 排进队里，点「中断」可以停下" : "";
+  // 停下来了就没有"进行中"可言：这一行跟着收掉，免得屏幕上一直挂着"思考中…"
+  if (!running) setStatus("");
   renderQueue();
+}
+
+// setStatus 换掉输入框上方那行状态。文案照抄终端底部那行（连接模型…、思考中…、
+// 回答中…、执行 某个工具…），两个界面看到的东西一致；传空就是收起来。
+// 它只说明"走到哪一步了"，所以模型一开口就换成下一句，不留在聊天记录里
+function setStatus(text) {
+  state.statusText = text || "";
+  el.statusText.textContent = state.statusText;
+  el.statusLine.hidden = !state.statusText;
 }
 
 // renderQueue 画排队那几条。每行带"取回"和"删除"两个按钮，
@@ -434,14 +464,18 @@ function renderRuntime(rt) {
 /* ---------------- 顶部信息 ---------------- */
 
 function applyMeta(meta) {
-  el.badgeModel.textContent = meta.model || "未配置";
-  el.badgeEffort.textContent = `思考 ${meta.effort || "默认"}`;
+  // 胶囊是"标签 + 值"两段，这里只换值那一段，标签和样式留给 HTML/CSS
+  el.badgeModelName.textContent = meta.model || "未配置";
+  el.badgeModel.title = `当前模型 ${meta.model || "（未配置）"}，点开改配置（也可以敲 /config）`;
+  el.badgeEffortLevel.textContent = meta.effort || "默认";
   // 默认档不发 reasoning_effort，标一下黄，一眼看出现在是不是特意调过
   el.badgeEffort.classList.toggle("on", (meta.effort || "默认") !== "默认");
   // 精简显示：开着时只显示正文
   state.quiet = meta.quiet !== false;
-  el.badgeQuiet.textContent = state.quiet ? "精简" : "详细";
+  el.badgeQuietMode.textContent = state.quiet ? "精简" : "详细";
   el.badgeQuiet.classList.toggle("on", !state.quiet);
+  // 这一枚是真开关，读屏软件按 aria-pressed 播报"已按下/未按下"才对得上
+  el.badgeQuiet.setAttribute("aria-pressed", state.quiet ? "true" : "false");
   el.mode.value = meta.mode;
 }
 
@@ -784,7 +818,11 @@ async function loadSessions() {
 // 圆点：进行中转圈、等待提问黄、完成绿、还没聊过灰
 function sessionRow(info) {
   const row = node("div", "session" + (info.id === state.sessionId ? " active" : ""));
+  // 选中态靠它来挪（markActiveSession），切会话时就不用重画整个列表
+  row.dataset.id = info.id;
   const status = info.status || "idle";
+  // 记下标题：点这条会话时标题得立刻变，不能等 snapshot 回来
+  if (info.title) state.sessionTitles.set(info.id, info.title);
 
   const main = node("button", "session-main");
   main.type = "button";
@@ -819,6 +857,8 @@ function clearSessionView() {
   state.sessionId = null;
   state.turn = null;
   state.calls.clear();
+  // 历史分页回到默认：不然切到别的工作区，第一条会话还带着上一条的 limit
+  state.historyLimit = HISTORY_PAGE;
   hideApproval();
   hideSuggest();
   setRunning(false);
@@ -962,7 +1002,22 @@ function renderHistory(snapshot) {
   el.chat.replaceChildren();
   if (!snapshot.messages || snapshot.messages.length === 0) {
     renderEmpty();
+    el.title.textContent = snapshot.title || snapshot.id;
     return;
+  }
+  // 只加载了尾部一段时，最上面放一个"加载更早"的入口。
+  // 不画这个的话，用户往上翻到顶就以为会话只有这么点内容了。
+  // 不显示条数：服务端算的是原始消息数，而这里一条 assistant 块可能合并了
+  // 好几次工具调用，两个数不是一个单位，给出数字反而会骗人
+  if (snapshot.has_more) {
+    const bar = node("button", "load-earlier", "加载更早的内容");
+    bar.type = "button";
+    bar.addEventListener("click", async () => {
+      bar.disabled = true;
+      bar.textContent = "加载中…";
+      await loadEarlier();
+    });
+    el.chat.append(bar);
   }
   snapshot.messages.forEach((m) => {
     if (m.role === "user") {
@@ -1176,6 +1231,10 @@ async function answerApproval(answer) {
       method: "POST",
       body: JSON.stringify({ id: a.id, ...answer }),
     });
+    // 答完立刻说清楚接下来会怎样，和终端那三句一致
+    if (!answer.allow) setStatus("已拒绝，等模型继续…");
+    else if (answer.always) setStatus(`已允许，本回合不再问 ${a.tool}…`);
+    else setStatus(`已允许，执行 ${a.tool}…`);
   } catch (err) {
     // 这一轮已经被中断了、或者别处已经答过：说一声就好，不用拦着
     notice(`确认没送出去：${err.message}`, true);
@@ -1195,11 +1254,23 @@ function handleEvent(ev) {
     case "ping":
       // 心跳只用来证明这条连接还活着，收到的时刻在 onmessage 里已经记过了
       break;
+    case "meta":
+      // 顶栏那几项都是全局开关：别的标签页（或 /mode、/quiet 命令）改过之后，
+      // 这边得当场跟着变——下拉框停在旧值上，看着就像"切了没生效"
+      if (ev.meta) {
+        const wasQuiet = state.quiet;
+        applyMeta(ev.meta);
+        // 显示方式变了：已经摆出来的思考和工具输出要换个样子，重画一遍历史
+        if (ev.meta.quiet !== wasQuiet) refresh();
+      }
+      break;
     case "started":
       // 先把上一轮的正文收尾（补渲染攒着的那点、去掉光标），再换新槽位
       endContent();
       state.turn = null;
-      if (ev.text) el.chat.append(userBubble(ev.text));
+      setStatus("连接模型…");
+      // 附图跟着这条一起挂进聊天记录：发出去之后就只剩这一份，输入区里的预览已经清掉了
+      if (ev.text || (ev.images && ev.images.length)) el.chat.append(userBubble(ev.text, ev.images));
       scrollToBottom();
       // 这一轮开始了：列表上的圆点要转起来
       loadSessions();
@@ -1207,23 +1278,31 @@ function handleEvent(ev) {
     case "step":
       // 新一轮请求模型：换一个槽位，上一轮的工具已经画完了
       state.turn = null;
+      // 第 2 轮起说明模型又回来接着干了（中间夹着一堆工具调用），说出来更清楚
+      if (ev.step > 1) setStatus(`第 ${ev.step} 轮`);
       break;
     case "reasoning":
       appendReasoning(ev.text || "");
+      // 精简显示下思考内容不摆，但这句"思考中…"照旧要有：
+      // 否则模型闷头想的时候界面上什么都没有，分不清是在想还是卡住了
+      setStatus("思考中…");
       break;
     case "content":
       appendContent(ev.text || "");
+      setStatus("回答中…");
       break;
     case "answer_end":
       endContent();
       break;
     case "tool_call":
       addToolCall(ev);
+      setStatus(`执行 ${ev.tool}…`);
       break;
     case "tool_result":
       finishToolCall(ev);
       // 工具跑完可能刚列了待办、起了后台任务，这两块立刻刷一次
       loadRuntime();
+      setStatus(state.calls.size > 0 ? `还有 ${state.calls.size} 个工具在跑…` : "等模型继续…");
       break;
     case "usage":
       if (ev.usage) applyUsage(ev.usage);
@@ -1231,12 +1310,15 @@ function handleEvent(ev) {
     case "approval":
       if (ev.approval) {
         showApproval(ev.approval);
+        // 模型正停在这儿等人点头，先把状态说清楚
+        setStatus("等待确认…");
         // 有确认要答：列表上这条会话该亮黄点
         loadSessions();
       }
       break;
     case "retry":
       notice(ev.text || "正在重试…");
+      setStatus("连接失败，正在重试…");
       break;
     case "compact":
       notice(ev.text || "上下文压缩");
@@ -1256,6 +1338,7 @@ function handleEvent(ev) {
         saveDraft();
         renderQueue();
         setRunning(true);
+        setStatus("连接模型…");
         sendPrompt(next.prompt, next.images);
       } else {
         loadSessions();
@@ -1337,15 +1420,40 @@ function subscribe(reconnect = false) {
 
 async function refresh() {
   if (!state.sessionId) return;
+  const id = state.sessionId;
   try {
-    const snapshot = await api(`/api/sessions/${state.sessionId}`);
+    const limit = state.historyLimit || 0;
+    const q = limit > 0 ? `?limit=${limit}` : "";
+    const snapshot = await api(`/api/sessions/${id}${q}`);
+    // 拉的过程中又切走了：这份是上一条的，别摆到新会话上
+    if (id !== state.sessionId) return;
     renderHistory(snapshot);
     setRunning(snapshot.running);
+    // 刚补齐历史（重连、切会话回来），不知道这一轮具体走到哪一步：先挂一句"运行中…"，
+    // 下一条事件到了会换成准确的（思考中 / 回答中 / 执行某个工具）
+    if (snapshot.running && !state.statusText) setStatus("运行中…");
     state.status = snapshot.status || (snapshot.running ? "running" : "idle");
     el.title.textContent = snapshot.title || snapshot.id;
   } catch (err) {
+    if (id !== state.sessionId) return;
     notice(`拉会话失败：${err.message}`, true);
   }
+}
+
+// loadEarlier 往上翻一页历史：把 limit 加大再拉一次。
+// 拉回来的是从尾部往前数的更多条，整个重画——历史不长的时候这样最省事，
+// 也不用管"插到哪一行前面"的偏移问题（插进去会让滚动位置跳）
+async function loadEarlier() {
+  if (!state.sessionId) return;
+  const id = state.sessionId;
+  const cur = state.historyLimit || 0;
+  state.historyLimit = cur === 0 ? HISTORY_PAGE * 3 : cur * 2;
+  const before = el.chat.scrollHeight - el.chat.scrollTop;
+  await refresh();
+  // 等的时候切到别的会话去了：这份滚动位置不属于它，别去动
+  if (id !== state.sessionId) return;
+  // 重画之后把视口拉回原来的位置，看着就是"上面多出了一些旧内容"，不是跳走了
+  el.chat.scrollTop = el.chat.scrollHeight - before;
 }
 
 // resumeQueueIfIdle 接上"切走期间跑完了"的排队：那一轮的 done 事件没推到这个页面，
@@ -1357,26 +1465,76 @@ function resumeQueueIfIdle() {
   saveDraft();
   renderQueue();
   setRunning(true);
+  setStatus("连接模型…");
   sendPrompt(next.prompt, next.images);
 }
 
+// openSession 切到某条会话。
+//
+// 关键顺序：先把界面切过去（标题、选中态、占位、SSE 连接），再去拉数据。
+// 以前是 await refresh() 之后才做别的，所以点一下要等"1.5MB 下载 + 160ms 渲染"
+// 才有任何变化——那就是"切会话非常延迟、没有丝滑感"的来源。
+// 现在点下去当场就有反馈：标题换成目标会话的、聊天区出现占位、连接同步建立，
+// 数据到了再填进去。
 async function openSession(id) {
   if (!id) return;
   // 切走之前把这一份草稿存到原会话名下，切回来还能接着写
   if (state.sessionId && state.sessionId !== id) saveDraft();
+
   state.sessionId = id;
   if (state.workspaceId) localStorage.setItem(`agent-dev.session.${state.workspaceId}`, id);
   state.calls.clear();
   state.turn = null;
+  setStatus("");
   hideApproval();
   hideSuggest();
   loadDraft(id);
-  await refresh();
+
+  // —— 从这里开始全部是同步的，点下去立刻就有反馈 ——
+  markActiveSession(id);
+  el.title.textContent = sessionTitle(id) || id;
+  showHistoryPlaceholder();
+  // 这一条的先要这么多，往上翻时再加
+  state.historyLimit = HISTORY_PAGE;
+
+  // SSE 不等 snapshot：它和拉历史是两件独立的事，并行着做
   subscribe();
+  // runtime（待办/后台任务）也并行，它和历史上互不依赖
+  loadRuntime();
+  try {
+    await refresh();
+  } catch {
+    // refresh 自己会把错误画出来，这里不用再喊一遍
+  }
   // 切走期间那一轮跑完了的话，排队那几条接着发（上面 refresh 拿到了最新状态）
   resumeQueueIfIdle();
+  // 列表的状态圆点可能变了（别的标签页在跑），静默刷新，不阻塞切换
   loadSessions();
-  loadRuntime();
+}
+
+// markActiveSession 只挪选中态，不重画整个列表。
+// 切会话时列表内容基本没变，重画一遍既没必要又会让侧栏闪一下
+function markActiveSession(id) {
+  el.sessions.querySelectorAll(".session").forEach((row) => {
+    const active = row.dataset.id === id;
+    row.classList.toggle("active", active);
+  });
+}
+
+// sessionTitle 从已经拿到的列表里取这条会话的标题，取不到就用 id。
+// 为的是"标题立刻变"，不用等 snapshot 回来
+function sessionTitle(id) {
+  const known = state.sessionTitles && state.sessionTitles.get(id);
+  return known || "";
+}
+
+// showHistoryPlaceholder 在聊天区放一个"正在加载历史"。它不是空状态：
+// 用户刚点了一条会话，看到"加载中"才确定点上了
+function showHistoryPlaceholder() {
+  el.chat.replaceChildren();
+  const box = node("div", "empty history-loading");
+  box.append(node("div", null, "正在加载历史…"));
+  el.chat.append(box);
 }
 
 async function newSession() {
@@ -1474,6 +1632,7 @@ async function submit() {
     return;
   }
   setRunning(true);
+  setStatus("连接模型…");
   sendPrompt(prompt, images);
 }
 
@@ -1757,9 +1916,45 @@ function applyConfigView(view) {
   el.cfgDelete.hidden = state.configMode !== "edit";
   el.cfgNew.hidden = state.configMode === "new";
   const models = view.models || [];
-  el.cfgPath.textContent = [view.cfg_path, models.length > 1 ? `共 ${models.length} 套：${models.join("、")}` : ""]
-    .filter(Boolean)
-    .join(" · ");
+  // 路径单独一行（它常很长），"有几套、能切到哪套"由上面那排按钮说，不再重复一遍
+  el.cfgPath.textContent = view.cfg_path || "";
+  renderConfigSwitch(view, models);
+}
+
+// renderConfigSwitch 把"已经配好的几套"摆成一排按钮：当前那套高亮且点不动，
+// 点别的就直接切过去。只有一套、或者在新增模式时整块藏起来——
+// 新增时"切到哪套"和"正在填一套新的"混在一起，容易让人以为保存会写进被点的那套
+function renderConfigSwitch(view, models) {
+  el.cfgSwitch.replaceChildren();
+  el.cfgSwitch.hidden = true;
+  if (state.configMode !== "edit" || models.length < 2) return;
+  const current = (state.configEditLabel || "").trim();
+  el.cfgSwitch.hidden = false;
+  el.cfgSwitch.append(node("div", "dialog-detail", `已配好 ${models.length} 套，点一下就切过去（下一轮生效）`));
+  const row = node("div", "cfg-model-list");
+  models.forEach((name) => {
+    const cur = name === current;
+    const btn = node("button", `btn btn-sm ${cur ? "btn-primary" : "btn-outline-secondary"}`, name);
+    btn.type = "button";
+    btn.disabled = cur;
+    btn.title = cur ? "现在用的就是这套" : `切到 ${name}`;
+    btn.addEventListener("click", () => switchModel(name));
+    row.append(btn);
+  });
+  el.cfgSwitch.append(row);
+}
+
+// switchModel 切到另一套已经配好的模型：写回配置由服务端做，回来只刷顶栏和表单。
+// 切完重新拉一遍表单，是因为上面那些输入框得换成新那套的值（不然看着像没切）
+async function switchModel(name) {
+  try {
+    const meta = await api("/api/model", { method: "POST", body: JSON.stringify({ model: name }) });
+    if (meta && meta.model) applyMeta(meta);
+    await openConfigDialog("edit");
+    notice(`已切到 ${name}`);
+  } catch (err) {
+    showConfigError(`切换失败：${err.message}`);
+  }
 }
 
 // fillSelect 把一组可选项填进下拉框，并选中 want 对应的那个
@@ -1970,6 +2165,7 @@ function bindEvents() {
   });
   el.cancel.addEventListener("click", async () => {
     if (!state.sessionId) return;
+    setStatus("正在中断…");
     try {
       await api(`/api/sessions/${state.sessionId}/cancel`, { method: "POST" });
     } catch (err) {
@@ -1990,11 +2186,9 @@ function bindEvents() {
   // 顶栏那两枚徽标点开就是配置表单：模型、思考强度都在里面改，
   // 省得为了换个档位去敲 /config
   for (const badge of [el.badgeModel, el.badgeEffort]) {
-    badge.style.cursor = "pointer";
-    badge.title = "点开改模型配置（也可以敲 /config）";
+    // title 和光标由 HTML/CSS 给（模型那枚的 title 里带当前模型名，在 applyMeta 里更新）
     badge.addEventListener("click", openConfigDialog);
   }
-  el.badgeQuiet.title = "显示方式：精简只显示正文；点一下切换（也可以敲 /quiet）";
   el.badgeQuiet.addEventListener("click", () => toggleQuiet(!state.quiet));
 
   // /config 表单：切类型时地址跟着换成该类型的内置地址（手填过的地址不动），

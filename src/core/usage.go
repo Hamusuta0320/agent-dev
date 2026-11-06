@@ -91,6 +91,12 @@ func (t *usageTracker) trackToolResult(call domain.ToolCall, content string) {
 	})
 }
 
+// retrackTools 换一套工具定义：跑到一半切了模式（比如切到只读），发出去的工具
+// 少了一截，工具那块的估算要跟着重算，不然上下文占用里它还按老的一份算
+func (t *usageTracker) retrackTools(specs []domain.ToolSpec) {
+	t.toolTokens = estimateToolSpecs(specs)
+}
+
 // newContextUsage 把响应里的 prompt tokens 当总数，按本地估算的比例拆成
 // 系统提示词、工具定义、对话消息三项，三项之和正好等于 PromptTokens。
 // 响应里没报用量时退化成纯估算，这时候 PromptTokens 也是估的。

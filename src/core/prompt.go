@@ -29,7 +29,8 @@ func systemPrompt(ctx domain.Ctx) string {
 	if shell := strings.TrimSpace(ctx.Shell); shell != "" {
 		fmt.Fprintf(&sb, "- Bash 工具实际用的 shell: %s\n", shell)
 	}
-	sb.WriteString(modeSection(ctx.Mode))
+	// 模式按"此刻"写：跑的过程中切了模式，下一步请求的系统提示词就跟着变
+	sb.WriteString(modeSection(ctx.CurrentMode()))
 	sb.WriteString(conventionSection(workdir))
 	if root, err := SkillsRoot(); err == nil {
 		sb.WriteString(skillSection(root))

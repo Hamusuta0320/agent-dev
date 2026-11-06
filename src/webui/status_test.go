@@ -226,7 +226,7 @@ func TestHTTPDeleteWorkspaceBusy(t *testing.T) {
 	if err := s.Start(m.Config(), "慢慢跑", nil); err != nil {
 		t.Fatalf("起一轮失败: %v", err)
 	}
-	defer s.Cancel()
+	defer stopSession(t, s)
 
 	if code, body := sendJSON(t, http.MethodDelete, srv.URL+"/api/workspaces/"+ws.Id, ""); code != http.StatusConflict {
 		t.Fatalf("跑着的时候该 409，实际 %d: %s", code, body)
@@ -309,17 +309,25 @@ func TestRuntimeTasksBelongToSession(t *testing.T) {
 	}
 }
 
-// parseTodos 认得整份清单，参数写坏时不清空原来的
+// 参数写坏时不能说成"清空"：ok=false 是"别动原来那份"，不是"清单空了"
 func TestParseTodos(t *testing.T) {
-	got := parseTodos(`{"todos":[{"content":"a","status":"pending"}]}`)
-	if len(got) != 1 || got[0].Content != "a" {
-		t.Fatalf("解析不对: %+v", got)
+	got, ok := tool.ParseTodoArgs(`{"todos":[{"content":"a","status":"pending"}]}`)
+	if !ok || len(got) != 1 || got[0].Content != "a" {
+		t.Fatalf("解析不对: %+v %v", got, ok)
 	}
-	if got := parseTodos(""); got != nil {
-		t.Fatalf("空参数该给 nil: %+v", got)
+	if _, ok := tool.ParseTodoArgs(""); ok {
+		t.Fatal("空参数该说解析不出来")
 	}
-	if got := parseTodos("{坏掉的"); got != nil {
-		t.Fatalf("坏参数该给 nil: %+v", got)
+	if _, ok := tool.ParseTodoArgs("{坏掉的"); ok {
+		t.Fatal("坏参数该说解析不出来")
+	}
+	if _, ok := tool.ParseTodoArgs(`{"intent":"只传了意图"}`); ok {
+		t.Fatal("没带 todos 字段该说解析不出来，不能当成清空")
+	}
+	// 显式空数组才是"清空清单"
+	got, ok = tool.ParseTodoArgs(`{"todos":[]}`)
+	if !ok || len(got) != 0 {
+		t.Fatalf("空数组该解析成空清单: %+v %v", got, ok)
 	}
 }
 

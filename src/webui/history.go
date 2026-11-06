@@ -40,13 +40,35 @@ const (
 	callIncomplete = "未完成"
 )
 
-// historyFromSession 把会话消息整理成前端要的块。
+// historyOptions 控制这份历史怎么裁给前端。
+//
+// 两个都不是"省事"，是实打实的性能问题：一条聊得久的会话 snapshot 有 1.5 MB，
+// 其中 43% 是工具输出——精简显示（默认开着）下那些内容前端根本不画。
+// 传过去再丢掉，白花的是下载、JSON 解析和主线程时间。
+type historyOptions struct {
+	// Limit 只取最近这么多条消息，0 表示全部。
+	// 一次切会话要渲染 300 条的话，光 markdown 解析就 160ms 白屏卡顿
+	Limit int
+	// Quiet 精简显示：工具输出和失败原因不回传（那边只画一行标题）
+	Quiet bool
+}
+
+// historyFromSession 把会话消息整理成前端要的块（全量、详细模式）。
 // 规则和 TUI 重开会话时打历史的那套一致：提问、思考、回答按顺序留下，
 // 工具结果挂到对应调用的下面；被摘要覆盖的老消息不再显示（它们已经并进摘要），
 // 摘要本身作为一条提示放在最前面。
 func historyFromSession(s *domain.Session) []message {
+	msgs, _ := historyFromSessionOpts(s, historyOptions{})
+	return msgs
+}
+
+// historyFromSessionOpts 是带裁剪的版本。
+// 第二个返回值说明"上面还有没有更早的"——注意原始消息数和显示块数不是一个单位
+// （工具结果会并进对应的 assistant 块），所以别拿它们相减算条数，
+// 想知道有没有更早的内容只有这一个可靠答案
+func historyFromSessionOpts(s *domain.Session, opt historyOptions) ([]message, bool) {
 	if s == nil {
-		return nil
+		return nil, false
 	}
 	out := make([]message, 0, len(s.Messages))
 	if summary := strings.TrimSpace(s.Summary); summary != "" {
@@ -57,15 +79,25 @@ func historyFromSession(s *domain.Session) []message {
 	}
 	start := min(max(s.SummaryUpTo, 0), len(s.Messages))
 
+	// 裁剪：只留尾部。原文是"从 start 开始的全部"，这里往前推
+	hasMore := false
+	if opt.Limit > 0 {
+		if keep := len(s.Messages) - opt.Limit; keep > start {
+			start = keep
+			hasMore = true
+		}
+	}
+	tail := s.Messages[start:]
+
 	// outputs 按 tool_call_id 攒起来，等回头往调用上挂
-	outputs := make(map[string]domain.SessionMessage, len(s.Messages))
-	for _, m := range s.Messages[start:] {
+	outputs := make(map[string]domain.SessionMessage, len(tail))
+	for _, m := range tail {
 		if m.Role == domain.RoleTool && m.ToolCallId != "" {
 			outputs[m.ToolCallId] = m
 		}
 	}
 
-	for _, m := range s.Messages[start:] {
+	for _, m := range tail {
 		switch m.Role {
 		case domain.RoleUser:
 			if m.Content == "" && len(m.Images) == 0 {
@@ -83,7 +115,7 @@ func historyFromSession(s *domain.Session) []message {
 			}
 			calls := make([]call, 0, len(m.ToolCalls))
 			for _, c := range m.ToolCalls {
-				calls = append(calls, callFromHistory(c, outputs[c.Id]))
+				calls = append(calls, callFromHistory(c, outputs[c.Id], opt.Quiet))
 			}
 			out = append(out, message{
 				Role:      "assistant",
@@ -95,12 +127,15 @@ func historyFromSession(s *domain.Session) []message {
 		}
 		// tool 消息本身不再单独输出：内容已经挂到上面那次调用上了
 	}
-	return out
+	return out, hasMore
 }
 
 // callFromHistory 把一次调用和它的结果拼成前端那份。
-// 没有结果（那一轮被打断）标成"未完成"，和 TUI 里补的那句一样
-func callFromHistory(c domain.ToolCall, result domain.SessionMessage) call {
+// 没有结果（那一轮被打断）标成"未完成"，和 TUI 里补的那句一样。
+//
+// quiet 时只留一行标题要用的东西（名字、意图、状态）：输出正文和失败原因是
+// 点开才看得见的内容，精简模式下前端连 body 都不建，回传了也是纯浪费
+func callFromHistory(c domain.ToolCall, result domain.SessionMessage, quiet bool) call {
 	out := call{
 		ID:     c.Id,
 		Name:   c.Name,
@@ -111,15 +146,20 @@ func callFromHistory(c domain.ToolCall, result domain.SessionMessage) call {
 	if result.Role == "" {
 		return out
 	}
-	out.Output = result.Content
 	if failedContent(result.Content) {
 		out.Status = callFailed
+	} else {
+		out.Status = callSuccess
+	}
+	if quiet {
+		return out
+	}
+	out.Output = result.Content
+	if out.Status == callFailed {
 		// 失败原因就是结果开头那句，剥掉前缀摆到前端单独一行
 		out.FailMsg = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(
 			result.Content, "执行失败: "), "错误: "))
-		return out
 	}
-	out.Status = callSuccess
 	return out
 }
 

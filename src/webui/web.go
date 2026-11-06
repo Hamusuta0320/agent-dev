@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -416,7 +417,25 @@ func (m *Manager) setMode(mode domain.Mode) error {
 		s.mode = mode.String()
 		s.mu.Unlock()
 	}
+	// 别处开着的页面也得跟着变：一个标签页切了模式，另一个标签页的下拉框要是
+	// 还停在旧值上，用户会以为切换没生效（甚至照着旧值又切回去）
+	m.broadcastMeta()
 	return nil
+}
+
+// broadcastMeta 把顶栏那几项全局开关的现状推给每一个打开着的会话。
+// 这些开关是全局的（工作模式、精简显示），不是某条会话的私有状态
+func (m *Manager) broadcastMeta() {
+	m.mu.Lock()
+	sessions := make([]*Session, 0, len(m.live))
+	for _, s := range m.live {
+		sessions = append(sessions, s)
+	}
+	m.mu.Unlock()
+	info := m.meta()
+	for _, s := range sessions {
+		s.notifyMeta(info)
+	}
 }
 
 // setQuiet 切"精简显示"：写回配置文件，内存里也跟着换。
@@ -428,6 +447,8 @@ func (m *Manager) setQuiet(quiet bool) error {
 	m.mu.Lock()
 	m.cfg.Quiet = &quiet
 	m.mu.Unlock()
+	// 和切模式一样：别的标签页的「精简/详细」徽标也得当场翻过来
+	m.broadcastMeta()
 	return nil
 }
 
@@ -623,6 +644,8 @@ func (m *Manager) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("GET /api/meta", m.handleMeta())
 	mux.Handle("POST /api/mode", m.handleSetMode())
+	// 换当前用哪套模型：和模式一样是全局的，不需要会话 id
+	mux.Handle("POST /api/model", m.handleSetModel())
 	// 显示方式（精简 / 详细）：全局开关，不需要会话 id —— 顶栏徽标在没开会话时也能点
 	mux.Handle("POST /api/quiet", m.handleSetQuiet())
 	// 命令表 + 技能名：前端打 / 时的补全候选就从这儿来
@@ -791,6 +814,32 @@ func (m *Manager) handleSetQuiet() http.Handler {
 	})
 }
 
+// handleSetModel 切当前用哪套模型。和 /api/mode、/api/quiet 一样是全局开关，
+// 不需要会话 id：顶栏那枚徽标在还没开会话时也该能点。
+// 名字认法和 /model 命令一致（名字、模型名、唯一前缀都认）
+func (m *Manager) handleSetModel() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Model string `json:"model"`
+		}
+		if err := decodeBody(w, r, &req); err != nil {
+			fail(w, http.StatusBadRequest, "%v", err)
+			return
+		}
+		target, err := m.switchModel(req.Model)
+		// 认不出是哪一套（或者一套都没配）：这次切换整个没发生，配置不动
+		if target.Label() == "" {
+			fail(w, http.StatusBadRequest, "%v", err)
+			return
+		}
+		if err != nil {
+			fail(w, http.StatusInternalServerError, "切换已生效，但写回配置失败: %v", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, m.meta())
+	})
+}
+
 // workspaceFrom 从查询参数 ws 里取工作区。没带就用默认工作区，
 // 带了但认不出时返回 false 并回 404——不同工作区的会话不该串在一起
 func (m *Manager) workspaceFrom(w http.ResponseWriter, r *http.Request) (*workspace, bool) {
@@ -926,13 +975,27 @@ func (m *Manager) handleCreate() http.Handler {
 	})
 }
 
+// handleSnapshot 给前端一份会话现状。
+//
+// ?limit=N 只返回最近 N 条消息：切会话时前端默认就要这么多，几百条一次渲染
+// 要 160ms，白屏卡着不像"切过去"倒像"卡住了"。往上滚再看更早的。
+// 工具输出按当前 quiet 配置裁：精简显示下前端不画那些内容，回传几百 KB 纯浪费。
 func (m *Manager) handleSnapshot() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s, ok := m.sessionFrom(w, r)
 		if !ok {
 			return
 		}
-		writeJSON(w, http.StatusOK, s.snapshot())
+		opt := historyOptions{Quiet: m.Config().QuietMode()}
+		if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+			n, err := strconv.Atoi(raw)
+			if err != nil || n < 0 {
+				fail(w, http.StatusBadRequest, "limit 要是个非负整数，收到的是 %q", raw)
+				return
+			}
+			opt.Limit = n
+		}
+		writeJSON(w, http.StatusOK, s.snapshotWith(opt))
 	})
 }
 

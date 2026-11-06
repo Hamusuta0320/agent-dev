@@ -31,6 +31,10 @@ const (
 	// "这条连接还活着"。SSE 的注释式心跳（": ping"）够用但前端看不见，
 	// 断网后 EventSource 要等 TCP 超时才知道，这里让它有个明确的信号
 	kindPing = "ping"
+	// kindMeta 是顶栏那几项全局开关（工作模式）变了。core 不会发它，是管理端
+	// 改完配置后推给所有打开着的页面的：一个标签页切了模式，别的标签页、
+	// 别的会话也该当场变过来，不然那个下拉框停在旧值上，看着就像没生效
+	kindMeta = "meta"
 )
 
 // event 是 SSE 里推给浏览器的一条消息。所有字段都带 omitempty，
@@ -44,6 +48,10 @@ type event struct {
 	// Text 是流式增量、回答全文、工具输出，或者一句给人的说明（重试、压缩、标题）
 	Text string `json:"text,omitempty"`
 
+	// Images 只有 started 事件带：这次提问附的图，转成 data: 地址直接给前端当 src。
+	// 聊天记录里那条提问要显示缩略图，不然图发出去就从界面上消失了
+	Images []string `json:"images,omitempty"`
+
 	// 工具调用相关，只有 tool_call / tool_result 会带
 	Tool      string `json:"tool,omitempty"`
 	Intent    string `json:"intent,omitempty"`
@@ -56,6 +64,9 @@ type event struct {
 
 	Usage    *usage    `json:"usage,omitempty"`
 	Approval *approval `json:"approval,omitempty"`
+	// Meta 只有 meta 事件带：顶栏那几项（模型、思考强度、精简显示、工作模式）
+	// 被别处改过时，把新的整份推过来，前端直接照着刷
+	Meta *meta `json:"meta,omitempty"`
 }
 
 // usage 是上下文占用，数字给前端自己排版，百分比也算好一起带过去
@@ -188,9 +199,11 @@ func errorEvent(seq int, err error, cancelled bool) *event {
 }
 
 // startedEvent 在一轮开始时发出去，带上这次提问本身：
-// 前端据此把用户那条消息挂进对话（多个标签页同时看同一会话时也能看到）
-func startedEvent(seq int, prompt string) *event {
-	return &event{Seq: seq, Kind: kindStarted, Text: prompt}
+// 前端据此把用户那条消息挂进对话（多个标签页同时看同一会话时也能看到）。
+// images 是这份提问附的图（data: 地址），聊天记录里要当场就能看到，
+// 不能等到刷新页面走 snapshot 才显示
+func startedEvent(seq int, prompt string, images []domain.Image) *event {
+	return &event{Seq: seq, Kind: kindStarted, Text: prompt, Images: imageURLs(images)}
 }
 
 // pingEvent 是心跳。At 是服务端时间，前端只拿来显示"最后一次见到服务端"，

@@ -210,21 +210,87 @@ body { overflow: hidden; }
   font-weight: 600;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.badges { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
-.badges .badge { font-weight: 400; }
-.badges #badge-effort.on { color: #d9c26a; }
-.badges select { width: auto; font-size: 12px; }
+.badges { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+
+/* 顶栏右侧那几枚胶囊：模型 / 思考强度 / 显示方式。
+   以前模型和思考强度用的是 Bootstrap badge（实底灰），显示方式是个 <button>——
+   浏览器给按钮补了一圈默认边框，三枚并排形状就不齐了。现在统一成 .chip：
+   半透明底 + 发丝边、等高、等圆角，能点的那几枚补上悬停和键盘 focus 反馈 */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 10px;
+  border: 1px solid rgba(255, 255, 255, .10);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, .045);
+  color: var(--bs-secondary-color);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+  transition: background-color .15s ease, border-color .15s ease, color .15s ease;
+}
+button.chip { cursor: pointer; }
+button.chip:hover {
+  background: rgba(255, 255, 255, .10);
+  border-color: rgba(255, 255, 255, .18);
+  color: var(--bs-body-color);
+}
+button.chip:active { background: rgba(255, 255, 255, .06); }
+button.chip:focus-visible { outline: 2px solid rgba(108, 192, 139, .55); outline-offset: 1px; }
+
+/* 一枚胶囊分两段：前面压暗的是"这是什么"，后面提亮的是值。
+   值最长给个上限，模型名太长时截断，不至于把整条顶栏顶变形 */
+.chip-label { color: var(--bs-tertiary-color); font-size: 11px; }
+.chip-value {
+  max-width: 148px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--bs-body-color);
+}
+/* 模型名是英文标识，等宽字体排出来更整齐，也方便和配置里那串对照 */
+.chip-model .chip-value {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  letter-spacing: .2px;
+}
+
+/* 不是默认值才点亮：思考强度调过、显示方式切到详细，都走这一套强调色。
+   颜色沿用连接状态那组（黄=有改动），整个顶栏的语义保持一致 */
+.chip.on { border-color: rgba(217, 194, 106, .45); background: rgba(217, 194, 106, .12); }
+.chip.on .chip-label, .chip.on .chip-value { color: #d9c26a; }
+button.chip.on:hover { background: rgba(217, 194, 106, .20); border-color: rgba(217, 194, 106, .6); }
+
+/* 下拉框和连接状态跟胶囊同一行，高度对齐到 24px，底边才在一条线上 */
+.badges select {
+  width: auto;
+  height: 24px;
+  padding: 0 24px 0 8px;
+  border-radius: 8px;
+  font-size: 12px;
+}
+
+/* 窗口一窄，顶栏右边这排比标题更缺地方：先把胶囊里的标签让出去，
+   只留值（模型名、档位、显示方式），一排仍然放得下，也不会把标题挤没 */
+@media (max-width: 900px) {
+  .chip-label { display: none; }
+  .chip { padding: 0 9px; }
+  .chip-value { max-width: 108px; }
+}
 
 /* 连接状态：绿=通着、黄=正在连、红=断了 */
 .conn {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  height: 24px;
+  padding: 0 9px;
   font-size: 12px;
   color: var(--bs-secondary-color);
   border: 1px solid var(--bs-border-color);
   border-radius: 999px;
-  padding: 2px 9px;
   white-space: nowrap;
 }
 .conn-dot {
@@ -265,6 +331,26 @@ body { overflow: hidden; }
   gap: 14px;
 }
 .empty { color: var(--bs-tertiary-color); margin: auto; text-align: center; line-height: 2; }
+/* 切会话时的"正在加载历史…"：和空状态一个位置（居中），但语气不同——
+   这是"马上就来"，不是"这里什么都没有" */
+.history-loading { color: var(--bs-secondary-color); }
+/* 只加载了尾部一段时最上面那条"加载更早"。做成一条虚线小条，
+   不抢内容的位置，也明确告诉人上面还有东西 */
+.load-earlier {
+  align-self: center;
+  border: 1px dashed var(--bs-border-color);
+  border-radius: 999px;
+  background: none;
+  color: var(--bs-tertiary-color);
+  font-size: 12px;
+  padding: 4px 14px;
+  cursor: pointer;
+}
+.load-earlier:hover:not(:disabled) {
+  color: var(--bs-body-color);
+  border-color: var(--bs-secondary-color);
+}
+.load-earlier:disabled { cursor: default; opacity: .6; }
 
 .msg { display: flex; flex-direction: column; gap: 6px; max-width: 100%; }
 .msg-user { align-items: flex-end; }
@@ -638,6 +724,25 @@ body { overflow: hidden; }
 
 .composer-actions { display: flex; align-items: center; gap: 8px; }
 .composer-actions .file { cursor: pointer; }
+/* 跑任务时贴在输入框上方的那行状态：细圆环转着 + 一句"现在在干什么"。
+   和终端底部那行（spinner + status）是同一个意思；闲着时 [hidden] 整行收掉 */
+.turn-status {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  color: #d9c26a;
+}
+.turn-status[hidden] { display: none; }
+.turn-status-dot {
+  flex: none;
+  width: 10px;
+  height: 10px;
+  border: 1.4px solid rgba(217, 194, 106, .25);
+  border-top-color: #d9c26a;
+  border-radius: 50%;
+  animation: spin .8s linear infinite;
+}
 .hint {
   flex: 1 1 auto;
   font-size: 12px;
@@ -657,9 +762,11 @@ body { overflow: hidden; }
   overflow: auto;
 }
 .dialog::backdrop { background: rgba(8, 9, 12, .72); }
-.dialog-box { padding: 16px 18px; display: flex; flex-direction: column; gap: 10px; }
+.dialog-box { padding: 18px 20px; display: flex; flex-direction: column; gap: 12px; }
 .dialog-head { display: flex; align-items: center; gap: 8px; }
-.dialog-title { font-weight: 600; }
+/* 弹窗里的按钮一律不折行：中文按钮在窄容器里会被逐字竖着排，最难看（"删除这套"竖排就是这么来的） */
+.dialog .btn { white-space: nowrap; }
+.dialog-title { font-weight: 600; font-size: 15px; }
 .dialog-detail { font-size: 13px; color: var(--bs-secondary-color); margin: 0; }
 .dialog-target {
   font: 13px/1.6 "Cascadia Mono", Consolas, monospace;
@@ -670,7 +777,15 @@ body { overflow: hidden; }
   white-space: pre-wrap;
 }
 .dialog-error { font-size: 12px; color: #e06c75; }
-.dialog-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+.dialog-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  /* 实在放不下时整体换行，而不是把每个按钮的字挤成两行 */
+  flex-wrap: wrap;
+  row-gap: 8px;
+}
 
 /* ---------- 文件夹选择器 ---------- */
 .ws-picker { width: min(760px, 94vw); }
@@ -783,25 +898,71 @@ body { overflow: hidden; }
 }
 
 /* ---------- /config 表单 ---------- */
-.cfg-dialog { width: min(620px, 94vw); }
+/* 比别的弹窗宽一点：左边一列标签 + 右边输入框，还要放得下"拉列表"和底部四个按钮。
+   620px 时按钮全被压成两行（"删除这套"竖着排），所以放宽到 760 */
+.cfg-dialog { width: min(760px, 94vw); }
+/* 标题右边那枚"当前这套"：靠右对齐、不抢标题的位置 */
+.cfg-current { margin-left: auto; }
+.cfg-intro { line-height: 1.7; }
 .cfg-grid {
   display: grid;
-  grid-template-columns: 6.5em 1fr;
+  grid-template-columns: 7.5em 1fr;
   align-items: center;
-  gap: 8px 12px;
+  gap: 10px 14px;
+  /* 上下留一点气：贴太近时每一行都像连在一起 */
+  padding: 4px 0;
 }
-.cfg-grid > label { font-size: 13px; color: var(--bs-secondary-color); }
-.cfg-model-row { display: flex; gap: 6px; }
-.cfg-model-row .form-control { flex: 1 1 auto; }
+.cfg-grid > label {
+  font-size: 13px;
+  color: var(--bs-secondary-color);
+  /* 标签别被窄屏挤成两行 */
+  white-space: nowrap;
+}
+.cfg-model-row { display: flex; gap: 8px; align-items: center; }
+.cfg-model-row .form-control { flex: 1 1 auto; min-width: 0; }
+/* 按钮里的字一律不换行：中文按钮在窄容器里会被逐字折行，看着最丑 */
+.cfg-dialog .btn { white-space: nowrap; }
 .cfg-models { display: flex; flex-direction: column; gap: 6px; }
 /* display:flex 会盖掉 hidden 自带的 display:none，得显式关掉 */
 .cfg-models[hidden] { display: none; }
+/* 已配好的几套：和"拉列表"那块同一套排布，按钮横排、放不下就换行 */
+.cfg-switch { display: flex; flex-direction: column; gap: 6px; }
+.cfg-switch[hidden] { display: none; }
 .cfg-model-list {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
   max-height: 180px;
   overflow: auto;
+}
+/* 底部：路径一行（常很长，单独给一行，挤在按钮旁边会把按钮压扁），
+   按钮一行，分左右两组 */
+.cfg-footer {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 4px;
+  border-top: 1px solid var(--bs-border-color);
+  margin-top: 2px;
+}
+.cfg-path {
+  font-size: 12px;
+  color: var(--bs-tertiary-color);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  word-break: break-all;
+  line-height: 1.5;
+  /* 路径一行、共 N 套一行：靠 textContent 里的 \n 分行 */
+  white-space: pre-line;
+}
+.cfg-actions { display: flex; align-items: center; gap: 8px; }
+/* 把"新增/删除"和"取消/保存"隔开：左边管这套配置，右边管这个对话框 */
+.cfg-actions-gap { flex: 1 1 auto; }
+/* 窄屏：标签挪到输入框上面，一列排下来，不然右边只剩一点点宽度 */
+@media (max-width: 560px) {
+  .cfg-grid { grid-template-columns: 1fr; gap: 4px; }
+  .cfg-grid > label { margin-top: 6px; }
+  .cfg-actions { flex-wrap: wrap; }
+  .cfg-actions-gap { display: none; }
 }
 
 /* 窄屏：侧栏收窄，只留名字 */

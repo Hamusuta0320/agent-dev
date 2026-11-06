@@ -120,6 +120,26 @@ func TodoList(items []TodoItem) string {
 	return strings.TrimRight(sb.String(), "\n")
 }
 
+// ParseTodoArgs 从 TodoWrite 的原始参数里取出整份清单。
+// ok 为 false 表示参数写坏了、或者压根没带 todos 字段，这时调用方应当保留
+// 原来那份清单：模型偶尔只传个 intent，静默清掉会让界面上的进度凭空消失。
+// 显式传空数组才是清空，那时 ok 为 true、清单为空。
+//
+// 和 Execute 里的校验不同，这里只做"能不能读出整份清单"，不管内容合不合法：
+// 界面上显示的清单要看的是模型当时想表达什么，不是它有没有按规定写
+func ParseTodoArgs(raw string) (items []TodoItem, ok bool) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, false
+	}
+	var args struct {
+		Todos *[]TodoItem `json:"todos"`
+	}
+	if err := json.Unmarshal([]byte(raw), &args); err != nil || args.Todos == nil {
+		return nil, false
+	}
+	return *args.Todos, true
+}
+
 // parseTodoStatus 把模型给的状态收成三种。留空算 pending；
 // 认不出的直接报错——静默当成 pending 会让清单看起来莫名其妙
 func parseTodoStatus(s string) (string, error) {

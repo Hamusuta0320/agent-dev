@@ -119,7 +119,8 @@ func helpText() string {
 		"  地址和密钥填好后能直接从接口拉模型列表，点一个就填进去",
 		"  显示方式默认是精简（只显示正文），顶栏的「精简」徽标或 /quiet 可以切；",
 		"  关掉之后思考过程折叠显示、工具输出点开能看",
-		"  /model 不带参数列出配置好的几套；/model add 新增一套，/model del 名字 删掉一套",
+		"  /model 不带参数列出配置好的几套；顶栏的「模型」徽标点开，已配好的几套点一下就切；",
+		"  /model add 新增一套，/model del 名字 删掉一套",
 		"  左侧能切工作区、加工作区；会话列表点一下就能切换",
 		"  写文件、执行命令前会弹出来问一次（完全授权模式不问）",
 	)
@@ -379,9 +380,34 @@ func (m *Manager) commandModel(arg string) commandReply {
 		return textReply("%s", strings.Join(lines, "\n"))
 	}
 
-	target, ok := config.PickModel(models, arg)
+	target, err := m.switchModel(arg)
+	if target.Label() == "" {
+		return textReply("%v；/model 看看有哪些", err)
+	}
+	out := commandReply{Kind: replyText, Text: fmt.Sprintf("已切到模型 %s  %s", target.Label(), modelHint(target))}
+	if err != nil {
+		out.Text += "\n（没能写回配置：" + err.Error() + "，本次运行仍然生效）"
+	}
+	meta := m.meta()
+	out.Meta = &meta
+	return out
+}
+
+// switchModel 把"当前用哪套"换成 name 指的那套：内存和配置文件一起改，
+// 顺手推给开着的其它页面——切模型是全局的，另一个标签页的徽标不能还停在旧名字上。
+//
+// 认不出 name（或一套都没配）时返回零值配置 + 错误；写回配置文件失败时照常返回
+// 切到的那套 + 错误——内存里已经生效了，调用方提示一句就行，不该当成切换失败
+func (m *Manager) switchModel(name string) (config.ModelConfig, error) {
+	cfg := m.Config()
+	// 拷贝一份再改：AvailableModels 返回的就是配置里那个数组，不能就地改
+	models := append([]config.ModelConfig(nil), cfg.AvailableModels()...)
+	if len(models) == 0 {
+		return config.ModelConfig{}, errString("还没配模型：/config 填一套；/model add 也能新增一套")
+	}
+	target, ok := config.PickModel(models, name)
 	if !ok {
-		return textReply("没有叫 %q 的模型；/model 看看有哪些", arg)
+		return config.ModelConfig{}, errString(fmt.Sprintf("没有叫 %q 的模型", strings.TrimSpace(name)))
 	}
 	// 内存里也把名字补齐，和写回文件的那份保持一致
 	for i := range models {
@@ -390,13 +416,11 @@ func (m *Manager) commandModel(arg string) commandReply {
 		}
 	}
 	m.setCurrentModel(models, target.Label())
-	out := commandReply{Kind: replyText, Text: fmt.Sprintf("已切到模型 %s  %s", target.Label(), modelHint(target))}
+	m.broadcastMeta()
 	if err := config.SaveModels(m.cfgPath, models, target.Label()); err != nil {
-		out.Text += "\n（没能写回配置：" + err.Error() + "，本次运行仍然生效）"
+		return target, err
 	}
-	meta := m.meta()
-	out.Meta = &meta
-	return out
+	return target, nil
 }
 
 // commandDeleteModel 处理 /model del：带名字就回一个要确认的回复，

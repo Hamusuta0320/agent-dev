@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
-	"strings"
 	"sync"
 
 	"hamusuta/agent-dev/src/config"
@@ -56,10 +55,6 @@ type Session struct {
 	// core 那边阻塞在 Reply 上，这里收到回答再写进去
 	approvals    map[string]chan domain.ApprovalAnswer
 	nextApproval int
-
-	// promptSaved 记着本轮提问有没有落过盘。snapshot 在运行中读磁盘那份，
-	// 得保证磁盘上已经有这条提问
-	promptSaved bool
 
 	// outcome 是最近一次跑完的结果：outcomeDone / outcomeFailed / outcomeCancelled，
 	// 空串表示还没跑过。列表上那个圆点的颜色就靠它（见 Status）
@@ -174,17 +169,6 @@ func (s *Session) Mode() domain.Mode {
 	return parseMode(s.mode)
 }
 
-// SetMode 换工作模式，并写回配置文件
-func (s *Session) SetMode(path string, mode domain.Mode) error {
-	if err := config.SaveMode(path, mode.String()); err != nil {
-		return err
-	}
-	s.mu.Lock()
-	s.mode = mode.String()
-	s.mu.Unlock()
-	return nil
-}
-
 // parseMode 把配置里的字符串认成模式，认不出按默认的"编辑需授权"
 func parseMode(s string) domain.Mode {
 	mode, err := domain.ParseMode(s)
@@ -258,7 +242,11 @@ func (s *Session) emit(ev domain.Event) {
 	// 待办清单：TodoWrite 每次传上来的都是整份，照着替换就行。
 	// core 那边记的是进程级的一份，多开几个会话会串，所以这里按会话留一份
 	if ev.Kind == domain.EventToolCall && ev.Call.Name == "TodoWrite" {
-		s.todos = parseTodos(ev.Call.Arguments)
+		// 参数写坏了（模型偶尔只传个 intent）就保留原来那份：
+		// 静默清空会让界面上的进度凭空消失，像是活白干了
+		if items, ok := tool.ParseTodoArgs(ev.Call.Arguments); ok {
+			s.todos = items
+		}
 	}
 	// 后台任务归属：Bash 用 background=true 起的任务，结果里带着 task_id=task_N
 	if ev.Kind == domain.EventToolResult {
@@ -268,35 +256,46 @@ func (s *Session) emit(ev domain.Event) {
 			}
 		}
 	}
-	// 第一轮开始时把"提问已经记进会话"这件事落到磁盘：core 在发第一个 EventStep 之前
-	// 已经 AppendUser 过了。这样运行中刷新页面能看见本次提问（snapshot 读的是磁盘那份）。
+	// 跑一步就落一步盘。界面上刷新页面、切走再切回来，读的都是磁盘那份
+	// （见 snapshot：内存里这份 core 正在追加，读它会撞上并发写），
+	// 所以只有落到盘上才看得见。挑这三个事件是因为它们都发生在"某段内容刚刚记进会话"之后
+	// （core 里 Append 排在 emit 前面）：
+	//   EventStep       —— 新一步的开头，上一步的 assistant 和工具结果都齐了
+	//   EventAnswerEnd  —— 这一轮模型回答刚记进会话
+	//   EventToolResult —— 一次工具结果刚记进会话
+	// 流式的 EventContent / EventReasoning 一个 token 一条，绝不能落盘
+	//
 	// 写文件放在锁外，别把订阅者挡在后面
-	savePrompt := ev.Kind == domain.EventStep && ev.Step == 1 && !s.promptSaved
-	if savePrompt {
-		s.promptSaved = true
-	}
+	save := shouldSave(ev.Kind)
 	s.mu.Unlock()
 
-	if savePrompt {
+	if save {
 		// 这里就在 core 的 goroutine 里，data 此刻不会被别处写，序列化是安全的
 		_ = s.store.Save(s.data)
 	}
 	s.broadcast(e)
 }
 
-// parseTodos 从 TodoWrite 的参数里取出整份清单。参数不是合法 JSON（模型偶尔会写坏）
-// 时返回 nil 并且不动原来的清单——宁可显示旧的，也别把清单清空
-func parseTodos(raw string) []tool.TodoItem {
-	if strings.TrimSpace(raw) == "" {
-		return nil
+// notifyMeta 把顶栏那几项全局开关的现状推给连着的浏览器。
+// 工作模式是全局的：一个标签页切了，别的标签页、别的会话里开着的页面也得当场变过来，
+// 不然那边的下拉框还停在旧值上，看着就像"切了没生效"
+func (s *Session) notifyMeta(m meta) {
+	s.mu.Lock()
+	s.seq++
+	seq := s.seq
+	s.mu.Unlock()
+	s.broadcast(&event{Seq: seq, Kind: kindMeta, Meta: &m})
+}
+
+// shouldSave 判断这个事件要不要顺手把会话落盘。
+// 只在这个回合"刚有一条消息进会话"的边界上存，不按 token 存
+func shouldSave(kind domain.EventKind) bool {
+	switch kind {
+	case domain.EventStep, domain.EventAnswerEnd, domain.EventToolResult:
+		return true
+	default:
+		return false
 	}
-	var args struct {
-		Todos []tool.TodoItem `json:"todos"`
-	}
-	if err := json.Unmarshal([]byte(raw), &args); err != nil {
-		return nil
-	}
-	return args.Todos
 }
 
 // taskIdRe 从工具结果里认出后台任务的 id：Bash 用 background=true 启动时
@@ -380,7 +379,6 @@ func (s *Session) Start(cfg config.GlobalConfig, prompt string, images []domain.
 	s.running = true
 	s.cancel = cancel
 	s.seq = 0
-	s.promptSaved = false
 	// 新一轮开始了，上一轮的结果作废：列表上这会儿该显示"进行中"
 	s.outcome = ""
 	s.approvals = make(map[string]chan domain.ApprovalAnswer)
@@ -388,23 +386,27 @@ func (s *Session) Start(cfg config.GlobalConfig, prompt string, images []domain.
 	data := s.data
 	s.mu.Unlock()
 
-	s.broadcast(startedEvent(0, prompt))
+	s.broadcast(startedEvent(0, prompt, images))
 
 	go func() {
 		defer cancel()
 		runErr := core.Loop(domain.Ctx{
-			Prompt:       prompt,
-			Images:       images,
-			Provider:     p,
-			Tools:        tool.ForMode(mode),
+			Prompt:   prompt,
+			Images:   images,
+			Provider: p,
+			// 递全套工具，让 core 按"此刻"的模式现筛：顶栏那个下拉框在这一轮跑着的
+			// 时候也能点，切到只读要当场把写类工具收回去，切到完全授权要当场放开
+			Tools:        tool.All(),
 			Context:      ctx,
 			WorkDir:      data.WorkDir,
 			Shell:        tool.ShellName(),
 			Session:      data,
 			ContextLimit: mc.Limit(),
 			Mode:         mode,
-			MaxSteps:     cfg.Steps(),
-			Emit:         s.emit,
+			// 模式随时可能被切（/api/mode 会改 s.mode），core 每一步都回来问一次
+			ModeLive: s.Mode,
+			MaxSteps: cfg.Steps(),
+			Emit:     s.emit,
 		})
 		// 出错也要落盘：前面几轮的工具调用不能白跑
 		saveErr := s.store.Save(data)
@@ -450,17 +452,31 @@ type snapshot struct {
 	Mode      string    `json:"mode"`
 	Messages  []message `json:"messages"`
 	UpdatedAt string    `json:"updated_at,omitempty"`
+	// HasMore 说明上面还有没发过来的更早内容（被 limit 裁掉了）。
+	// 不给条数：原始消息数和显示块数不是一个单位，给个数字反而会骗人
+	HasMore bool `json:"has_more,omitempty"`
 }
 
+// snapshot 默认给全量历史、详细内容（终端界面、测试都走这条）
 func (s *Session) snapshot() snapshot {
+	return s.snapshotWith(historyOptions{})
+}
+
+// snapshotWith 按 opt 裁剪历史。浏览器切会话时传 limit：一次渲染几百条的
+// markdown 要 160ms，白屏卡在那儿，体感就是"切个会话怎么这么慢"
+func (s *Session) snapshotWith(opt historyOptions) snapshot {
 	s.mu.Lock()
 	data, running, mode, store, status := s.data, s.running, s.mode, s.store, s.statusLocked()
 	s.mu.Unlock()
 
 	// 跑着的时候不读内存里那份：core 正在往它上面追加消息，读它就是在和数据竞争
 	// （TUI 那边靠"运行中只读自己攒的流式缓冲"避开了这件事）。
-	// 磁盘上是上一轮结束时的完整版本，而且 Start 里的第一次事件就把本次提问写进去了，
-	// 所以运行中刷新页面能看到完整历史加这条提问；本轮正在产生的增量由实时事件流负责画
+	//
+	// 磁盘那份现在是每走一步就同步过的（见 emit 里的 shouldSave）：提问、每一步的
+	// 回答、每一次工具结果，一进会话就落盘。所以运行中刷新页面、切走再切回来，
+	// 能看到已经跑完的那些步，而不是只剩一句提问。
+	// 只有"这一轮正在流式输出、还没结束的那半句"要靠实时事件流画——那半句本来
+	// 就还没记进会话，丢了也不算丢历史
 	view := data
 	if running {
 		if saved, err := store.Load(data.Id); err == nil {
@@ -468,6 +484,7 @@ func (s *Session) snapshot() snapshot {
 		}
 	}
 
+	msgs, hasMore := historyFromSessionOpts(view, opt)
 	out := snapshot{
 		Id:       view.Id,
 		Title:    view.Title,
@@ -475,7 +492,8 @@ func (s *Session) snapshot() snapshot {
 		Running:  running,
 		Status:   status,
 		Mode:     mode,
-		Messages: historyFromSession(view),
+		Messages: msgs,
+		HasMore:  hasMore,
 	}
 	if !view.UpdatedAt.IsZero() {
 		out.UpdatedAt = view.UpdatedAt.Format("2006-01-02 15:04:05")

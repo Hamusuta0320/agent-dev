@@ -597,6 +597,87 @@ func TestHTTPSetMode(t *testing.T) {
 	}
 }
 
+// 切模式要当场推给连着的页面：别的标签页顶栏那个下拉框不能停在旧值上，
+// 停在旧值上会让人以为切换没生效（甚至照着旧值又切回去）
+func TestSetModeNotifiesPages(t *testing.T) {
+	m := newTestManager(t)
+	s := m.create()
+	ch, stop := s.Subscribe()
+	defer stop()
+
+	if err := m.setMode(domain.ModeAsk); err != nil {
+		t.Fatalf("切模式失败: %v", err)
+	}
+	evs := collect(t, ch, func(evs []event) bool {
+		return len(evs) > 0
+	})
+	if len(evs) == 0 {
+		t.Fatal("切模式之后该推一条事件过来")
+	}
+	if evs[0].Kind != kindMeta {
+		t.Fatalf("推过来的不该是 %q", evs[0].Kind)
+	}
+	if evs[0].Meta == nil || evs[0].Meta.Mode != "ask" || evs[0].Meta.ModeLabel != "编辑需授权" {
+		t.Fatalf("meta 里的模式不对: %+v", evs[0].Meta)
+	}
+}
+
+// 换模型：POST /api/model 把当前那套换掉，配置文件要写回，
+// 顶栏拿到的 meta 也跟着换（前端靠它刷徽标），别的标签页也得收到推进来的一条
+func TestHTTPSetModel(t *testing.T) {
+	m := newTestManager(t)
+	// 再配一套：切换这事得有两套才有意义
+	m.setConfig(addOtherModel(m.Config()))
+	srv := newTestServer(t, m)
+	s := m.create()
+	ch, stop := s.Subscribe()
+	defer stop()
+
+	code, body := sendJSON(t, http.MethodPost, srv.URL+"/api/model", `{"model":"另一套"}`)
+	if code != http.StatusOK {
+		t.Fatalf("切模型该 200，实际 %d: %s", code, body)
+	}
+	var got meta
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("回包不是合法的 meta: %v: %s", err, body)
+	}
+	if got.Model != "另一套" {
+		t.Fatalf("回包的 meta 还是旧模型: %+v", got)
+	}
+	if cur, err := m.Config().CurrentModel(); err != nil || cur.Label() != "另一套" {
+		t.Fatalf("内存里没切过去: %+v %v", cur, err)
+	}
+	data, err := os.ReadFile(m.cfgPath)
+	if err != nil {
+		t.Fatalf("配置没写回: %v", err)
+	}
+	if !strings.Contains(string(data), "Current: 另一套") {
+		t.Fatalf("写回的配置里 Current 不对:\n%s", data)
+	}
+	// 开着的页面（另一个标签页）也得知道换了：SSE 上要有一条 meta
+	evs := collect(t, ch, func(evs []event) bool { return len(evs) > 0 })
+	if len(evs) == 0 || evs[0].Kind != kindMeta || evs[0].Meta == nil || evs[0].Meta.Model != "另一套" {
+		t.Fatalf("切模型之后该推一条新模型的 meta: %+v", evs)
+	}
+
+	// 认不出的名字挡住，当前那套不动
+	if code, _ := sendJSON(t, http.MethodPost, srv.URL+"/api/model", `{"model":"不存在"}`); code != http.StatusBadRequest {
+		t.Fatalf("认不出的模型该 400，实际 %d", code)
+	}
+	if cur, err := m.Config().CurrentModel(); err != nil || cur.Label() != "另一套" {
+		t.Fatalf("认不出的模型不该改掉当前那套: %+v %v", cur, err)
+	}
+}
+
+// addOtherModel 在当前配置上再挂一套假模型，给"得有两套才谈得上切换"的用例用
+func addOtherModel(cfg config.GlobalConfig) config.GlobalConfig {
+	cfg.Models = append(cfg.Models, config.ModelConfig{
+		Name: "另一套", Type: "OpenAI", ApiUrl: "https://example.invalid",
+		ApiKey: "sk-test", Model: "other-model", ContextLimit: 128000,
+	})
+	return cfg
+}
+
 // 消息发出去之后，SSE 那条连接真的收到事件流
 func TestHTTPEvents(t *testing.T) {
 	m := newTestManager(t)

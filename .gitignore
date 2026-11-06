@@ -1,3 +1,14 @@
 **/config.yaml
 .agent/
 cli.exe
+# restart-web.ps1 起的服务把输出写这两个文件里；.old 是它换版本时留的回滚底
+agent-dev.out.log
+agent-dev.err.log
+# -Detach 起的后台实例把自己的输出记在这儿（WMI 起的进程没有 stdout）
+agent-dev.restart.log
+agent-dev.restart.log.err
+*.exe.old
+*.exe.new
+# 换版本时按时间戳留的备份，以及回滚时隔离出来的坏版本
+*.exe.*.bak
+*.exe.*.broken

@@ -51,7 +51,11 @@ func Run(ctx domain.Ctx, session *domain.Session) (string, error) {
 	if maxSteps <= 0 {
 		maxSteps = config.DefaultMaxSteps
 	}
-	specs := buildSpecs(ctx.Tools)
+	// 工具清单和模式都按"此刻"算，不认开跑那一下的快照：浏览器那边能在这一轮
+	// 跑着的时候切模式，切到完全授权就不该再逐次确认，切到只读就该当场把写类工具收回去
+	mode := ctx.CurrentMode()
+	tools := tool.FilterByMode(ctx.Tools, mode)
+	specs := buildSpecs(tools)
 	// 上下文占用的估算：工具定义整轮不变只算一次，对话消息每追加一条累加一条，
 	// 不用每次请求都把整段历史从头数一遍
 	usage := newUsageTracker(specs, session)
@@ -67,10 +71,24 @@ func Run(ctx domain.Ctx, session *domain.Session) (string, error) {
 	// 压缩之后这一轮的占用已经变了，要清零重新估
 	lastPrompt := 0
 
+	// notices 是本回合追加在对话末尾的一次性提醒（目前是待办自检）。
+	// 只发给模型、不写进会话历史：写进去会被落盘，下次恢复会话又冒出来一遍
+	var notices []domain.AIChatMessage
+	// todoChecked 表示这一回合已经催过一次核销，无论如何不再催第二次，免得打转
+	todoChecked := false
+
 	for step := range maxSteps {
 		// 用户中途按了 Ctrl+C 就别再要下一轮了，赶紧把这一轮结束掉
 		if err := cancelErr(ctx.Context); err != nil {
 			return "", err
+		}
+		// 模式在跑的过程中被切了：工具定义和系统提示词都照着新模式重来。
+		// 只读模式把写类工具从这一请求里摘掉，模型下一步就拿不到它们了
+		if now := ctx.CurrentMode(); now != mode {
+			mode = now
+			tools = tool.FilterByMode(ctx.Tools, mode)
+			specs = buildSpecs(tools)
+			usage.retrackTools(specs)
 		}
 		emit(domain.Event{Kind: domain.EventStep, Step: step + 1})
 		onDelta := func(ev domain.StreamEvent) {
@@ -100,6 +118,7 @@ func Run(ctx domain.Ctx, session *domain.Session) (string, error) {
 		// 后台任务的通知追加在最后：前面 [系统提示词 + 历史] 的字节保持稳定，
 		// 只有这条新内容需要模型重新处理
 		messages = append(messages, taskMessages()...)
+		messages = append(messages, notices...)
 		res, err := ctx.Provider.Chat(ctx.Context, messages, specs, onDelta)
 		if err != nil {
 			return "", err
@@ -107,25 +126,42 @@ func Run(ctx domain.Ctx, session *domain.Session) (string, error) {
 		if res.Usage.PromptTokens > 0 {
 			lastPrompt = res.Usage.PromptTokens
 		}
-		// 上下文占用：总数用响应里的 usage，三项分项按本地估算的比例拆
+		// 上下文占用：总数用响应里的 usage，三项分项按本地估算的比例拆。
+		// 这一条要在 AppendAssistant 之前发：它报的是"请求模型时占了多少"，
+		// 不能把刚生成的这条回答算进去
 		emit(domain.Event{
 			Kind:  domain.EventUsage,
 			Step:  step + 1,
 			Usage: newContextUsage(messages[0].Content, usage.toolTokens, usage.messageTokens, res.Usage, ctx.ContextLimit),
 		})
-		emit(domain.Event{Kind: domain.EventAnswerEnd, Step: step + 1, Text: res.Content})
+		// 先记进会话，再上报 AnswerEnd。
+		// 顺序有讲究：界面那边（webui）收到 AnswerEnd 会顺手把会话落一次盘，
+		// 好让人刷新页面就能看到这段回答。要是先 emit 再 Append，落盘时这条还没进会话，
+		// 存下去的永远是"上一步"，刷新看到的进度就总差一截
 		session.AppendAssistant(res.Content, res.Reasoning, res.ToolCalls)
 		usage.trackAssistant(res.Content, res.ToolCalls)
+		emit(domain.Event{Kind: domain.EventAnswerEnd, Step: step + 1, Text: res.Content})
 		if len(res.ToolCalls) == 0 {
+			// 收尾自检：清单里还有没做完的条目，说明模型跳过了核销，
+			// 补一条提醒再跑一轮。一次提问只催一次；催完还不改就直接收
+			// （step+1 < maxSteps 是护栏：就剩最后一步时别再要一轮，
+			// 否则循环直接撞上"工具调用超过 N 轮"那个刹车）
+			if !todoChecked && step+1 < maxSteps {
+				if n := todoNotice(session); len(n) > 0 {
+					todoChecked = true
+					notices = append(notices, n...)
+					continue
+				}
+			}
 			return res.Content, nil
 		}
 		for i := 0; i < len(res.ToolCalls); {
 			// 只读的工具互不干扰，连着的一批可以并行跑；会改磁盘的（Write / Edit / Bash）
 			// 单独一批一个跑，免得两个写操作撞在同一个文件上
 			batch := res.ToolCalls[i : i+1]
-			if parallelizable(ctx, res.ToolCalls[i]) {
+			if parallelizable(tools, res.ToolCalls[i]) {
 				j := i + 1
-				for j < len(res.ToolCalls) && parallelizable(ctx, res.ToolCalls[j]) {
+				for j < len(res.ToolCalls) && parallelizable(tools, res.ToolCalls[j]) {
 					j++
 				}
 				batch = res.ToolCalls[i:j]
@@ -144,9 +180,13 @@ func Run(ctx domain.Ctx, session *domain.Session) (string, error) {
 				})
 			}
 
-			outcomes := runCalls(ctx, emit, always, batch)
+			outcomes := runCalls(ctx, tools, emit, always, batch)
 
 			for k, call := range batch {
+				// 和 AnswerEnd 一个道理：先 Append 再 emit，
+				// 界面收到这条时落盘才带得上这个工具结果
+				session.AppendToolResult(call, outcomes[k].out)
+				usage.trackToolResult(call, outcomes[k].out)
 				emit(domain.Event{
 					Kind:      domain.EventToolResult,
 					Text:      outcomes[k].out,
@@ -156,8 +196,6 @@ func Run(ctx domain.Ctx, session *domain.Session) (string, error) {
 					StartedAt: started[k],
 					Elapsed:   outcomes[k].elapsed,
 				})
-				session.AppendToolResult(call, outcomes[k].out)
-				usage.trackToolResult(call, outcomes[k].out)
 			}
 			i += len(batch)
 
@@ -185,19 +223,19 @@ type toolOutcome struct {
 
 // parallelizable 说明这次调用能不能和同批的其它调用一起跑：工具存在，而且不改磁盘。
 // 不存在的工具、只读模式下被挡住的工具都会走单独的一批，报错的先后顺序和以前一样。
-func parallelizable(ctx domain.Ctx, call domain.ToolCall) bool {
-	t, ok := ctx.Tools[call.Name]
+func parallelizable(tools map[string]domain.Tool, call domain.ToolCall) bool {
+	t, ok := tools[call.Name]
 	return ok && !t.Mutating()
 }
 
 // runCalls 跑一批调用：只有一个就当场跑，多个就并发跑，结果按原顺序返回。
 // 需要用户确认的写操作永远不会进多调用的批次（都是单独一批），
 // 所以 always 这张 map 在并发时只有读，不会打架。
-func runCalls(ctx domain.Ctx, emit domain.EmitFunc, always map[string]bool, calls []domain.ToolCall) []toolOutcome {
+func runCalls(ctx domain.Ctx, tools map[string]domain.Tool, emit domain.EmitFunc, always map[string]bool, calls []domain.ToolCall) []toolOutcome {
 	outcomes := make([]toolOutcome, len(calls))
 	one := func(i int) {
 		started := time.Now()
-		out, status, reason := executeTool(ctx, emit, always, calls[i])
+		out, status, reason := executeTool(ctx, tools, emit, always, calls[i])
 		outcomes[i] = toolOutcome{out: out, status: status, reason: reason, elapsed: time.Since(started)}
 	}
 	if len(calls) == 1 {
@@ -219,8 +257,9 @@ func runCalls(ctx domain.Ctx, emit domain.EmitFunc, always map[string]bool, call
 
 // executeTool 执行一次工具调用，返回给模型的输出、调用状态和失败原因。
 // 输出里也带上失败原因，模型看到才知道下一步该怎么改。
-func executeTool(ctx domain.Ctx, emit domain.EmitFunc, always map[string]bool, call domain.ToolCall) (string, domain.ToolStatus, string) {
-	t, ok := ctx.Tools[call.Name]
+// tools 是这一步按模式筛好的那份，mode 每次现取——用户在跑的过程中切了模式要当场生效。
+func executeTool(ctx domain.Ctx, tools map[string]domain.Tool, emit domain.EmitFunc, always map[string]bool, call domain.ToolCall) (string, domain.ToolStatus, string) {
+	t, ok := tools[call.Name]
 	if !ok {
 		reason := "不存在的工具 " + call.Name
 		return "错误: " + reason, domain.ToolStatusFailed, reason
@@ -229,7 +268,7 @@ func executeTool(ctx domain.Ctx, emit domain.EmitFunc, always map[string]bool, c
 		return "错误: " + reason, domain.ToolStatusFailed, reason
 	}
 	// 只读模式下写类工具本该没发出去，漏进来也在这儿兜住
-	if ctx.Mode == domain.ModeReadOnly && t.Mutating() {
+	if ctx.CurrentMode() == domain.ModeReadOnly && t.Mutating() {
 		reason := "当前是只读模式，不能用会改动磁盘的工具 " + call.Name
 		return "错误: " + reason, domain.ToolStatusFailed, reason
 	}
@@ -257,8 +296,9 @@ func cancelErr(c context.Context) error {
 
 // approved 判断这次调用能不能往下走。"编辑需授权"模式下会发一个 EventApproval
 // 停下来等用户选，用户拒绝时返回 false 和给模型看的原因。
+// 模式现取不认快照：用户在这轮跑着的时候切到"完全授权"，接下来就不该再问了。
 func approved(ctx domain.Ctx, emit domain.EmitFunc, always map[string]bool, call domain.ToolCall, t domain.Tool) (bool, string) {
-	if ctx.Mode != domain.ModeAsk || !t.Mutating() || always[call.Name] {
+	if ctx.CurrentMode() != domain.ModeAsk || !t.Mutating() || always[call.Name] {
 		return true, ""
 	}
 	if emit == nil {

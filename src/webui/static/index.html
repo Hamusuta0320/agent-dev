@@ -34,11 +34,21 @@
   <main class="main">
     <header class="topbar">
       <div class="title" id="title">新会话</div>
+      <!-- 三枚胶囊：模型、思考强度点开改配置，显示方式点一下切换。
+           标签压暗、值提亮，三段结构一样，右边那串值排一条线上能直接扫 -->
       <div class="badges">
-        <span class="badge rounded-pill text-bg-secondary" id="badge-model" title="当前模型">—</span>
-        <span class="badge rounded-pill text-bg-secondary" id="badge-effort" title="思考强度">—</span>
-        <button type="button" class="badge rounded-pill text-bg-secondary" id="badge-quiet"
-                title="显示方式：精简只显示正文；点一下切换（也可以敲 /quiet）">—</button>
+        <button type="button" class="chip chip-model" id="badge-model"
+                title="当前模型，点开改配置（也可以敲 /config）">
+          <span class="chip-label">模型</span><span class="chip-value" id="badge-model-name">—</span>
+        </button>
+        <button type="button" class="chip" id="badge-effort"
+                title="思考强度，点开改配置（也可以敲 /effort）">
+          <span class="chip-label">思考</span><span class="chip-value" id="badge-effort-level">—</span>
+        </button>
+        <button type="button" class="chip" id="badge-quiet" aria-pressed="true"
+                title="显示方式：精简只显示正文；点一下切换（也可以敲 /quiet）">
+          <span class="chip-label">显示</span><span class="chip-value" id="badge-quiet-mode">—</span>
+        </button>
         <select id="mode" class="form-select form-select-sm" title="工作模式">
           <option value="read">只读</option>
           <option value="ask">编辑需授权</option>
@@ -60,6 +70,12 @@
     <div class="chat" id="chat"></div>
 
     <form class="composer" id="composer">
+      <!-- 跑着的时候这一行说明现在走到哪一步了：连接模型 / 思考中 / 回答中 / 执行某个工具。
+           终端里贴在输入框上方那行状态就是它；闲着时整行收掉 -->
+      <div class="turn-status" id="turn-status" hidden>
+        <span class="turn-status-dot"></span>
+        <span class="turn-status-text" id="turn-status-text"></span>
+      </div>
       <!-- 输入框上方那几块，自上而下：待办清单 → 后台任务 → 排队消息。
            放在同一个容器里排，各自带底色，谁是谁一眼分得清，不会挤成一片 -->
       <div class="runtime" id="runtime" hidden>
@@ -150,12 +166,15 @@
   <div class="dialog-box">
     <div class="dialog-head">
       <span class="dialog-title">模型配置</span>
-      <span class="dialog-detail" id="cfg-title"></span>
+      <span class="dialog-detail cfg-current" id="cfg-title"></span>
     </div>
-    <p class="dialog-detail">
+    <p class="dialog-detail cfg-intro">
       保存后写回配置文件，下一轮请求就用新的，不用重启。接口地址留空用该类型内置的。
       名字留空就用模型名；新增时当前用的那套不会跟着换。
     </p>
+    <!-- 已配好的几套摆一排：点一下就切过去（配置文件里 Current 跟着改），
+         不用为了换一套模型重新填一遍表单 -->
+    <div class="cfg-switch" id="cfg-switch" hidden></div>
     <div class="cfg-grid">
       <label for="cfg-name">名字</label>
       <input id="cfg-name" class="form-control form-control-sm" autocomplete="off" spellcheck="false"
@@ -174,9 +193,7 @@
       <label for="cfg-model">模型名</label>
       <div class="cfg-model-row">
         <input id="cfg-model" class="form-control form-control-sm" autocomplete="off" spellcheck="false">
-        <button type="button" id="cfg-fetch" class="btn btn-outline-secondary btn-sm" title="按上面的地址和密钥从接口拉列表">
-          拉列表
-        </button>
+        <button type="button" id="cfg-fetch" class="btn btn-outline-secondary btn-sm" title="按上面的地址和密钥从接口拉列表">拉列表</button>
       </div>
 
       <label for="cfg-limit">上下文上限</label>
@@ -188,12 +205,17 @@
     </div>
     <div class="cfg-models" id="cfg-models" hidden></div>
     <div class="dialog-error" id="cfg-error" hidden></div>
-    <div class="dialog-actions">
-      <span class="dialog-detail me-auto" id="cfg-path"></span>
-      <button type="button" id="cfg-new" class="btn btn-outline-secondary btn-sm">＋ 新增一套</button>
-      <button type="button" id="cfg-delete" class="btn btn-outline-danger btn-sm">删除这套</button>
-      <button type="button" id="cfg-cancel" class="btn btn-outline-secondary btn-sm">取消</button>
-      <button type="button" id="cfg-save" class="btn btn-primary btn-sm">保存</button>
+    <!-- 底部：路径单独一行（它常很长，挤在按钮旁边会把按钮压成两行），
+         按钮再分左右两组——管这套配置的、和管这个对话框的 -->
+    <div class="cfg-footer">
+      <div class="cfg-path" id="cfg-path"></div>
+      <div class="cfg-actions">
+        <button type="button" id="cfg-new" class="btn btn-outline-secondary btn-sm">＋ 新增一套</button>
+        <button type="button" id="cfg-delete" class="btn btn-outline-danger btn-sm">删除这套</button>
+        <span class="cfg-actions-gap"></span>
+        <button type="button" id="cfg-cancel" class="btn btn-outline-secondary btn-sm">取消</button>
+        <button type="button" id="cfg-save" class="btn btn-primary btn-sm">保存</button>
+      </div>
     </div>
   </div>
 </dialog>

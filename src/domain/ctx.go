@@ -19,9 +19,22 @@ type Ctx struct {
 	Emit EmitFunc
 	// ContextLimit 是模型的上下文窗口（token），只用来算"上下文已用百分比"；0 表示不知道
 	ContextLimit int
-	// Mode 是工作模式：只读时没有写类工具，编辑需授权时每次写操作都要先问用户
+	// Mode 是工作模式：只读时没有写类工具，编辑需授权时每次写操作都要先问用户。
+	// 这是开跑那一刻的快照
 	Mode Mode
+	// ModeLive 返回"此刻"的工作模式。浏览器那边在这一轮跑着的时候也能点顶栏切模式，
+	// 有它就每一步都回来问一次，切了当场生效；为空（终端界面、测试）就用 Mode 那个快照
+	ModeLive func() Mode
 	// MaxSteps 是一次提问里最多跑多少轮工具调用，用来给模型死循环刹车；
 	// 0 表示用 config.DefaultMaxSteps
 	MaxSteps int
+}
+
+// CurrentMode 取此刻生效的工作模式：有 ModeLive 就问它，没有就用 Mode 这个快照。
+// 浏览器界面上跑着也能切模式，要是不问一遍，切换就得等到下一轮才见效
+func (c Ctx) CurrentMode() Mode {
+	if c.ModeLive != nil {
+		return c.ModeLive()
+	}
+	return c.Mode
 }

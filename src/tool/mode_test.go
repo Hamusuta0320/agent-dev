@@ -34,6 +34,27 @@ func TestForMode(t *testing.T) {
 	}
 }
 
+// All 不分模式给全套：浏览器那边把它递给 core，由 core 按"此刻"的模式现筛。
+// FilterByMode 是那一层筛子，口径和 ForMode 一致
+func TestAllAndFilterByMode(t *testing.T) {
+	if got := All(); len(got) != len(Tools) {
+		t.Fatalf("All 应该给全套工具，实际 %v", names(got))
+	}
+	// 非只读模式原样返回、不做拷贝：每一步都筛一遍，不该白白复制一张表
+	for _, mode := range []domain.Mode{domain.ModeAsk, domain.ModeFull} {
+		if got := FilterByMode(Tools, mode); len(got) != len(Tools) {
+			t.Fatalf("%v 下不该筛掉工具，实际 %v", mode, names(got))
+		}
+	}
+	readOnly := FilterByMode(Tools, domain.ModeReadOnly)
+	if _, ok := readOnly["Write"]; ok {
+		t.Fatalf("只读模式不该有 Write: %v", names(readOnly))
+	}
+	if _, ok := Tools["Write"]; !ok {
+		t.Fatal("筛出来的那份不该动到原来那张表：之后切回完全授权还要用它")
+	}
+}
+
 // 每个工具都要老实交代自己改不改磁盘，授权流程全靠它
 func TestMutatingFlags(t *testing.T) {
 	want := map[string]bool{

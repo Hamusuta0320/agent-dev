@@ -68,15 +68,28 @@ var Tools map[string]domain.Tool = map[string]domain.Tool{
 // （Write / Edit / Bash）整个摘掉，模型拿不到就调不了，比事后拦更干净。
 // 其它模式全给，"编辑需授权"由 core 在执行前逐个确认。
 func ForMode(mode domain.Mode) map[string]domain.Tool {
+	return FilterByMode(Tools, mode)
+}
+
+// FilterByMode 按模式筛一套工具，口径和 ForMode 一样。
+// core 在跑的每一步都拿它把 ctx.Tools 重新筛一遍——浏览器那边能在这轮跑着的时候
+// 切到只读，光在开跑时筛一次的话，切了也得等下一轮才收得回去
+func FilterByMode(tools map[string]domain.Tool, mode domain.Mode) map[string]domain.Tool {
 	if mode != domain.ModeReadOnly {
-		return Tools
+		return tools
 	}
-	out := make(map[string]domain.Tool, len(Tools))
-	for name, t := range Tools {
+	out := make(map[string]domain.Tool, len(tools))
+	for name, t := range tools {
 		if t.Mutating() {
 			continue
 		}
 		out[name] = t
 	}
 	return out
+}
+
+// All 返回全套工具，不分模式。浏览器界面那一侧递的就是它：core 会按"此刻"的模式
+// 现筛，所以从只读切到完全授权时，写类工具也在手里，下一步就能发出去
+func All() map[string]domain.Tool {
+	return Tools
 }
