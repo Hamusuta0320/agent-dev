@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"hamusuta/agent-dev/src/config"
@@ -40,13 +43,46 @@ const (
 )
 
 // defaultCfgPath 是配置文件的默认位置：用户目录下的 .agent-dev/config.yaml，跟工作区无关。
-// 取不到用户目录时退回当前目录的 config.yaml，好歹能启动
+// 取不到用户目录时退回当前目录的 config.yaml，好歹能启动。
+//
+// 跑测试时一律落到临时目录。这个值只有测试（newModel 造界面）会用到——主流程拿到
+// 配置路径后会显式盖掉它——而一个忘了把 cfgPath 指到临时目录的用例撞上真实家目录，
+// 就会把用户的真配置写坏。2026-11-06 就这么坏过一次：那次是在一个不含
+// testmain_test.go 的干净检出里跑的测试，进程级的家目录防护根本不在。
 func defaultCfgPath() string {
+	if runningUnderTest() {
+		return testCfgPath()
+	}
 	path, err := config.DefaultPath()
 	if err != nil {
 		return "config.yaml"
 	}
 	return path
+}
+
+// runningUnderTest 报告当前二进制是不是 go test 编出来的。
+// 认标准库 testing 注册的那个 -test.v 标志：跨平台，不依赖文件名后缀
+func runningUnderTest() bool {
+	return flag.Lookup("test.v") != nil
+}
+
+// testCfgPath 是测试里用的配置路径，整个测试进程共用一份临时文件
+// （和 TestMain 把家目录挪到临时目录的效果一样）。用 Once 是因为一个进程里
+// 会造很多个界面，每次新建临时目录既浪费又互相看不到对方写的配置
+var testCfgOnce struct {
+	once sync.Once
+	path string
+}
+
+func testCfgPath() string {
+	testCfgOnce.once.Do(func() {
+		dir, err := os.MkdirTemp("", "agent-dev-test-cfg")
+		if err != nil {
+			return
+		}
+		testCfgOnce.path = filepath.Join(dir, "config.yaml")
+	})
+	return testCfgOnce.path
 }
 
 // 运行中在底部预览几行，结束后打到上方历史区；太长的内容只显示开头几行，
