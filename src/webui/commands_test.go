@@ -551,6 +551,45 @@ func TestCommandModelDelAsksConfirm(t *testing.T) {
 	}
 }
 
+// 改的不是当前那套时，密钥留空是沿用**那套**的密钥，不能拿当前那套的盖上去
+func TestSaveConfigKeepsEditedKey(t *testing.T) {
+	m := newTestManager(t)
+	m.setConfig(config.GlobalConfig{Models: []config.ModelConfig{
+		{Name: "快", Type: "DeepSeek", ApiUrl: "https://a", ApiKey: "sk-A", Model: "model-a"},
+		{Name: "稳", Type: "OpenAI", ApiUrl: "https://b", ApiKey: "sk-B", Model: "model-b"},
+	}, Current: "快"})
+
+	// 改"稳"，密钥留空：sk-B 该保住
+	if _, err := m.saveConfig(configRequest{
+		EditLabel: "稳", Name: "稳", Type: "OpenAI", ApiUrl: "https://b",
+		ApiKey: "", Model: "model-b",
+	}); err != nil {
+		t.Fatalf("保存失败: %v", err)
+	}
+	models := m.Config().AvailableModels()
+	if len(models) != 2 {
+		t.Fatalf("该还是两套: %+v", models)
+	}
+	if models[1].ApiKey != "sk-B" {
+		t.Fatalf("改的那套的密钥被覆盖了: %+v", models[1])
+	}
+	if models[0].ApiKey != "sk-A" {
+		t.Fatalf("当前那套的密钥不该动: %+v", models[0])
+	}
+
+	// 改当前那套时，密钥留空照样沿用当前那套的
+	if _, err := m.saveConfig(configRequest{
+		EditLabel: "快", Name: "快", Type: "DeepSeek", ApiUrl: "https://a",
+		ApiKey: "", Model: "model-a",
+	}); err != nil {
+		t.Fatalf("保存失败: %v", err)
+	}
+	models = m.Config().AvailableModels()
+	if models[0].ApiKey != "sk-A" {
+		t.Fatalf("改当前那套时密钥该沿用: %+v", models[0])
+	}
+}
+
 // 删一套：删的是当前那套就改用剩下的第一套
 func TestDeleteConfigModel(t *testing.T) {
 	m := newTestManager(t)

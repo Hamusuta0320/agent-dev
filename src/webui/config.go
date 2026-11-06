@@ -138,6 +138,16 @@ func (m *Manager) saveConfig(req configRequest) (configView, error) {
 	models := cfg.AvailableModels()
 	current := cfg.Current
 
+	// 正在改的是哪一套：新增时是空串
+	label := strings.TrimSpace(req.EditLabel)
+	if label == "" && !req.New {
+		if cur, err := cfg.CurrentModel(); err == nil {
+			label = cur.Label()
+		} else if len(models) > 0 {
+			label = models[0].Label()
+		}
+	}
+
 	mc := config.ModelConfig{
 		Name:            strings.TrimSpace(req.Name),
 		Type:            normalizeType(req.Type),
@@ -147,9 +157,11 @@ func (m *Manager) saveConfig(req configRequest) (configView, error) {
 		ReasoningEffort: strings.ToLower(strings.TrimSpace(req.Effort)),
 	}
 	// 密钥留空就是"不改"：前端拿不到明文，这是它唯一能表达"保持原样"的方式。
-	// 新增时不沿用当前那套的密钥——那会把别家的密钥悄悄带进新配置里
+	// 沿用的是**被改的那套**的密钥，不是当前那套的——改的不是当前那套时，
+	// 拿当前那套的密钥盖上去会把用户原来配的密钥弄丢。
+	// 新增时不沿用：那里没有"原来那一套"可沿用
 	if mc.ApiKey == "" && !req.New {
-		if cur, err := cfg.CurrentModel(); err == nil {
+		if cur, ok := config.PickModel(models, label); ok {
 			mc.ApiKey = strings.TrimSpace(cur.ApiKey)
 		}
 	}
@@ -187,16 +199,6 @@ func (m *Manager) saveConfig(req configRequest) (configView, error) {
 		models = next
 	} else {
 		// 改现有那套：名字换了就是改名（原地换，列表长度不变）
-		label := strings.TrimSpace(req.EditLabel)
-		if label == "" {
-			// 表单没说是哪一套：就改当前那套。Current 认不出时按第一套算，
-			// 和 CurrentModel() 一个口径
-			if cur, err := cfg.CurrentModel(); err == nil {
-				label = cur.Label()
-			} else {
-				label = models[0].Label()
-			}
-		}
 		// 名字留空就是"不改名字"：编辑模式下名字是这一套的标识，
 		// 没填就保住原来那个，别默默换成模型名
 		if mc.Name == "" {
