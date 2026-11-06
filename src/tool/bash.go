@@ -288,6 +288,19 @@ func checkWorkdir(workdir string) error {
 	return nil
 }
 
+// bashWaitDelay 是 ctx 被取消之后，还愿意等输出管道收尾的时间。
+//
+// 为什么必须设：cmd.Stdout 给的是 outputBuffer（不是 *os.File），exec 内部会
+// 建一根管道，再起 goroutine 把管道内容拷进 Writer，Wait 要等这根管道读到 EOF
+// 才算完。而 Windows 上 taskkill /T 只能顺着父子链杀，一旦命令自己把子进程
+// 脱离出去（cmd /c start /b、服务化启动之类），那个进程还攥着管道的写端，
+// EOF 永远不来，Wait 就一直阻塞 —— 表现就是按了 Ctrl+C、状态停在「正在中断…」、
+// 命令却再也不返回。
+//
+// 到点后 exec 会强制关掉管道，Wait 立刻返回（进程如果还活着会得到 ErrWaitDelay）。
+// 正常能杀干净的进程不受影响：它一退出管道就关了，不会白等这一秒。
+const bashWaitDelay = time.Second
+
 // shellCommand 组装一次 shell 调用：命令、环境、工作目录都在这儿统一处理。
 // 超时或用户中断时除了子进程本身，还要把它拉起来的进程一起收拾，
 // 否则 Windows 上 npm / go test 这类会留下孤儿进程继续跑。
@@ -304,6 +317,8 @@ func shellCommand(ctx context.Context, args BashArgs) (*exec.Cmd, error) {
 		killTree(cmd.Process)
 		return nil
 	}
+	// 兜底：杀不干净时别让 Wait 无限等管道，见 bashWaitDelay 的说明
+	cmd.WaitDelay = bashWaitDelay
 	if workdir := strings.TrimSpace(args.Workdir); workdir != "" {
 		cmd.Dir = workdir
 	}
