@@ -8,6 +8,7 @@ package webui
 
 import (
 	"context"
+	"crypto/subtle"
 	"embed"
 	"encoding/base64"
 	"encoding/json"
@@ -45,6 +46,9 @@ const (
 	maxBodyBytes = 32 << 20
 	// sseHeartbeat 是多久发一次心跳注释。中间隔着代理时，长时间没字节的空闲连接会被掐掉
 	sseHeartbeat = 25 * time.Second
+	// shutdownGrace 是收到停止信号后，还愿意等普通请求收尾的时间。
+	// 长连接（SSE）会主动退出，所以这里不用留太长——留久了用户就得干等
+	shutdownGrace = 2 * time.Second
 )
 
 // Options 是起 web 前端要的东西，和 TUI 启动时拿到的是同一套
@@ -84,11 +88,22 @@ func Serve(ctx context.Context, opt Options) error {
 		return fmt.Errorf("监听 %s 失败: %w", addrOrDefault(opt.Addr), err)
 	}
 	fmt.Fprintf(opt.Out, "web 界面: http://%s\n", displayAddr(ln.Addr().String()))
+	// 一句提示说清当前的安全状态：只听本机最安全；对外且配了认证是"能用"；
+	// 对外又没配认证就是明摆着的口子，得把话说重
+	if au := opt.Cfg.WebAuth; au != nil && !au.Valid() {
+		fmt.Fprintf(opt.Out, "注意: WebAuth 只配了一半（用户名和密码都得填），本次启动不要求登录\n")
+	}
 	if !loopbackOnly(ln.Addr().String()) {
-		// 这个界面没有任何登录验证，谁连上谁就能让 agent 读写这台机器的文件。
-		// 不是不能让外面连，但得让人知道自己在做什么
-		fmt.Fprintf(opt.Out, "注意: 正在监听所有网卡，界面没有登录验证，能读写本机文件。"+
-			"只给自己用的话请监听 127.0.0.1\n")
+		if opt.Cfg.WebAuth.Valid() {
+			// 用户名可以打出来，密码不能
+			fmt.Fprintf(opt.Out, "已启用登录验证: 用户名 %s（密码见配置文件 WebAuth）\n",
+				strings.TrimSpace(opt.Cfg.WebAuth.Username))
+		} else {
+			// 这个界面没有任何登录验证，谁连上谁就能让 agent 读写这台机器的文件。
+			// 不是不能让外面连，但得让人知道自己在做什么
+			fmt.Fprintf(opt.Out, "注意: 正在监听所有网卡，界面没有登录验证，能读写本机文件。"+
+				"只给自己用的话请监听 127.0.0.1，给外面用请在配置里加 WebAuth\n")
+		}
 	}
 	fmt.Fprintf(opt.Out, "当前工作区: %s（Ctrl+C 停掉）\n", opt.WorkDir)
 	fmt.Fprintf(opt.Out, "页面左上角可以切换或添加工作区\n")
@@ -101,14 +116,22 @@ func Serve(ctx context.Context, opt Options) error {
 		close(errCh)
 	}()
 
+	// Shutdown 开始后通知长连接自己退出。不这么做的话，SSE 那条连接会一直挂着，
+	// Shutdown 只能干等到超时——用户按了 Ctrl+C 却要等好几秒，还以为没按上
+	srv.RegisterOnShutdown(func() { close(m.closing) })
+
 	select {
 	case err := <-errCh:
 		return err
 	case <-ctx.Done():
-		// 关的时候给在跑的请求一点时间收尾，别让正在写文件的那一轮被打断
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// 关的时候给在跑的请求一点时间收尾，别让正在写文件的那一轮被打断。
+		// 长连接已经在上面的钩子里退出了，这里主要等那些正在收尾的普通请求
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			// 还有请求赖着不走，直接掐断：宁可少一次优雅，也别让人只能强杀进程
+			_ = srv.Close()
+		}
 		return nil
 	}
 }
@@ -161,6 +184,10 @@ type Manager struct {
 	// spaces 是已经认识的工作区，key 是工作区 id
 	spaces map[string]*workspace
 	live   map[string]*Session
+	// closing 在服务开始关闭时被关掉。SSE 那种长连接要盯着它：
+	// http.Server.Shutdown 只等活跃请求自己结束，并不会取消它们的 Context，
+	// 不主动退的话它们会一直挂着，把 Shutdown 拖到超时
+	closing chan struct{}
 }
 
 // workspace 是一个工作区在服务端的形态：它存会话的地方，加上它自己的目录
@@ -184,6 +211,7 @@ func newManager(opt Options) *Manager {
 		workdir: opt.WorkDir,
 		spaces:  make(map[string]*workspace),
 		live:    make(map[string]*Session),
+		closing: make(chan struct{}),
 	}
 	// 启动目录永远算一个工作区，它的 store 由调用方准备好（老会话迁移在里面）
 	m.register(opt.WorkDir, opt.Store)
@@ -622,7 +650,42 @@ func (m *Manager) routes() http.Handler {
 	mux.Handle("POST /api/sessions/{id}/approve", m.handleApprove())
 	mux.Handle("POST /api/sessions/{id}/cancel", m.handleCancel())
 	mux.Handle("GET /", m.handleStatic())
+	// 认证包在最外层，而不是每个 handler 里各写一遍：这些接口能让 agent 读写磁盘、
+	// 执行命令，漏掉任何一个都是口子。包在 mux 外面，以后新加路由不会忘
+	if au := m.cfg.WebAuth; au.Valid() {
+		return requireAuth(*au, mux)
+	}
 	return mux
+}
+
+// requireAuth 给全部路由套上 HTTP Basic 认证。
+//
+// 用 Basic 而不是自写登录页，是因为浏览器会自己弹框、自己记住凭证，
+// 并在同源请求上自动带上 —— 包括 SSE 那条长连接。自己写 cookie 登录的话，
+// 事件流和一堆 fetch 都得跟着改，还会多出"会话过期了但页面不知道"的问题。
+func requireAuth(au config.WebAuthConfig, next http.Handler) http.Handler {
+	user := strings.TrimSpace(au.Username)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u, p, ok := r.BasicAuth()
+		// 用户名和密码都要比完再判断，不要用 && 短路：短路会让"用户名对不对"
+		// 影响响应时间，理论上能被用来猜用户名
+		userOk := equalConstTime(u, user)
+		passOk := equalConstTime(p, au.Password)
+		if !ok || !userOk || !passOk {
+			// charset 是给浏览器看的中文提示用的
+			w.Header().Set("WWW-Authenticate", `Basic realm="agent-dev", charset="UTF-8"`)
+			http.Error(w, "需要登录", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// equalConstTime 是常数时间比对：普通的 == 一遇到不同的字节就返回，
+// 理论上能按响应时间逐字节猜出密码。长度不同时它也是直接返回，
+// 这会漏出"长度对不对"，但比起逐字节猜已经无所谓了
+func equalConstTime(a, b string) bool {
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
 // handleStatic 送页面。前端是打包进来的，没有构建步骤，
@@ -1093,6 +1156,10 @@ func (m *Manager) handleEvents() http.Handler {
 		for {
 			select {
 			case <-r.Context().Done():
+				return
+			// 服务正在关闭：主动退出，别攥着连接不放。
+			// Shutdown 不会取消 request Context，这里不看 m.closing 就只能等它超时
+			case <-m.closing:
 				return
 			case data, open := <-ch:
 				if !open {

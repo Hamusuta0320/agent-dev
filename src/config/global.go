@@ -1,6 +1,10 @@
 package config
 
-import "gopkg.in/yaml.v3"
+import (
+	"strings"
+
+	"gopkg.in/yaml.v3"
+)
 
 // DefaultMaxSteps 是一次提问里最多跑多少轮工具调用：模型陷入死循环时靠它刹车。
 // 真需要更多轮就在配置里写 MaxSteps
@@ -23,6 +27,28 @@ type GlobalConfig struct {
 	// （工具调用还是留一行标题，知道在跑什么）。不写这个字段时按打开处理——
 	// 用指针是为了区分"没配"和"配了 false"，值用 QuietMode() 取
 	Quiet *bool `yaml:"Quiet,omitempty"`
+	// WebAuth 是浏览器界面的登录账号。不配就保持原来的"谁连上谁就能用"，
+	// 那种情况下只该听 127.0.0.1；想让外面连就必须配上这个
+	WebAuth *WebAuthConfig `yaml:"WebAuth,omitempty"`
+}
+
+// WebAuthConfig 是浏览器界面的登录账号，走 HTTP Basic 认证。
+//
+// 选 Basic 而不是自己写登录页：浏览器原生弹框，凭证由浏览器自己记住并
+// 在同源请求上自动带上——包括 SSE 那条长连接，否则事件流会推不出来。
+// 代价是密码明文存在配置里，所以配置文件本身不能外泄（config.yaml 已在 .gitignore）。
+type WebAuthConfig struct {
+	Username string `yaml:"Username"`
+	Password string `yaml:"Password"`
+}
+
+// Valid 说明这组账号能不能用来登录：用户名和密码都得填。
+// 只填一半是明显的配置错误，调用方按"没配"处理并提示，不要静默放行
+func (a *WebAuthConfig) Valid() bool {
+	if a == nil {
+		return false
+	}
+	return strings.TrimSpace(a.Username) != "" && a.Password != ""
 }
 
 // QuietMode 返回精简显示开关，默认打开：没写过 Quiet 的配置也按精简来，
