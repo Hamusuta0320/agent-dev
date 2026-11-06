@@ -209,8 +209,9 @@ func SaveModels(path string, models []ModelConfig, current string) error {
 	)
 }
 
-// PickModel 把一个名字认成一套配置：名字和模型名都能认，前面几个字对得上也算，
-// 但必须只对上一套——两套以上拿不准时让用户说全。终端和浏览器界面的 /model 都用它
+// PickModel 把一个名字认成一套配置：名字和模型名都能认，显示名（Label）
+// 的前几个字对得上也算，但必须只对上一套——两套以上拿不准时让用户说全。
+// 终端和浏览器界面的 /model 都用它
 func PickModel(models []ModelConfig, arg string) (ModelConfig, bool) {
 	arg = strings.TrimSpace(arg)
 	if arg == "" {
@@ -242,14 +243,8 @@ func EditModel(models []ModelConfig, current, label string, mc ModelConfig) ([]M
 		return nil, "", fmt.Errorf("没有叫 %q 的模型", label)
 	}
 	mc = withName(mc)
-	// 新名字和别的撞了就说清楚，不默默覆盖人家配好的那套
-	for i, other := range models {
-		if i == idx {
-			continue
-		}
-		if strings.EqualFold(other.Label(), mc.Name) {
-			return nil, "", fmt.Errorf("已经有叫 %q 的模型了", mc.Name)
-		}
+	if err := checkNameFree(models, idx, mc); err != nil {
+		return nil, "", err
 	}
 	out := append([]ModelConfig(nil), models...)
 	out[idx] = mc
@@ -265,12 +260,37 @@ func EditModel(models []ModelConfig, current, label string, mc ModelConfig) ([]M
 // 名字和现有的撞了报错——不默默覆盖人家配好的那套
 func AddModel(models []ModelConfig, mc ModelConfig) ([]ModelConfig, error) {
 	mc = withName(mc)
-	for _, other := range models {
-		if strings.EqualFold(other.Label(), mc.Name) {
-			return nil, fmt.Errorf("已经有叫 %q 的模型了", mc.Name)
-		}
+	// 新的一套排在最后：名字撞了谁都认不出它（/model 会先认出别人那一套）
+	if err := checkNameFree(models, len(models), mc); err != nil {
+		return nil, err
 	}
 	return append(append([]ModelConfig(nil), models...), mc), nil
+}
+
+// checkNameFree 查新的一套会不会把谁挡在后面。
+// at 是这一套改完之后排在第几个（新增时排在最后）。
+// 挡人的两种情形：
+//   - 名字（Name）和别的套的 Name 或 Model 撞上了：/model 认名字时两个都认，
+//     撞上谁就认不出谁；
+//   - 模型名和排在后面某一套的 Name 撞上了：自己排在前面，那套用 Name 也认不出来。
+func checkNameFree(models []ModelConfig, at int, mc ModelConfig) error {
+	name := strings.TrimSpace(mc.Name)
+	if name == "" {
+		return nil
+	}
+	model := strings.TrimSpace(mc.Model)
+	for i, other := range models {
+		if i == at {
+			continue
+		}
+		if matchesModel(other, name) {
+			return fmt.Errorf("已经有叫 %q 的模型了", name)
+		}
+		if i > at && model != "" && strings.EqualFold(strings.TrimSpace(other.Name), model) {
+			return fmt.Errorf("模型名 %q 和另一套的名字重了，那套就用 /model 认不出来了", model)
+		}
+	}
+	return nil
 }
 
 // DeleteModel 删掉 models 里叫 label 的那套。删的是当前那套就改用剩下的第一套。
@@ -303,8 +323,9 @@ func withName(mc ModelConfig) ModelConfig {
 }
 
 // indexOfModel 找出叫 label 的那套在列表里的位置。名字和模型名都认，
-// 但只做精确匹配，不做 PickModel 那种前缀匹配——增删改都得指准是哪一套，
-// 认不出返回 -1
+// 但只做精确匹配，不做 PickModel 那种前缀匹配——增删改都得指准是哪一套。
+// 好几套都认得时取第一个（和 PickModel 一个口径）；界面传进来的名字来自列表，
+// 不会碰上重名。认不出返回 -1
 func indexOfModel(models []ModelConfig, label string) int {
 	label = strings.TrimSpace(label)
 	if label == "" {
@@ -338,8 +359,9 @@ func WithEffort(cfg GlobalConfig, level string) (GlobalConfig, ModelConfig, erro
 	if err != nil {
 		return cfg, ModelConfig{}, err
 	}
-	// 名字先补齐，和 SaveModels 写回时补的一致，两边才认得出是同一套
-	models := cfg.AvailableModels()
+	// 名字先补齐，和 SaveModels 写回时补的一致，两边才认得出是同一套。
+	// 拷贝一份再改：AvailableModels 返回的就是调用方那个数组，不能就地改
+	models := append([]ModelConfig(nil), cfg.AvailableModels()...)
 	for i := range models {
 		if strings.TrimSpace(models[i].Name) == "" {
 			models[i].Name = models[i].Label()

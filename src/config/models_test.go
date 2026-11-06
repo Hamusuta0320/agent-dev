@@ -219,3 +219,104 @@ func TestDeleteModel(t *testing.T) {
 		t.Fatal("找不到时应该报错")
 	}
 }
+
+// 撞名不只看名字：撞上别人的模型名一样，那套就再也认不出来
+func TestModelNameCollision(t *testing.T) {
+	models := []ModelConfig{
+		{Name: "快", Type: "DeepSeek", ApiUrl: "https://a", ApiKey: "sk-a", Model: "deepseek-chat"},
+	}
+	// 名字撞上别人的模型名：新增这套就再也 /model 不到了
+	if _, err := AddModel(models, ModelConfig{Name: "deepseek-chat", Model: "gpt-4"}); err == nil {
+		t.Fatal("名字撞上别人的模型名时应该报错")
+	}
+
+	two := []ModelConfig{
+		{Name: "慢", Type: "DeepSeek", ApiUrl: "https://a", ApiKey: "sk-a", Model: "model-a"},
+		{Name: "快", Type: "OpenAI", ApiUrl: "https://b", ApiKey: "sk-b", Model: "model-b"},
+	}
+	// 改名撞上另一套的模型名：一样报错。不拦的话 Current 会指到别的那套去
+	if _, _, err := EditModel(two, "快", "快", ModelConfig{Name: "model-a", Model: "model-c"}); err == nil {
+		t.Fatal("改名撞上另一套的模型名时应该报错")
+	}
+
+	// 模型名和排在后面那套的名字重名：会把那套挡住。
+	// 改的是第一套，它排在前面，后面的那套用 Name 就认不出来了
+	three := []ModelConfig{
+		{Name: "快", Model: "deepseek-chat"},
+		{Name: "稳", Model: "gpt-4"},
+	}
+	if _, _, err := EditModel(three, "快", "快", ModelConfig{Name: "快2", Model: "稳"}); err == nil {
+		t.Fatal("模型名撞上后面那套的名字时应该报错")
+	}
+
+	// 两套配同一个模型名是可以的：名字不同就分得清
+	if _, err := AddModel(models, ModelConfig{Name: "稳", Model: "deepseek-chat"}); err != nil {
+		t.Fatalf("同一个模型配两套应该允许: %v", err)
+	}
+}
+
+// 改名之后 Current 必须还认得回来：认成别的那套就等于没改
+func TestEditModelKeepsCurrentResolvable(t *testing.T) {
+	models := []ModelConfig{
+		{Name: "慢", Type: "DeepSeek", ApiUrl: "https://a", ApiKey: "sk-a", Model: "model-a"},
+		{Name: "快", Type: "OpenAI", ApiUrl: "https://b", ApiKey: "sk-b", Model: "model-b"},
+	}
+	next, current, err := EditModel(models, "快", "快", ModelConfig{
+		Name: "飞快", Type: "OpenAI", ApiUrl: "https://b", ApiKey: "sk-b", Model: "model-b",
+	})
+	if err != nil {
+		t.Fatalf("改名失败: %v", err)
+	}
+	cfg := GlobalConfig{Models: next, Current: current}
+	cur, err := cfg.CurrentModel()
+	if err != nil {
+		t.Fatalf("Current 认不回来: %v", err)
+	}
+	if cur.Name != "飞快" {
+		t.Fatalf("Current 该认到改名后那套，实际 %+v", cur)
+	}
+}
+
+// WithEffort 只动自己那份，不能就地改掉调用方的模型列表
+func TestWithEffortDoesNotTouchCaller(t *testing.T) {
+	cfg := GlobalConfig{Models: []ModelConfig{
+		{Type: "DeepSeek", ApiUrl: "https://a", ApiKey: "sk-a", Model: "model-a"},
+	}}
+	next, target, err := WithEffort(cfg, "high")
+	if err != nil {
+		t.Fatalf("调整思考强度失败: %v", err)
+	}
+	if target.ReasoningEffort != "high" {
+		t.Fatalf("思考强度没改: %+v", target)
+	}
+	if cfg.Models[0].Name != "" || cfg.Models[0].ReasoningEffort != "" {
+		t.Fatalf("不该就地改调用方的列表: %+v", cfg.Models[0])
+	}
+	if next.Models[0].Name != "model-a" || next.Models[0].ReasoningEffort != "high" {
+		t.Fatalf("新的一份该补上名字和档位: %+v", next.Models[0])
+	}
+}
+
+// PickModel：名字和模型名都认；显示名的前几个字对得上也行，但只能对上一套
+func TestPickModel(t *testing.T) {
+	models := []ModelConfig{
+		{Name: "快", Model: "model-a"},
+		{Name: "稳", Model: "model-b"},
+	}
+	if mc, ok := PickModel(models, "稳"); !ok || mc.Model != "model-b" {
+		t.Fatalf("按名字该挑中稳: %+v %v", mc, ok)
+	}
+	if mc, ok := PickModel(models, "model-a"); !ok || mc.Model != "model-a" {
+		t.Fatalf("按模型名也该认: %+v %v", mc, ok)
+	}
+	// 显示名的前缀：只对上一套时认得出来
+	pref := []ModelConfig{{Name: "快-a"}, {Name: "稳-b"}}
+	if mc, ok := PickModel(pref, "快"); !ok || mc.Name != "快-a" {
+		t.Fatalf("前缀该认: %+v %v", mc, ok)
+	}
+	// 对不上好几套时不该乱认
+	ambiguous := []ModelConfig{{Name: "快-a"}, {Name: "快-b"}}
+	if mc, ok := PickModel(ambiguous, "快"); ok {
+		t.Fatalf("对不上好几套时不该乱认: %+v", mc)
+	}
+}
