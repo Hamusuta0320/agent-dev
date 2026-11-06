@@ -176,6 +176,10 @@ const state = {
   suggestIdx: -1,
   // /config 表单里各类型的内置接口地址（切类型时带出来用）
   configDefaults: {},
+  // /config 表单里各类型的思考强度档位（切类型时换下拉用）
+  configEfforts: {},
+  // 待办清单全部完成时是否展开（默认收起成一行）
+  todosExpanded: false,
 };
 
 /* ---------------- 小工具 ---------------- */
@@ -429,17 +433,37 @@ async function loadRuntime() {
 function renderRuntime(rt) {
   const todos = (rt && rt.todos) || [];
   const tasks = (rt && rt.tasks) || [];
+  const total = (rt && rt.todo_total) || todos.length;
+  const done = (rt && rt.todo_done) || 0;
+  // 全做完了就收成一行：清单全绿还占着六七行，看着像活还没干完——
+  // 实测就是这一点让人以为"待办没清掉"。想看还是能点开，
+  // 展开状态记在 state 里，不然每几秒一次的轮询会把它折回去
+  const allDone = todos.length > 0 && done >= total;
 
   el.todos.hidden = todos.length === 0;
   el.todos.replaceChildren();
   if (todos.length) {
-    el.todos.append(
-      node("div", "runtime-title", `待办 ${rt.todo_done || 0}/${rt.todo_total || todos.length} 完成`),
+    const title = node(
+      "div",
+      "runtime-title" + (allDone ? " all-done" : ""),
+      allDone ? `✓ 待办 ${done}/${total} 全部完成` : `待办 ${done}/${total} 完成`,
     );
-    todos.forEach((t, i) => {
-      const mark = t.status === "completed" ? "✓" : t.status === "in_progress" ? "▸" : "·";
-      el.todos.append(node("div", `todo-item ${t.status || "pending"}`, `${mark} ${i + 1}. ${t.content}`));
-    });
+    if (allDone) {
+      const open = state.todosExpanded;
+      title.classList.add("toggle");
+      title.title = open ? "收起" : "展开看看做了哪些";
+      title.addEventListener("click", () => {
+        state.todosExpanded = !state.todosExpanded;
+        renderRuntime(rt);
+      });
+    }
+    el.todos.append(title);
+    if (!allDone || state.todosExpanded) {
+      todos.forEach((t, i) => {
+        const mark = t.status === "completed" ? "✓" : t.status === "in_progress" ? "▸" : "·";
+        el.todos.append(node("div", `todo-item ${t.status || "pending"}`, `${mark} ${i + 1}. ${t.content}`));
+      });
+    }
   }
 
   el.tasks.hidden = tasks.length === 0;
@@ -976,13 +1000,37 @@ function toolElement(c) {
   return box;
 }
 
-// streamBlock 造一块"正文"：模型输出按 markdown 排版。
-// 渲染只走 Markdown.into（全程 DOM 构建，没有 innerHTML），所以输出里写
-// <script> 之类的也只会显示成文字
+// textBlock 把一段 markdown 正文包成一个"块"：有边界、右上角一个复制按钮。
+//
+// 复制的是 markdown 原文，不是渲染后的文字 —— 拿到的是模型真正说的话，
+// 粘到别处还能重新排版。返回的 render 用来原地换内容（流式输出时每 90ms 调一次），
+// 它只清空 body，复制按钮在 body 外面，所以重排不会把按钮冲掉
+function textBlock(initial) {
+  let src = initial == null ? "" : String(initial);
+  const box = node("div", "text-block");
+  const bar = node("div", "text-block-bar");
+  const body = node("div", "stream md");
+  const copy = node("button", "md-copy", "复制");
+  copy.type = "button";
+  copy.title = "复制这段原文";
+  copy.addEventListener("click", () => Markdown.copyText(copy, src));
+  bar.append(copy);
+  box.append(bar, body);
+  const render = (next) => {
+    src = next == null ? "" : String(next);
+    Markdown.into(body, src);
+    // 还没吐出内容时（模型上来先调工具那段时间）整块藏起来：
+    // 一个空框上挂一枚"复制"看着像坏了
+    const empty = src.trim() === "";
+    box.hidden = empty;
+    bar.hidden = empty;
+  };
+  render(initial);
+  return { box, body, render };
+}
+
 function streamBlock(text) {
-  const box = node("div", "stream md");
-  Markdown.into(box, text);
-  return box;
+  return textBlock(text).box;
 }
 
 function assistantBlock(m) {
@@ -1043,6 +1091,9 @@ function newTurn() {
     reasoning: null,
     reasoningBody: null,
     stream: null,
+    // 正文块的外层（带复制按钮那层）和它的重排函数；stream 指的是里面的 body
+    streamBox: null,
+    streamRender: null,
     streamText: "",
     pendingRender: null,
     lastRender: 0,
@@ -1083,10 +1134,16 @@ const STREAM_RENDER_MS = 90;
 function appendContent(text) {
   const turn = ensureTurn();
   if (!turn.stream) {
-    turn.stream = node("div", "stream md cursor");
+    // 正文块自己带复制按钮；turn.stream 留着指向里面那块 body，
+    // 重排（Markdown.into）和光标都只动 body，不动外面那层
+    const block = textBlock("");
+    turn.streamBox = block.box;
+    turn.stream = block.body;
+    turn.streamRender = block.render;
+    turn.stream.classList.add("cursor");
     // 正文排在思考之后、工具之前
     const anchor = turn.tools || null;
-    turn.root.insertBefore(turn.stream, anchor);
+    turn.root.insertBefore(turn.streamBox, anchor);
     turn.streamText = "";
   }
   turn.streamText = (turn.streamText || "") + text;
@@ -1115,7 +1172,8 @@ function scheduleStreamRender(turn) {
 function renderStream(turn) {
   if (!turn || !turn.stream) return;
   turn.lastRender = Date.now();
-  Markdown.into(turn.stream, turn.streamText || "");
+  // 走块自己的 render：它同时把原文记在闭包里，复制按钮复制的是最新那份
+  turn.streamRender(turn.streamText || "");
   if (turn.stream.classList.contains("cursor")) placeCaret(turn.stream);
 }
 
@@ -1894,16 +1952,12 @@ async function openConfigDialog(mode = "edit") {
 // applyConfigView 把服务端给的表单值摆进表单
 function applyConfigView(view) {
   state.configDefaults = view.default_urls || {};
+  // 各类型的档位表：切类型时下拉要跟着换（DeepSeek 认的比另两家多）
+  state.configEfforts = view.effort_levels || {};
   state.configMode = view.mode || "edit";
   state.configEditLabel = view.edit_label || "";
   fillSelect(el.cfgType, view.types || [], (t) => [t, t], view.type);
-  // 思考强度的档位是显示名，提交时要换成档位本身（"默认" 就是空串）
-  fillSelect(
-    el.cfgEffort,
-    (view.efforts || []).map((label) => ({ label, value: label === "默认" ? "" : label })),
-    (o) => [o.label, o.value],
-    view.effort === "默认" ? "" : view.effort,
-  );
+  fillEfforts(view.efforts || [], view.effort);
   el.cfgName.value = view.name || "";
   el.cfgUrl.value = view.api_url || "";
   el.cfgUrl.placeholder = "留空用该类型内置的地址";
@@ -1919,6 +1973,16 @@ function applyConfigView(view) {
   // 路径单独一行（它常很长），"有几套、能切到哪套"由上面那排按钮说，不再重复一遍
   el.cfgPath.textContent = view.cfg_path || "";
   renderConfigSwitch(view, models);
+}
+
+// fillEfforts 填思考强度下拉。档位是显示名，提交时要换成档位本身（"默认" 就是空串）。
+// keep 是当前选中的那个显示名；它不在这份档位里（切了类型）就落回"默认"，
+// 不然下拉会停在空处、保存时提交一个这类型不认的值
+function fillEfforts(labels, keep) {
+  const options = labels.map((label) => ({ label, value: label === "默认" ? "" : label }));
+  let want = keep === "默认" || keep === undefined || keep === null ? "" : keep;
+  if (!options.some((o) => o.value === want)) want = "";
+  fillSelect(el.cfgEffort, options, (o) => [o.label, o.value], want);
 }
 
 // renderConfigSwitch 把"已经配好的几套"摆成一排按钮：当前那套高亮且点不动，
@@ -2201,6 +2265,10 @@ function bindEvents() {
     if (!cur || known.includes(cur)) {
       el.cfgUrl.value = defaults[el.cfgType.value] || "";
     }
+    // 档位表也按类型换：DeepSeek 有 none/xhigh/ultra/max，另两家没有。
+    // 原来那档新类型不认就落回"默认"（fillEfforts 里处理）
+    const levels = state.configEfforts || {};
+    fillEfforts(levels[el.cfgType.value] || [], el.cfgEffort.value);
   });
   el.cfgFetch.addEventListener("click", fetchModelNames);
   el.cfgSave.addEventListener("click", saveConfigForm);

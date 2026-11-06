@@ -75,21 +75,26 @@ func TestEffortCommandParsed(t *testing.T) {
 	}
 }
 
-// effortArg 认档位名，也认"默认 / auto / off"这些回到默认档的说法；别的都算认不出
+// effortArg 认档位名，也认"默认 / auto / off"这些回到默认档的说法；别的都算认不出。
+// "none" 不算默认档：DeepSeek 真认它（明确让它别思考），所以给 DeepSeek 时它是档位本身、
+// 给另外两家时才认不出
 func TestEffortArg(t *testing.T) {
 	for _, c := range []struct {
 		in   string
+		typ  string
 		want string
 	}{
-		{"high", "high"},
-		{"  Medium ", "medium"},
-		{"minimal", "minimal"},
-		{"默认", ""},
-		{"default", ""},
-		{"off", ""},
-		{"none", ""},
+		{"high", "DeepSeek", "high"},
+		{"  Medium ", "DeepSeek", "medium"},
+		{"minimal", "DeepSeek", "minimal"},
+		{"max", "DeepSeek", "max"},
+		{"xhigh", "DeepSeek", "xhigh"},
+		{"默认", "DeepSeek", ""},
+		{"default", "DeepSeek", ""},
+		{"off", "DeepSeek", ""},
+		{"none", "DeepSeek", "none"},
 	} {
-		got, ok := effortArg(c.in)
+		got, ok := effortArg(c.in, c.typ)
 		if !ok {
 			t.Fatalf("%q 该认下来", c.in)
 		}
@@ -99,8 +104,14 @@ func TestEffortArg(t *testing.T) {
 	}
 
 	for _, bad := range []string{"很努力", "ludicrous", "1"} {
-		if _, ok := effortArg(bad); ok {
+		if _, ok := effortArg(bad, "DeepSeek"); ok {
 			t.Fatalf("%q 不该认下来", bad)
+		}
+	}
+	// DeepSeek 独有的档位给 OpenAI 就不该认
+	for _, level := range []string{"none", "xhigh", "ultra", "max"} {
+		if _, ok := effortArg(level, "OpenAI"); ok {
+			t.Fatalf("OpenAI 不该认 %q 这一档", level)
 		}
 	}
 }

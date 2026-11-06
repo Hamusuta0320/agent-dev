@@ -30,6 +30,9 @@ type GlobalConfig struct {
 	// WebAuth 是浏览器界面的登录账号。不配就保持原来的"谁连上谁就能用"，
 	// 那种情况下只该听 127.0.0.1；想让外面连就必须配上这个
 	WebAuth *WebAuthConfig `yaml:"WebAuth,omitempty"`
+	// WebSearch 是联网搜索的配置（用哪个后端、参数是什么）。
+	// 整段不写也能用：有 DeepSeek 的 key 就走厂商服务端搜索，没有就刮网页兜底
+	WebSearch *WebSearchConfig `yaml:"WebSearch,omitempty"`
 }
 
 // WebAuthConfig 是浏览器界面的登录账号，走 HTTP Basic 认证。

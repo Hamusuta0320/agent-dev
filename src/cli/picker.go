@@ -147,7 +147,8 @@ func modePicker(cur domain.Mode) *picker {
 	return p
 }
 
-// effortPicker 是 /effort 不带参数时的几档思考强度，改的是当前生效的那套模型
+// effortPicker 是 /effort 不带参数时的几档思考强度，改的是当前生效的那套模型。
+// 档位按这套模型的类型取：DeepSeek 认的比另两家多
 func effortPicker(cur config.ModelConfig) *picker {
 	now := config.EffortLabel(cur.ReasoningEffort)
 	p := &picker{
@@ -155,7 +156,7 @@ func effortPicker(cur config.ModelConfig) *picker {
 		title: bannerStyle.Render("思考强度") +
 			hintStyle.Render("  当前 "+now+"（"+cur.Label()+"）"),
 	}
-	for _, level := range config.EffortLevels {
+	for _, level := range config.EffortLevelsFor(cur.Type) {
 		label := config.EffortLabel(level)
 		text := fmt.Sprintf("%-8s %s", label, effortHint(level))
 		if label == now {

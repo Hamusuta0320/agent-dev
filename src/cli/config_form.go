@@ -30,7 +30,7 @@ var configFields = []configField{
 	{"接口地址", "例如 https://api.deepseek.com，留空就用内置地址"},
 	{"密钥", "sk- 开头的那串"},
 	{"模型", "例如 deepseek-chat；Ctrl+L 能从接口拉列表挑"},
-	{"思考强度", "←→ 切换（默认 / minimal / low / medium / high），默认不发这个参数"},
+	{"思考强度", "←→ 切换，档位按类型不同（DeepSeek 有 none/xhigh/ultra/max）；默认不发这个参数"},
 	{"上下文上限", "模型的上下文窗口（token），可填 128000、128k、1M（1M = 1024k）"},
 }
 
@@ -436,7 +436,7 @@ func (m model) handleConfigKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		case "right", "l":
 			return m.switchEffort(1)
 		case "enter":
-			f.err = "思考强度用 ←→ 切换（" + strings.Join(config.EffortLabels(), " / ") + "）"
+			f.err = "思考强度用 ←→ 切换（" + strings.Join(config.EffortLabels(f.value(typeField)), " / ") + "）"
 			return m, nil
 		}
 	}
@@ -492,6 +492,11 @@ func (m model) switchType(step int) (tea.Model, tea.Cmd) {
 	// 类型换了，之前拉的候选列表是别家的模型名，作废
 	f.models = nil
 	f.pickIdx = -1
+	// 档位表也跟着换：从 DeepSeek 切到 OpenAI 时，原来选的 max 这类型不认，
+	// 留着它保存会报错，先归回"默认"（不发这个参数，最保险）
+	if _, err := config.ParseEffort(f.effort, next); err != nil {
+		f.effort = ""
+	}
 
 	before := f.value(urlField)
 	if before == "" || before == config.DefaultApiUrl(old) {
@@ -504,18 +509,21 @@ func (m model) switchType(step int) (tea.Model, tea.Cmd) {
 }
 
 // switchEffort 把思考强度换成档位表里的前（step = -1）或后（step = 1）一个。
-// 配置里存了个表外的值（手改过配置文件）时，从第一档开始找，仍然能往下切
+// 档位表按当前类型取：DeepSeek 认的比另两家多。
+// 配置里存了个这类型不认的值（手改过配置文件、或者刚从 DeepSeek 切到 OpenAI）时，
+// 从第一档开始找，仍然能往下切
 func (m model) switchEffort(step int) (tea.Model, tea.Cmd) {
 	f := &m.form
+	levels := config.EffortLevelsFor(f.value(typeField))
 	old := f.value(effortField)
 	idx := 0
-	for i, level := range config.EffortLevels {
+	for i, level := range levels {
 		if strings.EqualFold(level, old) {
 			idx = i
 			break
 		}
 	}
-	next := config.EffortLevels[(idx+step+len(config.EffortLevels))%len(config.EffortLevels)]
+	next := levels[(idx+step+len(levels))%len(levels)]
 	f.effort = next
 	f.err = ""
 	return m, nil

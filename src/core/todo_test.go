@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -117,6 +118,110 @@ func TestRunSkipsNudgeWhenNothingPending(t *testing.T) {
 			t.Fatalf("%s：不该催，实际请求了 %d 次，末尾是:\n%s", name, len(p.calls), p.lastContent())
 		}
 	}
+}
+
+// 催办得给出两条明确的出口：能做完就核销，这轮做不了就移出清单并说明。
+// 特别是不能再说"还没做完就接着做"——2026-11-06 实测：模型把"重启后生效"这类
+// 必须等本轮结束才能验证的事写进了清单，被这句一逼，只能反复改写措辞让它消失，
+// 一轮里改了 16 次、237 条消息
+func TestTodoNoticeGivesBothWaysOut(t *testing.T) {
+	s := sessionWithTodos(`{"todos":[{"content":"重启后生效","status":"in_progress"}]}`)
+	msgs := todoNotice(s)
+	if len(msgs) != 1 {
+		t.Fatalf("该有一条提醒，实际 %d 条", len(msgs))
+	}
+	got := msgs[0].Content
+
+	// 出口一：核销
+	if !strings.Contains(got, "completed") {
+		t.Fatalf("得说清能做完就标 completed:\n%s", got)
+	}
+	// 出口二：这轮做不了就移出清单 + 在回答里说明
+	if !strings.Contains(got, "从清单里删掉") || !strings.Contains(got, "回答里说清楚") {
+		t.Fatalf("得给出\"做不了就从清单删掉并说明\"这条路:\n%s", got)
+	}
+	// 必须点名"要等这一轮结束才能验证"这种自指情形
+	if !strings.Contains(got, "这一轮结束") {
+		t.Fatalf("得点明有些事要等本轮结束才能验证:\n%s", got)
+	}
+	// 不能再推着人往前干
+	if strings.Contains(got, "接着做") {
+		t.Fatalf("不该再说\"接着做\"，那会把做不了的事逼成反复改措辞:\n%s", got)
+	}
+}
+
+// 一轮里反复改清单要能被拦一下：超过上限补一句"别再改了"，
+// 而且只说一次——否则刹车本身又变成新的念叨
+func TestRunWarnsAboutRepeatedTodoEdits(t *testing.T) {
+	s := domain.NewSession("/tmp/demo")
+	s.AppendUser("干点活")
+
+	// 前 12 轮每轮都改一次清单，之后老实收尾
+	p := &repeatingTodoProvider{limit: 12}
+
+	if _, err := Run(domain.Ctx{
+		Provider: p,
+		Tools:    map[string]domain.Tool{"echo": &fakeTool{}, todoToolName: fakeTodoTool{}},
+		Context:  context.Background(),
+		WorkDir:  "/tmp/demo",
+		Session:  s,
+		Emit:     func(domain.Event) {},
+	}, s); err != nil {
+		t.Fatalf("Run 失败: %v", err)
+	}
+
+	// 上限内不该出现，过了上限才出现（加进去一次，之后跟着本回合走）
+	const probe = "别再重写"
+	firstAt := -1
+	for i, msgs := range p.calls {
+		for _, m := range msgs {
+			if strings.Contains(m.Content, probe) {
+				firstAt = i
+				break
+			}
+		}
+		if firstAt >= 0 {
+			break
+		}
+	}
+	if firstAt < 0 {
+		t.Fatal("改清单超过上限了却没提醒")
+	}
+	// 第 N 次改清单是在第 N 次请求里发生的，提醒从下一次请求起才带上
+	if firstAt < maxTodoEdits {
+		t.Fatalf("还没到上限（%d 次）就提醒了，首次出现在第 %d 次请求", maxTodoEdits, firstAt+1)
+	}
+}
+
+// repeatingTodoProvider 前 limit 轮每轮都调一次 TodoWrite，之后就收尾。
+// 它把每次请求原样留一份，好断言 core 往里塞了几句提醒
+type repeatingTodoProvider struct {
+	limit int
+	n     int
+	calls [][]domain.AIChatMessage
+}
+
+func (p *repeatingTodoProvider) Chat(ctx context.Context, messages []domain.AIChatMessage, tools []domain.ToolSpec, onDelta func(domain.StreamEvent)) (domain.ChatResult, error) {
+	p.calls = append(p.calls, messages)
+	p.n++
+	if p.n <= p.limit {
+		return domain.ChatResult{
+			Content:   "再改一次清单",
+			ToolCalls: []domain.ToolCall{{Id: "t", Name: "TodoWrite", Arguments: `{"todos":[{"content":"干活","status":"in_progress"}]}`}},
+		}, nil
+	}
+	return domain.ChatResult{Content: "收尾了"}, nil
+}
+
+// fakeTodoTool 是个什么都不做的 TodoWrite：这些用例只看 core 发了几次提醒
+type fakeTodoTool struct{}
+
+func (fakeTodoTool) Name() string           { return todoToolName }
+func (fakeTodoTool) Description() string    { return "记清单" }
+func (fakeTodoTool) Schema() map[string]any { return map[string]any{"type": "object"} }
+func (fakeTodoTool) Mutating() bool         { return false }
+func (fakeTodoTool) Execute(ctx context.Context, raw json.RawMessage) (string, error) {
+	return "待办已更新", nil
 }
 
 // lastTodos 只认会话历史里的清单，不认进程级那份：两条会话不该互相串

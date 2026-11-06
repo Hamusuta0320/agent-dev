@@ -12,7 +12,7 @@ import (
 func TestForMode(t *testing.T) {
 	readOnly := ForMode(domain.ModeReadOnly)
 	// Task 只跟进后台任务、自己不碰磁盘，只读模式下也留着
-	for _, name := range []string{"Read", "Grep", "Glob", "Task"} {
+	for _, name := range []string{"Read", "Grep", "Glob", "Task", "WebSearch", "WebFetch"} {
 		if _, ok := readOnly[name]; !ok {
 			t.Fatalf("只读模式应该有 %s: %v", name, names(readOnly))
 		}
@@ -61,6 +61,9 @@ func TestMutatingFlags(t *testing.T) {
 		"Read": false, "Grep": false, "Glob": false, "Task": false,
 		// 待办清单只存在内存里，不碰磁盘
 		"TodoWrite": false,
+		// 联网搜索、抓取只读网上的东西，不碰磁盘
+		"WebSearch": false,
+		"WebFetch":  false,
 		"Write":     true, "Edit": true, "Bash": true,
 	}
 	for name, mutating := range want {

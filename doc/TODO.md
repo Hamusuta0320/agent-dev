@@ -16,9 +16,53 @@
 源码里已经有这几个空目录，是当初预留的位置，目前都还没有代码：
 
 - [ ] `src/plugin/` —— 插件 / MCP 接入。现在加能力只能改代码重新编译。
-- [ ] `src/web/` —— 联网能力。全项目搜不到一处 HTTP 请求，模型**完全没法查在线文档**。
-      至少要有 WebFetch（抓一个 URL 转纯文本）和 WebSearch。
-      （浏览器界面不在这儿，在 `src/webui/`，见下面"浏览器界面"。）
+- [x] `src/web/` —— 联网能力。形状是 **seam + provider**（学 DSH 的 `ctx.web`）：
+      工具层只认 `web.Search` / `web.Fetch`，不认厂商；换后端是加一个文件、改配置，
+      不用碰工具本身。参考过 Claude Code 和 DSH 两家的做法，结论写在
+      `doc/web-design.md`（为什么搜索不按"支持几个引擎"来设计）。
+      - `web.go`：类型（`SearchRequest` / `SearchResult` / `Source`）、两个 provider 接口、
+        注册表、**选择策略**、错误码、`capSources`。规范化结果里 `title` / `snippet` /
+        `publishedAt` 都是可选的——后端不返回就空着，逼适配器编一个等于让这一层说谎。
+      - 选择策略（搜索和抓取共用一份，`pickProvider` 泛型）：配置或
+        `AGENT_WEB_SEARCH_PROVIDER` 指定了 id 就必须是它，没注册报 `CONFIGURED_MISSING`、
+        不可用报 `CONFIGURED_UNAVAILABLE`；没指定就按注册顺序取第一个可用的。
+        **不在多个可用后端之间"智能选择"**：多一个分支就多一种线上和本地不一致的可能。
+      - `deepseek.go`：主路径，走 DeepSeek 的 Anthropic 兼容端点 +
+        `web_search_20250305` 服务端工具。**实测可用**（2026-11-06）：回来的块是
+        `text` / `server_tool_use` / `web_search_tool_result`，`text` 里的内容是模型写的
+        带来源总结。代价是一次搜索 = 一次完整模型轮次（实测 4401 input + 636 output token）。
+        - 这个端点**不给 snippet**（真 Anthropic 会在 `text` 块的 `citations[].cited_text`
+          里给，它没有），所以 `Snippet` 只能空着。
+        - 没有 `web_search_tool_result` 块时报错而不是降级：那种情况说明厂商没真搜，
+          拿它的文字当搜索结果就是"模型自己编的搜索结果"。
+      - `duckduckgo.go`：兜底，刮 HTML 结果页，不用 key、永远可用。
+        它的契约是别人页面上的 `result__a` / `result__snippet` 两个 class——改一次就全废，
+        所以排在优先级最后。解析不引 HTML 库；链接从 `//duckduckgo.com/l/?uddg=` 还原，
+        广告位（`/y.js?`）跳过。
+      - `fetch.go`：唯一的抓取后端，本机发 HTTP。**安全是这里的主要职责**：
+        - 只认 http/https，URL 限 2048 字符；
+        - 解析出的每个地址都必须是公网地址（拒回环、私有网段、链路本地含
+          `169.254.169.254`、运营商级 NAT `100.64/10`、组播、`::1`、`fd00::/8`）；
+        - `DialContext` 自己解析、校验、然后**连到校验过的那个 IP**——只靠请求前校验一次
+          挡不住 DNS rebinding（先给公网地址过校验，真连时再给 127.0.0.1）；
+        - 跳转最多 5 次，每跳重新校验，不能 302 到内网把前面的校验绕过去；
+        - 只接 html/text，PDF、图片这类直接说读不了；
+        - HTML → 文本不引 DOM 库：扔 script/style/注释、块级元素换行、空白压紧。
+        - **走环境代理时防线要退一步**：配了 `HTTP(S)_PROXY` 时拨号目标是代理自己
+          （实测本机是 `127.0.0.1:7897`），不放行的话凡是用代理的机器 WebFetch 100% 失败。
+          放行的只有环境变量里声明的那个地址，其余内网照拦；rebinding 那一层改由代理负责。
+      - `configure.go`：从配置装配。DeepSeek 的 key / 模型名 / 端点留空时从当前生效的
+        那套模型借（前提是它确实指向 DeepSeek——拿 MiniMax 的 key 打 DeepSeek 只会 401）。
+      - 工具层（`src/tool/websearch.go`、`webfetch.go`）只负责面向模型的约定：
+        `queries` 是 1~4 个、并发发、按 URL 去重、轮询交错合并再截断；
+        **任何一个查询失败就整体失败**——一半成功一半失败的结果模型不知道该信哪部分。
+      - 两个工具 `Mutating` 都是 false，只读模式下也留着。
+- [ ] 配置还没有 `/config` 表单入口：`WebSearch` 段现在只能手改 YAML。
+      形状是 `WebSearch: {Provider, DeepSeek: {ApiUrl, Model, ApiKey, MaxUses},
+      DuckDuckGo: {Enabled, Endpoint}}`，整段不写也能用。
+- [ ] 没有搜索结果/抓取结果的缓存：同一个查询连问两次就是两次模型轮次的钱。
+- [ ] PDF / 图片读不了（`fetch.go` 只解 html/text）。要读 PDF 得接一个抽取库，
+      或者走 vLLM 的多模态（见本地 `pdf-to-markdown-vllm` 技能）。
 - [ ] `src/prompt/` —— 提示词模板。提示词目前硬编码在 `src/core/prompt.go`，
       想调措辞得改代码；独立出来还能做多套模板，比如给子任务用的精简版。
 - [ ] `src/log/` —— 结构化日志。现在只有界面展示和 `core.ConsoleEmit` 的纯文本输出，
@@ -280,10 +324,23 @@
 - [ ] 还差一家：Anthropic 那套 `/v1/messages` 协议和 OpenAI 兼容接口不一样，得单独实现一个
       provider 并在 `provider.New` 里分派。
 - [x] 思考强度（`reasoning_effort`）：`ModelConfig.ReasoningEffort` 存档位
-      （minimal / low / medium / high，留空表示不发这个参数），`/config` 里用 ←→ 切，
+      （留空表示不发这个参数），`/config` 里用 ←→ 切，
       也可以直接打命令：`/effort` 看当前这档，`/effort high`、`/effort 默认` 就地改并写回配置。
       请求体由 `src/provider/deepseek.go` 拼。写错档位在造 provider 时就报错，
       不至于让接口回一个 400 让人猜。各家认不认这个字段不一样，所以默认不动它。
+      - **档位按类型分开给**（`config.EffortLevelsFor`）。一开始是全局一套
+        `minimal/low/medium/high`，那是照着 OpenAI 抄的，对 DeepSeek 是错的。
+        DeepSeek 那份是**实测**出来的，不是查文档：故意发一个非法值，它会把期望列表原样吐回来——
+        `422 unknown variant \`ludicrous\`, expected one of none, minimal, low, medium, high, xhigh, ultra, max`。
+        现在 DeepSeek 九档（含空档）：默认 / none / minimal / low / medium / high / xhigh / ultra / max，
+        八档全发过一遍确认都 200。
+      - **`none` 不是"默认"的别名**。以前 `none`/`off` 都归到空串，但 DeepSeek 真认 `none`
+        （明确让它别思考），和"压根不发这个字段、用模型自己的默认"是两回事。
+        归到空串等于用户想关思考、结果配成了"看模型心情"。现在只有 默认/default/auto/off 归空串。
+      - OpenAI / MiniMax 保持原来那几档：手上没有可信的验证手段，不确定的档位不往里加——
+        加了只会让人选到一个接口不认的值，换回一个 400。认不出的类型按公共那几档算。
+      - 浏览器表单切类型时档位下拉跟着换（`configView.EffortLevels` 带上各类型的表）；
+        终端表单切类型时，若原来那档新类型不认，归回"默认"，不然保存会报错。
 
 ### 待办跟踪
 
@@ -306,6 +363,28 @@
       用 `ok` 明确区分"显式传空数组 = 清空"和"参数写坏/没带 todos 字段 = 别动原来那份"。
       以前 webui 把两种情况都当成 nil 直接赋值，模型偶尔只传个 intent 时，
       界面上的进度就凭空消失了。
+- [x] **修掉"拿清单打转"**（2026-11-06，用户当场反馈"AI 一直在纠结"）。翻会话记录复盘的：
+      一轮问答里 `TodoWrite` 被调了 **16 次**、期间 **237 条消息**没有一句是用户说的，
+      真正的活早就干完了。三个成因，逐个修：
+      - **催办把人逼进死胡同**。原来那句"还没做完就接着做"没有给"这轮做不了"留出口。
+        实测踩到的坑：清单里写了"补 doc/TODO 记录**并重启生效**"，而
+        `restart-web.ps1 -WaitIdle` 等的正是**这个会话空闲**（= 本轮跑完），
+        也就是说这条永远不可能在本轮内完成——自指死锁。模型唯一的出路就成了
+        **把"重启生效"改写成"重启"**，让条目"看起来能收尾"，于是清单被反复重写。
+        现在提醒给两条明确的出口：能做完就标 completed；这轮做不了的（要等用户拿主意、
+        已经不需要、或者**必须等这一轮结束才谈得上验证**）就从清单里删掉并在回答里说明白。
+        并明确写"改措辞让它看起来能收尾不算做完"。
+      - **刹车形同虚设**。`TodoWrite` 一轮里调多少次都没人管，全靠 `MaxSteps`（1200）兜底。
+        现在 `core` 里数着一轮改了几次，超过 `maxTodoEdits`（10）就往末尾补一句
+        "改清单不是干活，别再重写它了"。加进去一次，之后跟着本回合剩下的请求走
+        （和收尾自检一个路子），回合结束就没了。
+      - **全做完的清单还赖在屏幕上**。`renderRuntime` 以前只在清单为空时才隐藏，
+        六条全绿照样占六七行，看着就像"待办没清掉"（用户连着催了好几次清单该清掉）。
+        现在全部完成时收成一行「✓ 待办 6/6 全部完成」（转成绿字），点一下能展开看明细；
+        展开状态存在 `state.todosExpanded`，不然每几秒一次的轮询会把它折回去。
+      - 测试：`TestTodoNoticeGivesBothWaysOut`（提醒里必须有两条出口、不能再说"接着做"）、
+        `TestRunWarnsAboutRepeatedTodoEdits`（上限前不提醒、过了上限才提醒）。
+        前者对着旧文案跑会失败（旧的那句就是"还没做完就接着做"），确认抓得住旧行为。
 - [ ] 清单没有跟着会话存盘：现在退出就没了。要留的话得进 `domain.Session`。
 
 ### 会话管理
@@ -397,5 +476,5 @@
 ## 建议顺序
 
 1. 无界面模式 —— 改动集中在 `src/cli/cli.go`，复用现有的 `core.Loop`
-2. `src/web` 联网工具 —— "查这个库最新用法"这类问题的成功率会明显提升
-3. README + `doc/ARCH.md` —— 顺手把上面几个空目录的规划写进去，免得下次又忘
+2. README + `doc/ARCH.md` —— 顺手把上面几个空目录的规划写进去，免得下次又忘
+3. 搜索结果缓存 —— 现在同一个查询连问两次就是两次模型轮次的钱

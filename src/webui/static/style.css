@@ -14,6 +14,11 @@
   --bs-tertiary-bg: #1c1f26;
   --bs-border-color: #2c313c;
   --bs-border-color-translucent: #2c313c;
+  /* 内容卡片（正文块、代码块、工具块）专用的边框色，比 --bs-border-color 亮一档。
+     这三块的底色 #1c1f26 和页面底 #16181d 只差几个色阶，用通用边框色画 1px 线时
+     整条边几乎糊在背景里看不出来，块的下边界尤其没有东西衬托。
+     分隔线（顶栏、侧栏）仍旧用 --bs-border-color：那里该淡，不该抢戏 */
+  --block-border: #3f4859;
   --bs-link-color: #6cc08b;
   --bs-link-hover-color: #8dd6a8;
   --bs-code-color: #d787af;
@@ -386,7 +391,7 @@ button.chip.on:hover { background: rgba(217, 194, 106, .20); border-color: rgba(
 /* 工具调用 */
 .tools { display: flex; flex-direction: column; gap: 4px; max-width: min(880px, 94%); }
 .tool {
-  border: 1px solid var(--bs-border-color);
+  border: 1px solid var(--block-border);
   border-radius: 8px;
   background: var(--bs-tertiary-bg);
   overflow: hidden;
@@ -481,6 +486,40 @@ button.chip.on:hover { background: rgba(217, 194, 106, .20); border-color: rgba(
 .tool-fail { color: #e06c75; font-size: 12px; padding-top: 4px; }
 /* 流式回答 */
 .stream { max-width: min(780px, 88%); word-break: break-word; }
+/* 正文块：模型说的一整段话（markdown 排版）包成一个带边框的块，
+   和代码块（.md-pre）、工具块（.tool）同一套观感 —— 一眼看得出
+   "哪段是模型说的"，也不会和上面的思考、下面的工具调用混成一片。
+   宽度和 .tools 取同一个值：两块都带边框，宽度不同时左边会参差得很明显。
+   块定宽，里面的正文就不必再各自限宽了 */
+.text-block {
+  position: relative;
+  max-width: min(880px, 94%);
+  border: 1px solid var(--block-border);
+  border-radius: 8px;
+  background: var(--bs-tertiary-bg);
+  padding: 10px 13px;
+  word-break: break-word;
+}
+/* 还没吐出内容时不摆这个空框（模型先调工具去的那段时间） */
+.text-block[hidden] { display: none; }
+.text-block .stream { max-width: 100%; }
+/* 复制按钮贴在块的右上角边线上，而不是浮在正文上面：铺在字上会挡字，
+   而块里的第一行往往就是最要紧的那句。常态很淡、指到块上才清晰，
+   免得一屏几个块各挂一枚按钮把人看花 */
+.text-block-bar {
+  position: absolute;
+  top: -9px;
+  right: 8px;
+  display: flex;
+}
+.text-block .md-copy {
+  background: var(--bs-tertiary-bg);
+  border-color: var(--block-border);
+  padding: 0 7px;
+  line-height: 16px;
+  opacity: .45;
+}
+.text-block:hover .md-copy { opacity: 1; }
 /* 流式时最后一个字后面那个方块。以前挂在容器的 ::after 上，块级排版之后会掉到
    下面单独一行，所以改成真元素、塞进最后一个块里（见 placeCaret） */
 .caret {
@@ -540,7 +579,7 @@ button.chip.on:hover { background: rgba(217, 194, 106, .20); border-color: rgba(
 /* 代码块：带一条顶栏（语言标签 + 复制），内容自己横滚 */
 .md-pre {
   margin: 0 0 .85em;
-  border: 1px solid var(--bs-border-color);
+  border: 1px solid var(--block-border);
   border-radius: 8px;
   overflow: hidden;
   background: #12141a;
@@ -551,7 +590,7 @@ button.chip.on:hover { background: rgba(217, 194, 106, .20); border-color: rgba(
   gap: 8px;
   padding: 3px 8px 3px 10px;
   background: rgba(255, 255, 255, .04);
-  border-bottom: 1px solid var(--bs-border-color);
+  border-bottom: 1px solid var(--block-border);
   font-size: 11px;
   color: var(--bs-tertiary-color);
 }
@@ -669,6 +708,11 @@ button.chip.on:hover { background: rgba(217, 194, 106, .20); border-color: rgba(
   overflow-y: auto;
 }
 .runtime-title { color: var(--bs-tertiary-color); margin-bottom: 2px; }
+/* 待办全做完时那行标题：变成能点开的开关，颜色转成"完成"的绿，
+   一眼看出这活儿已经收了，不是在等谁 */
+.runtime-title.all-done { color: #6cc08b; }
+.runtime-title.toggle { cursor: pointer; user-select: none; }
+.runtime-title.toggle:hover { color: #8dd6a8; }
 .todo-item.in_progress { color: #d9c26a; }
 .todo-item.completed { color: var(--bs-tertiary-color); text-decoration: line-through; }
 .task-item { display: flex; gap: 8px; align-items: baseline; }

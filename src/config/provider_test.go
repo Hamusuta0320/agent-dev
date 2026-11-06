@@ -115,22 +115,33 @@ func TestSaveProviderFromEmptyFile(t *testing.T) {
 	}
 }
 
-// 思考强度：留空合法（不发这个参数），档位名大小写和空白都认，表外的值必须报错
+// 思考强度：留空合法（不发这个参数），档位名大小写和空白都认，这个类型不认的值必须报错
 func TestParseEffort(t *testing.T) {
 	for _, c := range []struct {
 		in   string
+		typ  string
 		want string
 	}{
-		{"", ""},
-		{"   ", ""},
-		{"low", "low"},
-		{"  Medium ", "medium"},
-		{"HIGH", "high"},
-		{"minimal", "minimal"},
+		{"", "DeepSeek", ""},
+		{"   ", "DeepSeek", ""},
+		{"low", "DeepSeek", "low"},
+		{"  Medium ", "DeepSeek", "medium"},
+		{"HIGH", "DeepSeek", "high"},
+		{"minimal", "DeepSeek", "minimal"},
+		// 这几档是实测 DeepSeek 才认的（发非法值让接口把期望列表吐回来）
+		{"none", "DeepSeek", "none"},
+		{"xhigh", "DeepSeek", "xhigh"},
+		{"ultra", "DeepSeek", "ultra"},
+		{"max", "DeepSeek", "max"},
+		// 类型留空按 DeepSeek 算，和 DefaultApiUrl、provider.New 一个口径
+		{"max", "", "max"},
+		// 另两家只认公共那几档
+		{"low", "OpenAI", "low"},
+		{"high", "MiniMax", "high"},
 	} {
-		got, err := ParseEffort(c.in)
+		got, err := ParseEffort(c.in, c.typ)
 		if err != nil {
-			t.Fatalf("%q 该认下来: %v", c.in, err)
+			t.Fatalf("%q（%s）该认下来: %v", c.in, c.typ, err)
 		}
 		if got != c.want {
 			t.Fatalf("%q 归一成 %q，想要 %q", c.in, got, c.want)
@@ -139,10 +150,20 @@ func TestParseEffort(t *testing.T) {
 
 	// 手打进配置文件里的怪值不能悄悄发给接口：这里就得报错，并且说清楚有哪些档位
 	for _, bad := range []string{"high高", "ludicrous", "1"} {
-		if _, err := ParseEffort(bad); err == nil {
+		if _, err := ParseEffort(bad, "DeepSeek"); err == nil {
 			t.Fatalf("%q 不该被认下来", bad)
 		} else if !strings.Contains(err.Error(), "minimal") {
 			t.Fatalf("报错里该列出档位提醒: %v", err)
+		}
+	}
+
+	// DeepSeek 认的档位不能漏给 OpenAI / MiniMax：那两家的表是公共那几档，
+	// 选一个它们不认的值过去就是 400
+	for _, typ := range []string{"OpenAI", "MiniMax", "认不出的网关"} {
+		for _, level := range []string{"none", "xhigh", "ultra", "max"} {
+			if _, err := ParseEffort(level, typ); err == nil {
+				t.Fatalf("%s 不该认 %q 这一档", typ, level)
+			}
 		}
 	}
 }
@@ -155,8 +176,15 @@ func TestEffortLabel(t *testing.T) {
 	if got := EffortLabel(" Medium "); got != "medium" {
 		t.Fatalf("档位名没归一: %q", got)
 	}
-	if got := strings.Join(EffortLabels(), "/"); got != "默认/minimal/low/medium/high" {
-		t.Fatalf("档位表不对: %q", got)
+	// DeepSeek 那套是实测出来的完整表，顺序按从省到费
+	if got := strings.Join(EffortLabels("DeepSeek"), "/"); got != "默认/none/minimal/low/medium/high/xhigh/ultra/max" {
+		t.Fatalf("DeepSeek 档位表不对: %q", got)
+	}
+	// 另两家和认不出的类型都只有公共那几档
+	for _, typ := range []string{"OpenAI", "MiniMax", "某个网关"} {
+		if got := strings.Join(EffortLabels(typ), "/"); got != "默认/minimal/low/medium/high" {
+			t.Fatalf("%s 的档位表不对: %q", typ, got)
+		}
 	}
 }
 

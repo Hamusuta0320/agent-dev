@@ -76,6 +76,12 @@ func Run(ctx domain.Ctx, session *domain.Session) (string, error) {
 	var notices []domain.AIChatMessage
 	// todoChecked 表示这一回合已经催过一次核销，无论如何不再催第二次，免得打转
 	todoChecked := false
+	// todoEdits 数这一轮里改了几次待办清单。改清单是记账，不是干活：
+	// 实测有会话一轮里改了 16 次、期间 237 条消息，真正的活早就干完了。
+	// 超过 maxTodoEdits 就往末尾加一句，把注意力推回"干完或者收尾"上
+	todoEdits := 0
+	// todoChurnWarned 保证那句话只说一次，别自己又变成新的念叨
+	todoChurnWarned := false
 
 	for step := range maxSteps {
 		// 用户中途按了 Ctrl+C 就别再要下一轮了，赶紧把这一轮结束掉
@@ -91,6 +97,18 @@ func Run(ctx domain.Ctx, session *domain.Session) (string, error) {
 			usage.retrackTools(specs)
 		}
 		emit(domain.Event{Kind: domain.EventStep, Step: step + 1})
+		// 一轮里反复改清单：模型在拿记账打转，不是在干活。
+		// 到上限时加进去一次，之后跟着本回合剩下的请求走（和待办自检一个路子，
+		// 回合结束就没了）；再加就不会加第二句，免得刹车本身变成新的念叨
+		if todoEdits > maxTodoEdits && !todoChurnWarned {
+			todoChurnWarned = true
+			notices = append(notices, domain.AIChatMessage{
+				Role: domain.RoleUser,
+				Content: fmt.Sprintf("## 待办清单\n这一轮你已经改了 %d 次待办清单。"+
+					"改清单不是干活，别再重写它了：要么接着做真正剩下的活，要么直接收尾——"+
+					"这轮做不了的条目按前面说的从清单里删掉，在回答里说明白为什么还欠着。", todoEdits),
+			})
+		}
 		onDelta := func(ev domain.StreamEvent) {
 			kind := domain.EventContent
 			switch ev.Kind {
@@ -182,6 +200,11 @@ func Run(ctx domain.Ctx, session *domain.Session) (string, error) {
 
 			outcomes := runCalls(ctx, tools, emit, always, batch)
 
+			for _, call := range batch {
+				if call.Name == todoToolName {
+					todoEdits++
+				}
+			}
 			for k, call := range batch {
 				// 和 AnswerEnd 一个道理：先 Append 再 emit，
 				// 界面收到这条时落盘才带得上这个工具结果

@@ -476,20 +476,26 @@ func (m *Manager) commandEffort(arg string) commandReply {
 	if arg == "" {
 		now := config.EffortLabel(cur.ReasoningEffort)
 		lines := []string{fmt.Sprintf("思考强度  当前 %s（%s）", now, cur.Label())}
-		for _, level := range config.EffortLevels {
+		levels := config.EffortLevelsFor(cur.Type)
+		for _, level := range levels {
 			mark := "  "
 			if config.EffortLabel(level) == now {
 				mark = "▸ "
 			}
 			lines = append(lines, fmt.Sprintf("%s%s — %s", mark, config.EffortLabel(level), effortHint(level)))
 		}
-		lines = append(lines, "", "调整：/effort low、/effort high、/effort 默认，会写回配置文件")
+		deepest := "high"
+		if n := len(levels); n > 0 {
+			deepest = config.EffortLabel(levels[n-1])
+		}
+		lines = append(lines, "", fmt.Sprintf("调整：/effort low、/effort %s、/effort 默认，会写回配置文件", deepest))
 		return textReply("%s", strings.Join(lines, "\n"))
 	}
 
-	level, ok := parseEffortArg(arg)
+	level, ok := parseEffortArg(arg, cur.Type)
 	if !ok {
-		return textReply("认不出思考强度 %q；可选 %s", arg, strings.Join(config.EffortLabels(), " / "))
+		return textReply("认不出思考强度 %q；%s 这套可选 %s", arg, cur.Type,
+			strings.Join(config.EffortLabels(cur.Type), " / "))
 	}
 	next, target, err := config.WithEffort(cfg, level)
 	if err != nil {
@@ -509,13 +515,17 @@ func (m *Manager) commandEffort(arg string) commandReply {
 	return out
 }
 
-// parseEffortArg 把 /effort 后面那截认成档位。"默认/auto/off" 都表示不发这个参数
-func parseEffortArg(arg string) (string, bool) {
+// parseEffortArg 把 /effort 后面那截认成档位。"默认/auto/off" 都表示不发这个参数。
+//
+// "none" 故意不在这里当别名：DeepSeek 真认这一档（明确让它别思考），
+// 和"压根不发这个字段、用模型自己的默认"是两回事。把它归到空串，
+// 用户想关掉思考反而配成了"看模型心情"
+func parseEffortArg(arg, typ string) (string, bool) {
 	switch strings.ToLower(strings.TrimSpace(arg)) {
-	case "默认", "default", "auto", "off", "none":
+	case "默认", "default", "auto", "off":
 		return "", true
 	}
-	level, err := config.ParseEffort(arg)
+	level, err := config.ParseEffort(arg, typ)
 	if err != nil {
 		return "", false
 	}
@@ -525,6 +535,8 @@ func parseEffortArg(arg string) (string, bool) {
 // effortHint 是一句话说明某个档位是什么意思
 func effortHint(level string) string {
 	switch config.EffortLabel(level) {
+	case "none":
+		return "明确不思考，直接答（和「默认」不是一个意思：默认是看模型自己的设置）"
 	case "minimal":
 		return "几乎不思考，最快，只有认这档的接口支持"
 	case "low":
@@ -533,6 +545,12 @@ func effortHint(level string) string {
 		return "均衡"
 	case "high":
 		return "想得最久最深，最慢也最费 token"
+	case "xhigh":
+		return "比 high 再深一档，更慢更费"
+	case "ultra":
+		return "很深的思考，慢且费 token"
+	case "max":
+		return "最深的一档，最慢也最费 token"
 	default:
 		return "不发这个参数，用模型自己的默认"
 	}

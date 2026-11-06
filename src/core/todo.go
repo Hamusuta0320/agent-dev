@@ -38,6 +38,11 @@ func lastTodos(session *domain.Session) []tool.TodoItem {
 	return nil
 }
 
+// maxTodoEdits 是一轮里允许改几次待办清单。留得很宽：一份五条的清单，
+// 正常"开工列一次、逐条核销三四次、收尾一次"也就五六次，十次足够。
+// 它只拦"拿清单打转"那种——实测有会话一轮改了 16 次
+const maxTodoEdits = 10
+
 // todoNotice 在模型准备收尾（这一轮不再调用工具）时检查待办清单，
 // 还有没做完的条目就拼一条提醒让它回去核销。返回 nil 表示可以收尾。
 //
@@ -64,9 +69,12 @@ func todoNotice(session *domain.Session) []domain.AIChatMessage {
 	if sb.Len() == 0 {
 		return nil
 	}
-	sb.WriteString("做完的立刻用 TodoWrite 标成 completed；还没做完就接着做。\n")
-	sb.WriteString("确实做不了（要等用户决定，或者已经不需要了）也能收尾，" +
-		"但要么把它从清单里去掉、要么在回答里说清楚为什么还留着——" +
-		"一条永远挂在 in_progress 上，用户会以为活没干完。")
+	sb.WriteString("两条路选一条，别反复改同一条的措辞：\n")
+	sb.WriteString("  1. 现在就能做完的，立刻用 TodoWrite 标成 completed；\n")
+	sb.WriteString("  2. 这一轮做不了的，按实际情况办——要等用户拿主意、已经不需要了，\n")
+	sb.WriteString("     或者必须等这一轮结束才谈得上验证（比如\"重启后生效\"，而重启正是在等这一轮跑完），\n")
+	sb.WriteString("     就把它从清单里删掉，并在回答里说清楚为什么还欠着。\n")
+	sb.WriteString("把\"重启生效\"改写成\"重启\"让它看起来能收尾，不算做完；" +
+		"一轮里反复重写同一份清单也解决不了问题。")
 	return []domain.AIChatMessage{{Role: domain.RoleUser, Content: sb.String()}}
 }

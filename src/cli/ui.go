@@ -1736,10 +1736,11 @@ func (m model) adjustEffort(input string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	level, ok := effortArg(arg)
+	level, ok := effortArg(arg, cur.Type)
 	if !ok {
 		return m, m.print(errStyle.Render(fmt.Sprintf(
-			"认不出思考强度 %q；可选 %s（/effort 看看当前是什么）", arg, strings.Join(config.EffortLabels(), " / "))))
+			"认不出思考强度 %q；%s 这套可选 %s（/effort 看看当前是什么）",
+			arg, cur.Type, strings.Join(config.EffortLabels(cur.Type), " / "))))
 	}
 
 	// 名字先补齐，和 SaveModels 写回时补的一致，两边才认得出是同一套；
@@ -1760,13 +1761,16 @@ func (m model) adjustEffort(input string) (tea.Model, tea.Cmd) {
 }
 
 // effortArg 把 /effort 后面那截认成档位。档位名本身之外，"默认/auto/off" 都表示不发这个参数；
-// 认不出来返回 false，让界面提示可选值
-func effortArg(arg string) (string, bool) {
+// 认不出来返回 false，让界面提示可选值。
+//
+// "none" 不在这里当别名：DeepSeek 真认这一档（明确让它别思考），
+// 和"压根不发这个字段"是两回事
+func effortArg(arg, typ string) (string, bool) {
 	switch strings.ToLower(strings.TrimSpace(arg)) {
-	case "默认", "default", "auto", "off", "none":
+	case "默认", "default", "auto", "off":
 		return "", true
 	}
-	level, err := config.ParseEffort(arg)
+	level, err := config.ParseEffort(arg, typ)
 	if err != nil {
 		return "", false
 	}
@@ -1776,6 +1780,8 @@ func effortArg(arg string) (string, bool) {
 // effortHint 是一句话说明某个档位是什么意思
 func effortHint(level string) string {
 	switch config.EffortLabel(level) {
+	case "none":
+		return "明确不思考，直接答（和「默认」不是一个意思）"
 	case "minimal":
 		return "几乎不思考，最快，只有认这档的接口支持"
 	case "low":
@@ -1784,6 +1790,12 @@ func effortHint(level string) string {
 		return "均衡"
 	case "high":
 		return "想得最久最深，最慢也最费 token"
+	case "xhigh":
+		return "比 high 再深一档，更慢更费"
+	case "ultra":
+		return "很深的思考，慢且费 token"
+	case "max":
+		return "最深的一档，最慢也最费 token"
 	default:
 		return "不发这个参数，用模型自己的默认"
 	}

@@ -139,7 +139,7 @@ const Markdown = (() => {
     }
     const copy = el("button", "md-copy", "复制");
     copy.type = "button";
-    copy.addEventListener("click", () => copyCode(copy, code));
+    copy.addEventListener("click", () => copyText(copy, code));
     bar.append(copy);
     const pre = el("pre");
     const codeEl = el("code");
@@ -149,9 +149,10 @@ const Markdown = (() => {
     return box;
   }
 
-  // copyCode 复制代码块内容。剪贴板 API 只在安全上下文（https / localhost）里有，
-  // 拿不到就退回选中文本让用户自己按 Ctrl+C —— 别让人以为点了没反应
-  function copyCode(button, code) {
+  // copyText 把文本放进剪贴板，并给按钮一句反馈。剪贴板 API 只在安全上下文
+  // （https / localhost）里有，拿不到就退回"按 Ctrl+C"——别让人以为点了没反应。
+  // 正文块和代码块共用这一份，两处的反馈行为才不会各走一套
+  function copyText(button, content) {
     const done = (ok) => {
       button.textContent = ok ? "已复制" : "按 Ctrl+C";
       setTimeout(() => {
@@ -159,7 +160,7 @@ const Markdown = (() => {
       }, 1400);
     };
     if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(code).then(() => done(true), () => done(false));
+      navigator.clipboard.writeText(content).then(() => done(true), () => done(false));
       return;
     }
     done(false);
@@ -506,5 +507,5 @@ const Markdown = (() => {
     flush();
   }
 
-  return { fragment, into };
+  return { fragment, into, copyText };
 })();

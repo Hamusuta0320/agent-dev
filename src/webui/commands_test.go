@@ -303,8 +303,15 @@ func TestHTTPConfigForm(t *testing.T) {
 	if view.Type != "DeepSeek" || view.Model != "test-model" || view.ContextLimit != "40000" {
 		t.Fatalf("表单值不对: %+v", view)
 	}
-	if len(view.Types) != len(config.ProviderTypes) || len(view.Efforts) != len(config.EffortLevels) {
+	if len(view.Types) != len(config.ProviderTypes) || len(view.Efforts) != len(config.EffortLevelsFor(view.Type)) {
 		t.Fatalf("下拉框的可选项没带上: %+v", view)
+	}
+	// 各类型的档位表都要给出来：前端切类型时要照着换下拉
+	if len(view.EffortLevels) != len(config.ProviderTypes) {
+		t.Fatalf("各类型的档位表没带上: %+v", view.EffortLevels)
+	}
+	if got := len(view.EffortLevels["DeepSeek"]); got != len(config.EffortLevelsFor("DeepSeek")) {
+		t.Fatalf("DeepSeek 的档位表不全: %+v", view.EffortLevels["DeepSeek"])
 	}
 
 	// 改模型名和思考强度，密钥留空：密钥要保住

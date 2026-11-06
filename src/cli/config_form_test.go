@@ -268,13 +268,13 @@ func TestConfigFormSwitchEffort(t *testing.T) {
 		t.Fatalf("该提示用 ←→ 切: %q", got.form.err)
 	}
 
-	// → 一档一档往上加
+	// → 一档一档往上加。DeepSeek 认得全：none / minimal / low / medium / high / xhigh / ultra / max
 	next, _ := got.handleConfigKey(tea.KeyPressMsg{Code: tea.KeyRight})
 	got = next.(model)
-	if v := got.form.value(effortField); v != "minimal" {
-		t.Fatalf("→ 之后该是 minimal，实际 %q", v)
+	if v := got.form.value(effortField); v != "none" {
+		t.Fatalf("→ 之后该是 none，实际 %q", v)
 	}
-	for _, want := range []string{"low", "medium", "high"} {
+	for _, want := range []string{"minimal", "low", "medium", "high", "xhigh", "ultra", "max"} {
 		next, _ = got.handleConfigKey(tea.KeyPressMsg{Code: tea.KeyRight})
 		got = next.(model)
 		if v := got.form.value(effortField); v != want {
@@ -285,13 +285,13 @@ func TestConfigFormSwitchEffort(t *testing.T) {
 	next, _ = got.handleConfigKey(tea.KeyPressMsg{Code: tea.KeyRight})
 	got = next.(model)
 	if v := got.form.value(effortField); v != "" {
-		t.Fatalf("high 之后再按 → 该绕回默认，实际 %q", v)
+		t.Fatalf("max 之后再按 → 该绕回默认，实际 %q", v)
 	}
 	// ← 从默认绕到最后一档
 	next, _ = got.handleConfigKey(tea.KeyPressMsg{Code: tea.KeyLeft})
 	got = next.(model)
-	if v := got.form.value(effortField); v != "high" {
-		t.Fatalf("从默认往前该绕到 high，实际 %q", v)
+	if v := got.form.value(effortField); v != "max" {
+		t.Fatalf("从默认往前该绕到 max，实际 %q", v)
 	}
 
 	// 存下来：配置里带着思考强度，重建的表单也还是这一档
@@ -302,15 +302,15 @@ func TestConfigFormSwitchEffort(t *testing.T) {
 	if err != nil {
 		t.Fatalf("保存后读配置失败: %v", err)
 	}
-	if mc.ReasoningEffort != "high" {
+	if mc.ReasoningEffort != "max" {
 		t.Fatalf("思考强度没存进配置: %+v", mc)
 	}
-	if v := saved.(model).form.value(effortField); v != "high" {
-		t.Fatalf("保存后表单里该还是 high，实际 %q", v)
+	if v := saved.(model).form.value(effortField); v != "max" {
+		t.Fatalf("保存后表单里该还是 max，实际 %q", v)
 	}
 
 	// /model 列表里能看出这套模型配了什么思考强度
-	if hint := modelHint(mc); !strings.Contains(hint, "思考 high") {
+	if hint := modelHint(mc); !strings.Contains(hint, "思考 max") {
 		t.Fatalf("/model 的说明里该带上思考强度: %q", hint)
 	}
 
@@ -319,7 +319,7 @@ func TestConfigFormSwitchEffort(t *testing.T) {
 	odd.cur = effortField
 	m.form = odd
 	next, _ = m.handleConfigKey(tea.KeyPressMsg{Code: tea.KeyRight})
-	if v := next.(model).form.value(effortField); v != "minimal" {
+	if v := next.(model).form.value(effortField); v != "none" {
 		t.Fatalf("表外的档位该从第一档接着走，实际 %q", v)
 	}
 }

@@ -30,13 +30,17 @@ type configView struct {
 	// 用户照样可以手填带单位的写法（128k、1M 都认）
 	ContextLimit string `json:"context_limit"`
 	Effort       string `json:"effort"`
-	// Types / Efforts 是下拉框的可选项，前端不用自己写死一份
+	// Types / Efforts 是下拉框的可选项，前端不用自己写死一份。
+	// Efforts 是**当前这个类型**的那几档
 	Types   []string `json:"types"`
 	Efforts []string `json:"efforts"`
 	CfgPath string   `json:"cfg_path"`
 	// DefaultUrls 是各类型的内置接口地址：前端切类型时能直接把地址带出来，
 	// 不用用户再抄一遍（终端界面里切类型也是这个行为）
 	DefaultUrls map[string]string `json:"default_urls"`
+	// EffortLevels 是各类型各自的档位：DeepSeek 认的比另两家多（none/xhigh/ultra/max）。
+	// 前端切类型时要跟着换下拉框，不然选到一个接口根本不认的值，保存下去就是 400
+	EffortLevels map[string][]string `json:"effort_levels"`
 	// Models 是配置文件里已有的几套模型名，前端提示"改的是哪一套"
 	Models []string `json:"models"`
 }
@@ -59,6 +63,7 @@ func (m *Manager) configForm() configView {
 	out.ApiKeySet = strings.TrimSpace(mc.ApiKey) != ""
 	out.ContextLimit = strconv.Itoa(mc.Limit())
 	out.Effort = config.EffortLabel(mc.ReasoningEffort)
+	out.Efforts = config.EffortLabels(out.Type)
 	return out
 }
 
@@ -75,19 +80,22 @@ func (m *Manager) newConfigForm() configView {
 	out.ApiKeySet = false
 	out.ContextLimit = strconv.Itoa(config.DefaultContextLimit)
 	out.Effort = config.EffortLabel("")
+	out.Efforts = config.EffortLabels(out.Type)
 	return out
 }
 
-// baseConfigView 是两种表单都一样的部分：可选项、配置文件路径、已有的模型名
+// baseConfigView 是两种表单都一样的部分：可选项、配置文件路径、已有的模型名。
+// Efforts 不在这里定：它是"当前这套类型"的档位，得知道 Type 才能给对
 func (m *Manager) baseConfigView(cfg config.GlobalConfig) configView {
 	out := configView{
-		Types:       config.ProviderTypes,
-		Efforts:     config.EffortLabels(),
-		CfgPath:     m.cfgPath,
-		DefaultUrls: make(map[string]string, len(config.ProviderTypes)),
+		Types:        config.ProviderTypes,
+		CfgPath:      m.cfgPath,
+		DefaultUrls:  make(map[string]string, len(config.ProviderTypes)),
+		EffortLevels: make(map[string][]string, len(config.ProviderTypes)),
 	}
 	for _, typ := range config.ProviderTypes {
 		out.DefaultUrls[typ] = config.DefaultApiUrl(typ)
+		out.EffortLevels[typ] = config.EffortLabels(typ)
 	}
 	for _, model := range cfg.AvailableModels() {
 		out.Models = append(out.Models, model.Label())
@@ -173,9 +181,10 @@ func (m *Manager) saveConfig(req configRequest) (configView, error) {
 	if mc.ApiUrl == "" {
 		mc.ApiUrl = config.DefaultApiUrl(mc.Type)
 	}
-	// 思考强度只认表里那几档，写错了直接报，别塞给接口换一个 400 回来
+	// 思考强度只认这个类型认的那几档，写错了直接报，别塞给接口换一个 400 回来。
+	// 注意 mc.Type 这时已经过 normalizeType（空类型归成 DeepSeek）
 	effort := strings.ToLower(strings.TrimSpace(req.Effort))
-	if _, err := config.ParseEffort(effort); err != nil {
+	if _, err := config.ParseEffort(effort, mc.Type); err != nil {
 		return configView{}, err
 	}
 	mc.ReasoningEffort = effort

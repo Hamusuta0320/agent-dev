@@ -34,24 +34,59 @@ var ProviderTypes = []string{"DeepSeek", "OpenAI", "MiniMax"}
 // EffortLevels 是"思考强度"的档位，从省到费排。/config 里用 ←→ 在这个表里循环，
 // 空串表示压根不发这个参数（模型用自家默认值）——那是最保险的一档，
 // 因为认不认 reasoning_effort 全看各家接口
-var EffortLevels = []string{"", "minimal", "low", "medium", "high"}
+//
+// 各家认的档位不一样，所以按类型分开（见 EffortLevelsFor）。deepseek 那份是**实测**
+// 出来的，不是照文档抄的：故意发一个非法值，接口会把自己的期望列表原样回过来——
+//
+//	422 unknown variant `ludicrous`, expected one of
+//	    `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `ultra`, `max`
+//
+// openai / minimax 这两家没实测过（手上没有可信的验证手段），保持原来那几档：
+// 不确定的档位不往里加，加进去只会让人选到一个接口不认的值，再换回一个 400
+var (
+	effortLevelsDeepSeek = []string{"", "none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"}
+	// effortLevelsCommon 是各家几乎都认的那几档，认不出类型时用它
+	effortLevelsCommon = []string{"", "minimal", "low", "medium", "high"}
+	effortLevelsByType = map[string][]string{
+		"deepseek": effortLevelsDeepSeek,
+		"openai":   effortLevelsCommon,
+		"minimax":  effortLevelsCommon,
+	}
+)
+
+// EffortLevelsFor 返回某个类型能用的档位。
+// 类型留空按 DeepSeek 算——和 DefaultApiUrl、provider.New 是同一个口径
+// （老的配置文件里没有 Type 这一项，那会儿就是 DeepSeek）。
+// 认不出的类型给公共的那几档：瞎给一整套 DeepSeek 的档位，等于让人配上一个
+// 自家网关根本不认的值
+func EffortLevelsFor(typ string) []string {
+	key := strings.ToLower(strings.TrimSpace(typ))
+	if key == "" {
+		key = "deepseek"
+	}
+	if levels, ok := effortLevelsByType[key]; ok {
+		return levels
+	}
+	return effortLevelsCommon
+}
 
 // ParseEffort 把配置里的思考强度归一成小写档位名。留空是合法的（不发这个参数），
-// 写了表外的值就报错：悄悄塞给接口换回一个 400，比在这里说清楚糟得多
-func ParseEffort(effort string) (string, error) {
+// 写了这个类型不认的值就报错：悄悄塞给接口换回一个 400，比在这里说清楚糟得多
+func ParseEffort(effort, typ string) (string, error) {
 	want := strings.ToLower(strings.TrimSpace(effort))
-	for _, level := range EffortLevels {
+	for _, level := range EffortLevelsFor(typ) {
 		if want == level {
 			return level, nil
 		}
 	}
-	return "", fmt.Errorf("思考强度只认 %s（留空表示按模型默认）", strings.Join(EffortLabels(), " / "))
+	return "", fmt.Errorf("思考强度只认 %s（留空表示按模型默认）", strings.Join(EffortLabels(typ), " / "))
 }
 
 // EffortLabels 是档位的显示名：空档叫"默认"，其余就是档位名本身
-func EffortLabels() []string {
-	out := make([]string, 0, len(EffortLevels))
-	for _, level := range EffortLevels {
+func EffortLabels(typ string) []string {
+	levels := EffortLevelsFor(typ)
+	out := make([]string, 0, len(levels))
+	for _, level := range levels {
 		out = append(out, EffortLabel(level))
 	}
 	return out

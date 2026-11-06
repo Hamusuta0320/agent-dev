@@ -467,8 +467,9 @@ func NewDeepSeek(dc config.DeepSeekConfig) (DeepSeekProvider, error) {
 		}
 		return DeepSeekProvider{}, fmt.Errorf("模型 %s 的配置不完整：ApiUrl/ApiKey/Model 必填", label)
 	}
-	// 思考强度写错了在这里就说清楚，别等接口回一个 400 让人猜
-	effort, err := config.ParseEffort(dc.ReasoningEffort)
+	// 思考强度写错了在这里就说清楚，别等接口回一个 400 让人猜。
+	// 按这套模型的类型取档位：DeepSeek 认的比另两家多
+	effort, err := config.ParseEffort(dc.ReasoningEffort, dc.Type)
 	if err != nil {
 		return DeepSeekProvider{}, fmt.Errorf("模型 %s 的 ReasoningEffort 有问题: %w", dc.Label(), err)
 	}

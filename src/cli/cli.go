@@ -14,6 +14,7 @@ import (
 	"hamusuta/agent-dev/src/session"
 	"hamusuta/agent-dev/src/tool"
 	"hamusuta/agent-dev/src/util"
+	"hamusuta/agent-dev/src/web"
 	"hamusuta/agent-dev/src/webui"
 
 	tea "charm.land/bubbletea/v2"
@@ -54,6 +55,10 @@ func main() {
 	if msg := joinNotice(notice, cfgNotice); msg != "" {
 		fmt.Fprintln(os.Stderr, msg)
 	}
+
+	// 装配联网后端（搜索 / 抓取）。只注册不发请求，两个界面共用这一份；
+	// 放这么早是因为它只依赖配置，和界面无关
+	web.Configure(cfg)
 
 	if wantWeb {
 		// Ctrl+C 停服务。这里自己管信号而不用 signal.NotifyContext，是为了能响应第二次：

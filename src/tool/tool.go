@@ -52,6 +52,8 @@ var grepTool GrepTool
 var globTool GlobTool
 var taskTool TaskTool
 var todoTool TodoTool
+var webSearchTool WebSearchTool
+var webFetchTool WebFetchTool
 
 var Tools map[string]domain.Tool = map[string]domain.Tool{
 	readTool.Name():  readTool,
@@ -62,6 +64,9 @@ var Tools map[string]domain.Tool = map[string]domain.Tool{
 	bashTool.Name():  bashTool,
 	taskTool.Name():  taskTool,
 	todoTool.Name():  todoTool,
+	// 联网：搜索和抓取，都只读
+	webSearchTool.Name(): webSearchTool,
+	webFetchTool.Name():  webFetchTool,
 }
 
 // ForMode 返回当前工作模式下该交给模型的工具：只读模式把会改动磁盘的
