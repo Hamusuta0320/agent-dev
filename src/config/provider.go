@@ -209,6 +209,156 @@ func SaveModels(path string, models []ModelConfig, current string) error {
 	)
 }
 
+// PickModel 把一个名字认成一套配置：名字和模型名都能认，前面几个字对得上也算，
+// 但必须只对上一套——两套以上拿不准时让用户说全。终端和浏览器界面的 /model 都用它
+func PickModel(models []ModelConfig, arg string) (ModelConfig, bool) {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return ModelConfig{}, false
+	}
+	for _, mc := range models {
+		if matchesModel(mc, arg) {
+			return mc, true
+		}
+	}
+	var matched []ModelConfig
+	for _, mc := range models {
+		if strings.HasPrefix(strings.ToLower(mc.Label()), strings.ToLower(arg)) {
+			matched = append(matched, mc)
+		}
+	}
+	if len(matched) == 1 {
+		return matched[0], true
+	}
+	return ModelConfig{}, false
+}
+
+// EditModel 改 models 里叫 label 的那套：换成 mc。mc.Name 是新名字，
+// 和 label 不同就是改名（原地换，不会多出一套）。
+// 返回新的模型列表和新的 Current
+func EditModel(models []ModelConfig, current, label string, mc ModelConfig) ([]ModelConfig, string, error) {
+	idx := indexOfModel(models, label)
+	if idx < 0 {
+		return nil, "", fmt.Errorf("没有叫 %q 的模型", label)
+	}
+	mc = withName(mc)
+	// 新名字和别的撞了就说清楚，不默默覆盖人家配好的那套
+	for i, other := range models {
+		if i == idx {
+			continue
+		}
+		if strings.EqualFold(other.Label(), mc.Name) {
+			return nil, "", fmt.Errorf("已经有叫 %q 的模型了", mc.Name)
+		}
+	}
+	out := append([]ModelConfig(nil), models...)
+	out[idx] = mc
+	next := current
+	// 改的正是当前那套时，Current 跟着换成新名字
+	if isCurrentIndex(models, current, idx) {
+		next = mc.Label()
+	}
+	return out, next, nil
+}
+
+// AddModel 追加一套新的。mc.Name 空就用模型名当名字。
+// 名字和现有的撞了报错——不默默覆盖人家配好的那套
+func AddModel(models []ModelConfig, mc ModelConfig) ([]ModelConfig, error) {
+	mc = withName(mc)
+	for _, other := range models {
+		if strings.EqualFold(other.Label(), mc.Name) {
+			return nil, fmt.Errorf("已经有叫 %q 的模型了", mc.Name)
+		}
+	}
+	return append(append([]ModelConfig(nil), models...), mc), nil
+}
+
+// DeleteModel 删掉 models 里叫 label 的那套。删的是当前那套就改用剩下的第一套。
+// 只剩一套时删不了：配置里一套都没有的话启动就报错
+func DeleteModel(models []ModelConfig, current, label string) ([]ModelConfig, string, error) {
+	idx := indexOfModel(models, label)
+	if idx < 0 {
+		return nil, "", fmt.Errorf("没有叫 %q 的模型", label)
+	}
+	if len(models) <= 1 {
+		return nil, "", fmt.Errorf("只剩一套模型了，删不掉")
+	}
+	out := make([]ModelConfig, 0, len(models)-1)
+	out = append(out, models[:idx]...)
+	out = append(out, models[idx+1:]...)
+	next := current
+	// 删掉的正是当前那套时，改用剩下的第一套
+	if isCurrentIndex(models, current, idx) {
+		next = out[0].Label()
+	}
+	return out, next, nil
+}
+
+// withName 把名字补齐：没填就用模型名当名字（和 SaveModels 里一个口径）
+func withName(mc ModelConfig) ModelConfig {
+	if strings.TrimSpace(mc.Name) == "" {
+		mc.Name = mc.Label()
+	}
+	return mc
+}
+
+// indexOfModel 找出叫 label 的那套在列表里的位置。名字和模型名都认，
+// 但只做精确匹配，不做 PickModel 那种前缀匹配——增删改都得指准是哪一套，
+// 认不出返回 -1
+func indexOfModel(models []ModelConfig, label string) int {
+	label = strings.TrimSpace(label)
+	if label == "" {
+		return -1
+	}
+	for i, mc := range models {
+		if matchesModel(mc, label) {
+			return i
+		}
+	}
+	return -1
+}
+
+// isCurrentIndex 判断第 idx 套是不是当前生效的那套。
+// Current 留空时按第一套算，和 CurrentModel() 一个口径
+func isCurrentIndex(models []ModelConfig, current string, idx int) bool {
+	if idx < 0 || idx >= len(models) {
+		return false
+	}
+	if strings.TrimSpace(current) == "" {
+		return idx == 0
+	}
+	return matchesModel(models[idx], current)
+}
+
+// WithEffort 返回一份"当前这套模型的思考强度改成 level"的配置，以及改的那套模型。
+// 只动内存里这份，写回文件由调用方用 SaveModels 做：两个界面都是先让新值生效、
+// 写回失败只提示一句，不能因为磁盘写不进去就把这次运行也作废
+func WithEffort(cfg GlobalConfig, level string) (GlobalConfig, ModelConfig, error) {
+	cur, err := cfg.CurrentModel()
+	if err != nil {
+		return cfg, ModelConfig{}, err
+	}
+	// 名字先补齐，和 SaveModels 写回时补的一致，两边才认得出是同一套
+	models := cfg.AvailableModels()
+	for i := range models {
+		if strings.TrimSpace(models[i].Name) == "" {
+			models[i].Name = models[i].Label()
+		}
+	}
+	// 当前这套就是要改的那套：按名字找，找不到（配置刚被改坏）就退回第一套
+	target := 0
+	for i := range models {
+		if strings.EqualFold(models[i].Label(), cur.Label()) {
+			target = i
+			break
+		}
+	}
+	models[target].ReasoningEffort = level
+	cfg.Models = models
+	cfg.Current = models[target].Label()
+	return cfg, models[target], nil
+}
+
 // SaveProvider 只把 Provider 这一段写回去（配置里只有一套模型时的写法）
 func SaveProvider(path string, dc DeepSeekConfig) error {
 	var provider yaml.Node

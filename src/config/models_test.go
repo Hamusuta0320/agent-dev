@@ -116,3 +116,106 @@ func TestSaveModelsRoundTrip(t *testing.T) {
 		t.Fatal("Current 认不出时应该报错")
 	}
 }
+
+// 改现有那套：改名是原地换，Current 跟着更新，列表长度不变
+func TestEditModelRenames(t *testing.T) {
+	models := []ModelConfig{
+		{Name: "快", Type: "DeepSeek", ApiUrl: "https://a", ApiKey: "sk-a", Model: "model-a"},
+		{Name: "稳", Type: "OpenAI", ApiUrl: "https://b", ApiKey: "sk-b", Model: "model-b"},
+	}
+	next, current, err := EditModel(models, "快", "快", ModelConfig{
+		Name: "飞快", Type: "DeepSeek", ApiUrl: "https://a", ApiKey: "sk-a", Model: "model-a",
+	})
+	if err != nil {
+		t.Fatalf("改名失败: %v", err)
+	}
+	if len(next) != 2 {
+		t.Fatalf("改名不该多出一套，实际 %d 套: %+v", len(next), next)
+	}
+	if next[0].Name != "飞快" {
+		t.Fatalf("名字没换过来: %+v", next[0])
+	}
+	if current != "飞快" {
+		t.Fatalf("Current 该跟着改名，实际 %q", current)
+	}
+
+	// 改的不是当前那套：Current 不动
+	_, current, err = EditModel(models, "快", "稳", ModelConfig{Name: "稳", Type: "OpenAI", Model: "model-b"})
+	if err != nil {
+		t.Fatalf("改别的失败: %v", err)
+	}
+	if current != "快" {
+		t.Fatalf("改别的时 Current 不该动，实际 %q", current)
+	}
+
+	// 新名字和别的撞了：报错，不覆盖
+	if _, _, err := EditModel(models, "快", "快", ModelConfig{Name: "稳", Model: "model-a"}); err == nil {
+		t.Fatal("撞名时应该报错")
+	}
+	// 找不到要改的那套：报错
+	if _, _, err := EditModel(models, "快", "没有这个", ModelConfig{Name: "x", Model: "m"}); err == nil {
+		t.Fatal("找不到时应该报错")
+	}
+}
+
+// 新增一套：追加到末尾、Current 不动、撞名报错
+func TestAddModel(t *testing.T) {
+	models := []ModelConfig{{Name: "快", Model: "model-a"}}
+	next, err := AddModel(models, ModelConfig{Name: "稳", Type: "OpenAI", Model: "model-b"})
+	if err != nil {
+		t.Fatalf("新增失败: %v", err)
+	}
+	if len(next) != 2 || next[1].Name != "稳" {
+		t.Fatalf("新的一套该追加到末尾: %+v", next)
+	}
+	if next[0].Name != "快" {
+		t.Fatalf("原来那套不该被动: %+v", next[0])
+	}
+	// 名字留空用模型名兜底
+	next, err = AddModel(models, ModelConfig{Model: "model-c"})
+	if err != nil {
+		t.Fatalf("新增失败: %v", err)
+	}
+	if next[1].Name != "model-c" {
+		t.Fatalf("名字留空该用模型名: %+v", next[1])
+	}
+	// 撞名报错，不覆盖
+	if _, err := AddModel(models, ModelConfig{Name: "快", Model: "model-x"}); err == nil {
+		t.Fatal("撞名时应该报错")
+	}
+}
+
+// 删一套：删的是当前那套就改用剩下的第一套，只剩一套删不掉
+func TestDeleteModel(t *testing.T) {
+	models := []ModelConfig{
+		{Name: "快", Model: "model-a"},
+		{Name: "稳", Model: "model-b"},
+		{Name: "慢", Model: "model-c"},
+	}
+	next, current, err := DeleteModel(models, "快", "快")
+	if err != nil {
+		t.Fatalf("删除失败: %v", err)
+	}
+	if len(next) != 2 {
+		t.Fatalf("该少一套，实际 %d 套: %+v", len(next), next)
+	}
+	if current != "稳" {
+		t.Fatalf("删掉当前那套该改用剩下的第一套，实际 %q", current)
+	}
+	// 删的不是当前那套：Current 不动
+	_, current, err = DeleteModel(models, "快", "慢")
+	if err != nil {
+		t.Fatalf("删除失败: %v", err)
+	}
+	if current != "快" {
+		t.Fatalf("Current 不该动，实际 %q", current)
+	}
+	// 只剩一套：删不掉
+	if _, _, err := DeleteModel(models[:1], "快", "快"); err == nil {
+		t.Fatal("只剩一套时应该报错")
+	}
+	// 找不到：报错
+	if _, _, err := DeleteModel(models, "快", "没有这个"); err == nil {
+		t.Fatal("找不到时应该报错")
+	}
+}
