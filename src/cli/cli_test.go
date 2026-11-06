@@ -30,6 +30,7 @@ func TestParseCommand(t *testing.T) {
 		"/new":       cmdNew,
 		"/resume":    cmdResume,
 		"/session":   cmdSession,
+		"/compact":   cmdCompact,
 		"/exit":      cmdExit,
 		"/quit":      cmdExit,
 		"exit":       cmdExit,
@@ -44,6 +45,17 @@ func TestParseCommand(t *testing.T) {
 		if got := parseCommand(input); got != want {
 			t.Fatalf("%q 解析成了 %v，应该是 %v", input, got, want)
 		}
+	}
+}
+
+// 配置是空的时候 /compact 建不起 provider：报一句错就回空闲，别把界面卡在"压缩中"
+func TestSubmitCompactWithoutModel(t *testing.T) {
+	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+	m.input.SetValue("/compact")
+
+	got, _ := m.submit()
+	if s := got.(model).state; s != stateIdle {
+		t.Fatalf("/compact 建不起 provider 时不该进入跑着状态，实际 %v", s)
 	}
 }
 
@@ -239,8 +251,8 @@ func TestWithMark(t *testing.T) {
 // 输入以 / 开头时列出能补全的命令，打全了就不再提示
 func TestSuggestCommands(t *testing.T) {
 	cases := map[string][]string{
-		"/":     {"/help", "/new", "/resume", "/session", "/config", "/mode", "/model", "/effort", "/skills", "/todo", "/quiet", "/exit"},
-		"/c":    {"/config"},
+		"/":     {"/help", "/new", "/resume", "/session", "/compact", "/config", "/mode", "/model", "/effort", "/skills", "/todo", "/quiet", "/exit"},
+		"/c":    {"/compact", "/config"},
 		"/re":   {"/resume"},
 		"/se":   {"/session"},
 		"/ef":   {"/effort"},
@@ -267,7 +279,7 @@ func TestSuggestCommands(t *testing.T) {
 func TestCompleteCommand(t *testing.T) {
 	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
 
-	m.input.SetValue("/co")
+	m.input.SetValue("/con")
 	got, _ := m.handleKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyTab}))
 	if v := got.(model).input.Value(); v != "/config " {
 		t.Fatalf("Tab 应该补全成 /config，实际 %q", v)
@@ -308,34 +320,34 @@ func TestCompleteCommandAlternateKeys(t *testing.T) {
 	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
 
 	// Ctrl+Space
-	m.input.SetValue("/co")
+	m.input.SetValue("/con")
 	got, _ := m.handleKey(tea.KeyPressMsg(tea.Key{Code: tea.KeySpace, Mod: tea.ModCtrl}))
 	if v := got.(model).input.Value(); v != "/config " {
 		t.Fatalf("Ctrl+Space 应该补全成 /config，实际 %q", v)
 	}
 
 	// 有的终端把 Tab 解码成 ctrl+i（和 Tab 是同一个字节）
-	m.input.SetValue("/co")
+	m.input.SetValue("/con")
 	got, _ = m.handleKey(tea.KeyPressMsg(tea.Key{Code: 'i', Mod: tea.ModCtrl}))
 	if v := got.(model).input.Value(); v != "/config " {
 		t.Fatalf("ctrl+i 应该当成 Tab 补全，实际 %q", v)
 	}
 
 	// 光标在行尾时 → 接受补全
-	m.input.SetValue("/co")
+	m.input.SetValue("/con")
 	got, _ = m.handleKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyRight}))
 	if v := got.(model).input.Value(); v != "/config " {
 		t.Fatalf("行尾 → 应该补全成 /config，实际 %q", v)
 	}
 
 	// 光标不在行尾时 → 还是正常右移，别乱补全
-	m.input.SetValue("/co")
+	m.input.SetValue("/con")
 	got, _ = m.handleKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyLeft}))
-	if v := got.(model).input.Value(); v != "/co" {
+	if v := got.(model).input.Value(); v != "/con" {
 		t.Fatalf("← 不该改输入框: %q", v)
 	}
 	got, _ = got.(model).handleKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyRight}))
-	if v := got.(model).input.Value(); v != "/co" {
+	if v := got.(model).input.Value(); v != "/con" {
 		t.Fatalf("光标在中间时 → 不该补全: %q", v)
 	}
 }
@@ -343,7 +355,7 @@ func TestCompleteCommandAlternateKeys(t *testing.T) {
 // 命令没打完时按 Enter 先补全，别把半截 "/co" 发给模型
 func TestEnterCompletesPartialCommand(t *testing.T) {
 	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
-	m.input.SetValue("/co")
+	m.input.SetValue("/con")
 
 	got, _ := m.handleKey(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
 	after := got.(model)

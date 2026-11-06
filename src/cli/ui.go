@@ -1512,6 +1512,8 @@ func (m model) submit() (tea.Model, tea.Cmd) {
 		return m.resume(input)
 	case cmdSession:
 		return m, m.print(sessionText(m.cur, m.workdir, m.store))
+	case cmdCompact:
+		return m.startCompact()
 	case cmdConfig:
 		return m.openConfig()
 	case cmdMode:
@@ -2045,6 +2047,60 @@ func historyStatus(content string) domain.ToolStatus {
 		return domain.ToolStatusFailed
 	}
 	return domain.ToolStatusSuccess
+}
+
+// startCompact 在后台跑一次手动压缩（/compact）。压缩本身要请求一次模型换摘要，
+// 所以走和跑一轮同一套 runner：进度照常打进历史区，Ctrl+C 也能中断。
+func (m model) startCompact() (tea.Model, tea.Cmd) {
+	p, err := buildProvider(m.cfg)
+	if err != nil {
+		return m, m.print(errStyle.Render("创建 Provider 失败: " + err.Error()))
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	r := &runner{ch: make(chan domain.Event, 64)}
+
+	m.cancel = cancel
+	m.runner = r
+	m.state = stateRunning
+	m.status = "压缩上下文…"
+	m.pending = nil
+	m.approval = nil
+	m.picker = nil
+	m.reasoning.Reset()
+	m.answer.Reset()
+	m.reasoningShown = false
+
+	cur, store, workdir := m.cur, m.store, m.workdir
+	limit := m.contextLimit
+
+	go func() {
+		defer close(r.ch)
+		core.CompactNow(domain.Ctx{
+			Provider:     p,
+			Context:      ctx,
+			WorkDir:      workdir,
+			Shell:        tool.ShellName(),
+			Session:      cur,
+			ContextLimit: limit,
+			// 中断之后界面可能已经不再读这个 channel，发事件也要认 ctx
+			Emit: func(ev domain.Event) {
+				select {
+				case r.ch <- ev:
+				case <-ctx.Done():
+				}
+			},
+		}, cur)
+		// 压缩改的是摘要和压缩标记，压完就落盘；被中断也存，前面那部分改动同样有效
+		if saveErr := store.Save(cur); saveErr != nil {
+			r.err = saveErr
+		}
+	}()
+
+	return m, tea.Sequence(
+		m.print(hintStyle.Render("· 手动压缩：把较早的对话整理成摘要，最近的照旧留着")),
+		waitEvent(r),
+	)
 }
 
 // startRun 把提问丢给 core.Loop，用 goroutine + channel 把过程事件送回 UI。

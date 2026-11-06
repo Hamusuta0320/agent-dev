@@ -678,6 +678,47 @@ func addOtherModel(cfg config.GlobalConfig) config.GlobalConfig {
 	return cfg
 }
 
+// 上下文占用要能跟着快照回来。usage 事件只在跑的时候推一次，
+// EventSource 不补发历史事件——只靠事件流的话，页面一刷新那条
+// "上下文 303k / 1024k · 已用 29%" 就整块消失，看着像功能没了
+func TestSnapshotKeepsUsage(t *testing.T) {
+	m := newTestManager(t)
+	s := m.create()
+
+	// 还没跑过：快照里不该有用量（前端据此把整块收起来，
+	// 不然会把上一条会话的数留在界面上）
+	if got := s.snapshot(); got.Usage != nil {
+		t.Fatalf("没跑过时不该带用量: %+v", got.Usage)
+	}
+
+	// 推一条 usage 事件（等于跑完一步）
+	s.emit(domain.Event{
+		Kind: domain.EventUsage,
+		Usage: domain.ContextUsage{
+			PromptTokens: 310272, CompletionTokens: 620, ContextLimit: 1048576,
+			SystemTokens: 17408, ToolTokens: 3686, MessageTokens: 288768,
+		},
+	})
+
+	got := s.snapshot()
+	if got.Usage == nil {
+		t.Fatal("推过 usage 之后快照里该带上用量")
+	}
+	if got.Usage.PromptTokens != 310272 || got.Usage.ContextLimit != 1048576 {
+		t.Fatalf("用量数字不对: %+v", got.Usage)
+	}
+	// 百分比是 eventFromDomain 算好的，快照里要带上同一个数
+	if got.Usage.UsedPercent != 29 {
+		t.Fatalf("已用百分比不对: %d", got.Usage.UsedPercent)
+	}
+
+	// 拿出去的那份是拷贝：外面改了不能影响会话里存的那份
+	got.Usage.PromptTokens = 1
+	if again := s.snapshot(); again.Usage.PromptTokens != 310272 {
+		t.Fatalf("快照给的用量该是拷贝，会话里那份被改坏了: %+v", again.Usage)
+	}
+}
+
 // 消息发出去之后，SSE 那条连接真的收到事件流
 func TestHTTPEvents(t *testing.T) {
 	m := newTestManager(t)

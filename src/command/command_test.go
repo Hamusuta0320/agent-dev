@@ -49,8 +49,8 @@ func TestSuggest(t *testing.T) {
 		return out
 	}
 
-	if got := names(Suggest("/co")); len(got) != 1 || got[0] != "/config" {
-		t.Fatalf("/co 该补成 /config，实际 %v", got)
+	if got := names(Suggest("/con")); len(got) != 1 || got[0] != "/config" {
+		t.Fatalf("/con 该补成 /config，实际 %v", got)
 	}
 	if got := Suggest("/config"); got != nil {
 		t.Fatalf("打全了不该再提示: %v", names(got))

@@ -206,6 +206,77 @@ function api(path, options = {}) {
   });
 }
 
+/* ---------------- 右键菜单 ---------------- */
+
+// ctxMenu 是整页共用的那一个菜单元素。右键是在哪一行触发的就填哪一行的动作，
+// 所以只建一个、反复用：每行各建一个的话，菜单会跟着列表重画一起被回收，
+// 而菜单可能是开着的
+let ctxMenu = null;
+// ctxCleanup 收起菜单时要摘掉的那几个全局监听，每次打开换一份
+let ctxCleanup = null;
+
+// closeContextMenu 收起菜单。菜单开着的时候页面还在轮询刷新列表，
+// 所以收起这件事必须能被别处随时调用
+function closeContextMenu() {
+  if (!ctxMenu) return;
+  ctxMenu.remove();
+  ctxMenu = null;
+  if (ctxCleanup) {
+    ctxCleanup();
+    ctxCleanup = null;
+  }
+}
+
+// openContextMenu 在鼠标位置弹一个菜单。items 是 [{label, danger, onClick}]。
+//
+// 为什么不用原生 <menu>：这个页面里已经有 Bootstrap 的下拉（工作区列表就在里面），
+// 原生菜单和它抢同一次点击，行为看浏览器。自己画一个，收起时机完全可控
+function openContextMenu(event, items) {
+  closeContextMenu();
+  const menu = node("div", "ctx-menu");
+  items.forEach((item) => {
+    const btn = node("button", "ctx-item" + (item.danger ? " danger" : ""), item.label);
+    btn.type = "button";
+    btn.addEventListener("click", () => {
+      closeContextMenu();
+      item.onClick();
+    });
+    menu.append(btn);
+  });
+  // 先挂上量一遍尺寸，再按视口边缘往回推：贴着屏幕右边右键时菜单不能跑出去
+  menu.style.left = "-9999px";
+  menu.style.top = "-9999px";
+  document.body.append(menu);
+  const box = menu.getBoundingClientRect();
+  const x = Math.min(event.clientX, window.innerWidth - box.width - 8);
+  const y = Math.min(event.clientY, window.innerHeight - box.height - 8);
+  menu.style.left = `${Math.max(8, x)}px`;
+  menu.style.top = `${Math.max(8, y)}px`;
+  ctxMenu = menu;
+
+  // 点别处、按 Esc、滚动、窗口失焦都收起。用 capture 让它在行的 click 之前生效
+  const onDown = (e) => {
+    if (ctxMenu && ctxMenu.contains(e.target)) return;
+    closeContextMenu();
+  };
+  const onKey = (e) => {
+    if (e.key === "Escape") closeContextMenu();
+  };
+  document.addEventListener("mousedown", onDown, true);
+  document.addEventListener("keydown", onKey);
+  window.addEventListener("resize", closeContextMenu);
+  window.addEventListener("blur", closeContextMenu);
+  // 侧栏是独立滚动的，滚它就等于"换地方了"，菜单跟着关
+  document.addEventListener("scroll", closeContextMenu, true);
+  ctxCleanup = () => {
+    document.removeEventListener("mousedown", onDown, true);
+    document.removeEventListener("keydown", onKey);
+    window.removeEventListener("resize", closeContextMenu);
+    window.removeEventListener("blur", closeContextMenu);
+    document.removeEventListener("scroll", closeContextMenu, true);
+  };
+}
+
 function node(tag, className, text) {
   const n = document.createElement(tag);
   if (className) n.className = className;
@@ -503,21 +574,45 @@ function applyMeta(meta) {
   el.mode.value = meta.mode;
 }
 
+// applyUsage 摆上下文占用。三类来源各用一种颜色（和终端界面同一套语义）：
+// 系统提示词紫、工具定义橙、对话消息绿——哪一块在涨扫一眼就看出来，
+// 不用逐个读数字。分项是本地按比例估算的，所以只给百分比，不假装精确到个位。
 function applyUsage(u) {
   el.usage.hidden = false;
   const pct = Math.max(0, Math.min(100, u.used_percent || 0));
   el.usageFill.style.width = `${pct}%`;
   el.usageFill.className = "progress-bar" + (pct >= 90 ? " hot" : pct >= 70 ? " warn" : "");
   const fmt = (n) => (n >= 1024 ? `${(n / 1024).toFixed(n < 10240 ? 1 : 0)}k` : String(n));
-  const parts = [
-    `上下文 ${fmt(u.prompt_tokens)}${u.context_limit ? ` / ${fmt(u.context_limit)}` : ""}`,
-    u.context_limit ? `已用 ${pct}%` : "",
-    u.completion_tokens ? `本轮回复 ${u.completion_tokens}` : "",
-    u.prompt_tokens
-      ? `系统 ${fmt(u.system_tokens)} · 工具 ${fmt(u.tool_tokens)} · 对话 ${fmt(u.message_tokens)}`
-      : "",
-  ].filter(Boolean);
-  el.usageText.textContent = parts.join(" · ");
+  // 分项百分比按占 prompt 的比例算，和 CLI 的 ContextUsage.Percent 一个口径
+  const share = (n) => (u.prompt_tokens > 0 ? Math.round((n * 100) / u.prompt_tokens) : 0);
+
+  const frag = document.createDocumentFragment();
+  const sep = () => frag.append(node("span", "u-sep", " · "));
+  let first = true;
+  const push = (children) => {
+    if (!first) sep();
+    first = false;
+    children.forEach((c) => frag.append(c));
+  };
+
+  const head = [node("span", null, "上下文 "), node("span", "u-total", fmt(u.prompt_tokens))];
+  if (u.context_limit) head.push(node("span", null, ` / ${fmt(u.context_limit)}`));
+  // 用超过八成就变红，和 CLI 一个阈值：免得一路跑到爆窗口才发现
+  if (u.context_limit) {
+    head.push(node("span", null, " · 已用 "));
+    head.push(node("span", pct >= 80 ? "u-over" : "u-total", `${pct}%`));
+  }
+  push(head);
+
+  if (u.completion_tokens) {
+    push([node("span", "u-dim", `本轮回复 ${fmt(u.completion_tokens)}`)]);
+  }
+  if (u.prompt_tokens) {
+    push([node("span", "u-system", `系统 ${fmt(u.system_tokens)} ${share(u.system_tokens)}%`)]);
+    push([node("span", "u-tool", `工具 ${fmt(u.tool_tokens)} ${share(u.tool_tokens)}%`)]);
+    push([node("span", "u-msg", `对话 ${fmt(u.message_tokens)} ${share(u.message_tokens)}%`)]);
+  }
+  el.usageText.replaceChildren(frag);
 }
 
 /* ---------------- 工作区 ---------------- */
@@ -544,16 +639,20 @@ function renderWorkspaces() {
       bootstrap.Dropdown.getOrCreateInstance(el.wsToggle).hide();
       if (ws.id !== state.workspaceId) selectWorkspace(ws.id);
     });
-    // 删工作区：这两种删法差别很大，所以在确认框里并排放，别让人手一滑就删了文件
-    const del = node("button", "ws-del", "✕");
-    del.type = "button";
-    del.title = "删除这个工作区";
-    del.addEventListener("click", (e) => {
-      e.stopPropagation();
+    // 删工作区走右键菜单（和工作区那一行一样，行上不挂 ✕）。
+    // 两种删法差别很大，确认框里并排放，别让人手一滑就删了文件
+    wrap.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
       bootstrap.Dropdown.getOrCreateInstance(el.wsToggle).hide();
-      deleteWorkspace(ws);
+      openContextMenu(e, [
+        {
+          label: "删除工作区…",
+          danger: true,
+          onClick: () => deleteWorkspace(ws),
+        },
+      ]);
     });
-    wrap.append(item, del);
+    wrap.append(item);
     el.wsMenu.append(wrap);
   });
   const divider = node("li");
@@ -838,8 +937,9 @@ async function loadSessions() {
   return infos || [];
 }
 
-// sessionRow 是列表里的一条：状态圆点 + 标题 + 时间，hover 时右边露出删除按钮。
-// 圆点：进行中转圈、等待提问黄、完成绿、还没聊过灰
+// sessionRow 是列表里的一条：状态圆点 + 标题 + 时间。
+// 删除走右键菜单，行上不再挂删除按钮——每行一颗 ✕ 太吵，而且贴着标题容易误点。
+// 右键（或键盘 Shift+F10 / 菜单键，浏览器会把它也报成 contextmenu）弹出来
 function sessionRow(info) {
   const row = node("div", "session" + (info.id === state.sessionId ? " active" : ""));
   // 选中态靠它来挪（markActiveSession），切会话时就不用重画整个列表
@@ -859,15 +959,18 @@ function sessionRow(info) {
   main.append(dot, body);
   main.addEventListener("click", () => openSession(info.id));
 
-  const del = node("button", "session-del", "✕");
-  del.type = "button";
-  del.title = "删除这条会话";
-  del.addEventListener("click", (e) => {
-    e.stopPropagation();
-    deleteSession(info.id, info.title || info.id);
+  row.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    openContextMenu(e, [
+      {
+        label: "删除会话…",
+        danger: true,
+        onClick: () => deleteSession(info.id, info.title || info.id),
+      },
+    ]);
   });
 
-  row.append(main, del);
+  row.append(main);
   return row;
 }
 
@@ -1048,6 +1151,14 @@ function assistantBlock(m) {
 
 function renderHistory(snapshot) {
   el.chat.replaceChildren();
+  // 快照里带着上次请求的上下文占用：刷新页面后 usage 事件不会补发，
+  // 只有靠它才能把那一条复原。没有（还没聊过）就把整块收起来，
+  // 不然会留着上一条会话的用量，看着像这条已经用掉那么多
+  if (snapshot.usage) {
+    applyUsage(snapshot.usage);
+  } else {
+    el.usage.hidden = true;
+  }
   if (!snapshot.messages || snapshot.messages.length === 0) {
     renderEmpty();
     el.title.textContent = snapshot.title || snapshot.id;

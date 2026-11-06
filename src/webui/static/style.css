@@ -166,24 +166,40 @@ body { overflow: hidden; }
 .status.done { background: #6cc08b; }
 .status.idle { background: #4b5563; }
 
-/* 删除按钮平时不显眼，指到那条会话才露出来 */
-.session-del, .ws-del {
-  flex: none;
+/* 右键菜单：会话和工作区的删除都从这里走，行上不再挂 ✕ 按钮。
+   固定定位到鼠标位置，层级压在弹窗之上（弹窗是 <dialog>，z-index 很高） */
+.ctx-menu {
+  position: fixed;
+  z-index: 2000;
+  min-width: 132px;
+  padding: 4px;
+  background: var(--bs-secondary-bg);
+  border: 1px solid var(--block-border, var(--bs-border-color));
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .45);
+}
+.ctx-item {
+  display: block;
+  width: 100%;
+  padding: 6px 10px;
   background: none;
   border: 0;
-  color: var(--bs-tertiary-color);
-  font-size: 12px;
-  line-height: 1;
-  padding: 4px 6px;
-  border-radius: 6px;
-  opacity: 0;
+  border-radius: 5px;
+  color: var(--bs-body-color);
+  font-size: 12.5px;
+  text-align: left;
+  white-space: nowrap;
   cursor: pointer;
 }
-.session:hover .session-del, .ws-item:hover .ws-del { opacity: 1; }
-.session-del:hover, .ws-del:hover { background: rgba(224, 108, 117, .16); color: #e06c75; }
-.session-del:focus-visible, .ws-del:focus-visible { opacity: 1; }
+.ctx-item:hover, .ctx-item:focus-visible {
+  background: rgba(255, 255, 255, .08);
+  outline: none;
+}
+/* 危险动作（删除）用红字，和确认框里那颗红按钮一个语义 */
+.ctx-item.danger { color: #e06c75; }
+.ctx-item.danger:hover, .ctx-item.danger:focus-visible { background: rgba(224, 108, 117, .16); }
 
-/* 工作区下拉：一行 = 名字/路径 + 删除按钮 */
+/* 工作区下拉：一行 = 名字/路径。删除在右键菜单里 */
 .ws-item { position: relative; display: flex; align-items: center; }
 .ws-item .dropdown-item { flex: 1 1 auto; min-width: 0; }
 .sidebar-foot {
@@ -215,7 +231,9 @@ body { overflow: hidden; }
   font-weight: 600;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.badges { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+/* 三枚胶囊之间的间距。6px 时两枚圆角胶囊几乎贴在一起，深色底上看着像一条
+   被切开的长条；给到 10px 才分得清"这是三枚独立的开关" */
+.badges { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; }
 
 /* 顶栏右侧那几枚胶囊：模型 / 思考强度 / 显示方式。
    以前模型和思考强度用的是 Bootstrap badge（实底灰），显示方式是个 <button>——
@@ -224,16 +242,19 @@ body { overflow: hidden; }
 .chip {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  height: 24px;
-  padding: 0 10px;
+  /* 标签和值之间留 8px：6px 时两段字几乎黏在一起，读起来要先分辨哪里断句 */
+  gap: 8px;
+  /* 28px 高、行高 1.4：原来 24px + line-height:1 时中文字形上下被切掉了——
+     汉字比西文的 em 框高，line-height 压到 1 就贴着边裁 */
+  height: 28px;
+  padding: 0 12px;
   border: 1px solid rgba(255, 255, 255, .10);
   border-radius: 999px;
   background: rgba(255, 255, 255, .045);
   color: var(--bs-secondary-color);
   font-family: inherit;
   font-size: 12px;
-  line-height: 1;
+  line-height: 1.4;
   white-space: nowrap;
   transition: background-color .15s ease, border-color .15s ease, color .15s ease;
 }
@@ -268,10 +289,10 @@ button.chip:focus-visible { outline: 2px solid rgba(108, 192, 139, .55); outline
 .chip.on .chip-label, .chip.on .chip-value { color: #d9c26a; }
 button.chip.on:hover { background: rgba(217, 194, 106, .20); border-color: rgba(217, 194, 106, .6); }
 
-/* 下拉框和连接状态跟胶囊同一行，高度对齐到 24px，底边才在一条线上 */
+/* 下拉框和连接状态跟胶囊同一行，高度对齐到 28px，底边才在一条线上 */
 .badges select {
   width: auto;
-  height: 24px;
+  height: 28px;
   padding: 0 24px 0 8px;
   border-radius: 8px;
   font-size: 12px;
@@ -281,8 +302,9 @@ button.chip.on:hover { background: rgba(217, 194, 106, .20); border-color: rgba(
    只留值（模型名、档位、显示方式），一排仍然放得下，也不会把标题挤没 */
 @media (max-width: 900px) {
   .chip-label { display: none; }
-  .chip { padding: 0 9px; }
+  .chip { padding: 0 11px; gap: 0; }
   .chip-value { max-width: 108px; }
+  .badges { gap: 8px; }
 }
 
 /* 连接状态：绿=通着、黄=正在连、红=断了 */
@@ -290,7 +312,7 @@ button.chip.on:hover { background: rgba(217, 194, 106, .20); border-color: rgba(
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  height: 24px;
+  height: 28px;
   padding: 0 9px;
   font-size: 12px;
   color: var(--bs-secondary-color);
@@ -321,6 +343,17 @@ button.chip.on:hover { background: rgba(217, 194, 106, .20); border-color: rgba(
 .usage .progress-bar.warn { background: #d9c26a; }
 .usage .progress-bar.hot { background: #e06c75; }
 .usage-text { font-size: 12px; color: var(--bs-tertiary-color); padding-top: 5px; }
+/* 上下文占用的分项按来源上色，和终端界面同一套语义（那边是 ANSI 141/215/114）：
+   系统提示词紫、工具定义橙、对话消息绿。底色深，这里取同样的色值就够亮，
+   一眼能看出是哪一块在涨——三项全灰的时候只能逐个读数字 */
+.usage-text .u-total { color: var(--bs-body-color); }
+.usage-text .u-system { color: #af87ff; }
+.usage-text .u-tool { color: #ffaf5f; }
+.usage-text .u-msg { color: #87d787; }
+/* 用超过八成变红，和 CLI 一个阈值：免得一路跑到爆窗口才发现 */
+.usage-text .u-over { color: #e06c75; font-weight: 600; }
+.usage-text .u-dim { color: var(--bs-tertiary-color); }
+.usage-text .u-sep { color: #3a4150; }
 
 /* ---------- 对话区 ---------- */
 .chat {

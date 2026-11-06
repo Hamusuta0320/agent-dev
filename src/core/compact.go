@@ -66,7 +66,7 @@ func compactContext(ctx domain.Ctx, session *domain.Session, emit domain.EmitFun
 	}
 
 	from := session.SummaryUpTo
-	emitCompact(emit, "上下文接近上限，正在把较早的对话整理成摘要…")
+	emitCompact(emit, "正在把较早的对话整理成摘要…")
 	summary, err := summarize(ctx, session, end)
 	if err != nil {
 		// 压缩失败不该让用户的这一轮直接失败，照常往下请求
@@ -81,6 +81,27 @@ func compactContext(ctx domain.Ctx, session *domain.Session, emit domain.EmitFun
 	session.SummaryUpTo = end
 	emitCompact(emit, fmt.Sprintf("已把 %d 条较早的消息整理成 %d 字摘要", end-from, len([]rune(summary))))
 	return true
+}
+
+// CompactNow 是手动压缩（/compact）：不等上下文涨到阈值，直接把较早的对话整理成摘要。
+// 只改摘要和压缩标记，原文留在会话文件里，所以调用方压完照常落盘即可。
+// 返回是否真的改动了会话：消息不够多、或者早就压到底了，这里什么都不做。
+func CompactNow(ctx domain.Ctx, session *domain.Session) bool {
+	if session == nil {
+		return false
+	}
+	emit := ctx.Emit
+	if emit == nil {
+		emit = consoleEmit()
+	}
+	// 最近 keepRecentMessages 条永远原样留着，能进摘要的只有它前面那截
+	truncBefore := max(len(session.Messages)-keepRecentMessages, 0)
+	if summaryBoundary(session, truncBefore) <= session.SummaryUpTo {
+		emitCompact(emit, fmt.Sprintf("没有可压缩的内容：最近 %d 条要原样留着，前面已经没有未压缩的消息了",
+			keepRecentMessages))
+		return false
+	}
+	return compactContext(ctx, session, emit, newUsageTracker(nil, session), 0, true)
 }
 
 // summaryBoundary 找摘要和原文的分界：Messages[:end] 进摘要，Messages[end:] 原样留着。

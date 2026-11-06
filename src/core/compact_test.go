@@ -253,3 +253,49 @@ func TestRunCompactsBeforeRequest(t *testing.T) {
 		t.Fatalf("摘要应该紧跟在系统提示词后面: %+v", first[1])
 	}
 }
+
+// 手动压缩不看阈值：上下文还宽裕，也要把较早的对话整理成摘要
+func TestCompactNowIgnoresThreshold(t *testing.T) {
+	session := compactDialog(10, strings.Repeat("line\n", 20))
+	p := &summaryProvider{}
+
+	var events []domain.Event
+	changed := CompactNow(domain.Ctx{
+		ContextLimit: 1 << 20, // 远远没到阈值
+		Provider:     p,
+		Context:      context.Background(),
+		Emit:         func(ev domain.Event) { events = append(events, ev) },
+	}, session)
+	if !changed || p.summaries != 1 || session.Summary == "" || session.SummaryUpTo == 0 {
+		t.Fatalf("手动压缩没生效: changed=%v summaries=%d summary=%q upTo=%d",
+			changed, p.summaries, session.Summary, session.SummaryUpTo)
+	}
+	found := false
+	for _, ev := range events {
+		if ev.Kind == domain.EventCompact && strings.Contains(ev.Text, "摘要") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("应该报一条整理摘要的事件: %+v", events)
+	}
+}
+
+// 消息太少（都在保留区里）时手动压缩什么都不做，只说明一句，不该白花一次摘要请求
+func TestCompactNowNothingToDo(t *testing.T) {
+	session := compactDialog(1, "ok")
+	p := &summaryProvider{}
+
+	var events []domain.Event
+	changed := CompactNow(domain.Ctx{
+		Provider: p,
+		Context:  context.Background(),
+		Emit:     func(ev domain.Event) { events = append(events, ev) },
+	}, session)
+	if changed || p.summaries != 0 {
+		t.Fatalf("没东西可压时不该动会话: changed=%v summaries=%d", changed, p.summaries)
+	}
+	if len(events) != 1 || events[0].Kind != domain.EventCompact || !strings.Contains(events[0].Text, "没有可压缩") {
+		t.Fatalf("应该报一条「没有可压缩」的事件: %+v", events)
+	}
+}

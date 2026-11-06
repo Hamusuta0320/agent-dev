@@ -1,6 +1,7 @@
 package webui
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -69,6 +70,8 @@ func (m *Manager) runCommand(s *Session, input string) commandReply {
 		return m.commandResume(s, arg)
 	case "/session":
 		return m.commandSession(s)
+	case "/compact":
+		return m.commandCompact(s)
 	case "/config":
 		return commandReply{Kind: replyConfig}
 	case "/mode":
@@ -121,7 +124,8 @@ func helpText() string {
 		"  关掉之后思考过程折叠显示、工具输出点开能看",
 		"  /model 不带参数列出配置好的几套；顶栏的「模型」徽标点开，已配好的几套点一下就切；",
 		"  /model add 新增一套，/model del 名字 删掉一套",
-		"  左侧能切工作区、加工作区；会话列表点一下就能切换",
+		"  左侧能切工作区、加工作区；会话列表点一下就能切换；",
+		"  删会话或工作区：在那一行上点右键（触屏长按），弹出来的菜单里选删除",
 		"  写文件、执行命令前会弹出来问一次（完全授权模式不问）",
 	)
 	return strings.Join(lines, "\n")
@@ -260,6 +264,19 @@ func (m *Manager) commandSession(s *Session) commandReply {
 		out += "\n存到 " + ws.Store.Dir
 	}
 	return textReply("%s", out)
+}
+
+// commandCompact 处理 /compact：把较早的对话压成摘要，腾出上下文。
+// 压缩在后台跑（要请求一次模型），进度和结果走 compact 事件、done 事件推给前端，
+// 所以这里只回一句"正在压缩"，剩下的交给前端那条事件流
+func (m *Manager) commandCompact(s *Session) commandReply {
+	if err := s.Compact(m.Config()); err != nil {
+		if errors.Is(err, ErrBusy) {
+			return textReply("这条会话还在跑，等它结束再压缩")
+		}
+		return textReply("压缩失败：%v", err)
+	}
+	return textReply("正在把较早的对话整理成摘要…")
 }
 
 // commandMode 处理 /mode：不带参数列三种模式，带了就切过去并写回配置

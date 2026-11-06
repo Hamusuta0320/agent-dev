@@ -65,6 +65,11 @@ type Session struct {
 	// taskIds 是这条会话起的后台任务 id（按出现顺序）。
 	// 后台任务本身是进程级的，界面上只显示属于这条会话的那几个
 	taskIds []string
+	// usage 是这条会话最近一次请求模型的上下文占用。它不是事件流的副产品而是存下来：
+	// usage 事件只在跑的时候推一次，页面一刷新就再也收不到了，输入框上方那条
+	// "上下文 303k / 1024k" 就整块消失（实测刷新后一片空白，看着像功能没了）。
+	// 存一份，快照里带出去，刷新后照样看得见上次的占用量
+	usage *usage
 }
 
 // 会话在列表上的四种状态。前三样对应界面上那个圆点：转圈 / 黄 / 绿
@@ -239,6 +244,12 @@ func (s *Session) emit(ev domain.Event) {
 			s.approvals[id] = ev.Reply
 		}
 	}
+	// 上下文占用：这个事件一轮只推一次，页面刷过之后就再也收不到了
+	// （EventSource 不会补发历史事件），所以照着留一份，快照里带出去
+	if ev.Kind == domain.EventUsage && e != nil && e.Usage != nil {
+		u := *e.Usage
+		s.usage = &u
+	}
 	// 待办清单：TodoWrite 每次传上来的都是整份，照着替换就行。
 	// core 那边记的是进程级的一份，多开几个会话会串，所以这里按会话留一份
 	if ev.Kind == domain.EventToolCall && ev.Call.Name == "TodoWrite" {
@@ -357,6 +368,67 @@ func (s *Session) Cancel() bool {
 	return true
 }
 
+// Compact 手动压缩（/compact）：把较早的对话整理成摘要，腾出上下文。
+//
+// 它要请求一次模型，所以和跑一轮一样占着 running：这会儿前端再发消息会收到 ErrBusy，
+// 免得压缩改会话的同时另一轮在写同一个 Messages。压完广播 done，前端那边圆点和
+// 排队都按"这一轮结束"处理。
+func (s *Session) Compact(cfg config.GlobalConfig) error {
+	s.mu.Lock()
+	if s.running {
+		s.mu.Unlock()
+		return ErrBusy
+	}
+	mc, err := cfg.CurrentModel()
+	if err != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("%w: %v", ErrNoModel, err)
+	}
+	p, err := newProvider(mc)
+	if err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.running = true
+	s.cancel = cancel
+	s.approvals = make(map[string]chan domain.ApprovalAnswer)
+	data := s.data
+	s.mu.Unlock()
+
+	go func() {
+		defer cancel()
+		core.CompactNow(domain.Ctx{
+			Provider:     p,
+			Context:      ctx,
+			WorkDir:      data.WorkDir,
+			Shell:        tool.ShellName(),
+			Session:      data,
+			ContextLimit: mc.Limit(),
+			Emit:         s.emit,
+		}, data)
+		// 压缩改的是摘要和压缩标记，压完就落盘；被中断也存，前面那部分改动同样有效
+		saveErr := s.store.Save(data)
+
+		s.mu.Lock()
+		s.running = false
+		s.cancel = nil
+		s.approvals = make(map[string]chan domain.ApprovalAnswer)
+		s.outcome = outcomeDone
+		s.seq++
+		seq := s.seq
+		s.mu.Unlock()
+
+		switch {
+		case saveErr != nil:
+			s.broadcast(errorEvent(seq, saveErr, false))
+		default:
+			s.broadcast(doneEvent(seq, ""))
+		}
+	}()
+	return nil
+}
+
 // Start 起一轮：把提问记进会话，然后跑 core.Loop。
 // 一轮还没跑完时返回 ErrBusy（前端自己把消息排起来，等 done 再发）。
 func (s *Session) Start(cfg config.GlobalConfig, prompt string, images []domain.Image) error {
@@ -455,6 +527,10 @@ type snapshot struct {
 	// HasMore 说明上面还有没发过来的更早内容（被 limit 裁掉了）。
 	// 不给条数：原始消息数和显示块数不是一个单位，给个数字反而会骗人
 	HasMore bool `json:"has_more,omitempty"`
+	// Usage 是最近一次请求模型的上下文占用。带上它，页面刷新之后输入框上方那条
+	// "上下文 xxx / xxx" 还在——usage 事件只在跑的时候推一次，不补发历史事件，
+	// 只靠事件流的话一刷新就整块空白
+	Usage *usage `json:"usage,omitempty"`
 }
 
 // snapshot 默认给全量历史、详细内容（终端界面、测试都走这条）
@@ -467,6 +543,12 @@ func (s *Session) snapshot() snapshot {
 func (s *Session) snapshotWith(opt historyOptions) snapshot {
 	s.mu.Lock()
 	data, running, mode, store, status := s.data, s.running, s.mode, s.store, s.statusLocked()
+	// 用量是一份只读快照，拷出来再往外给：外面拿着它渲染时，下一轮可能正在改
+	var lastUsage *usage
+	if s.usage != nil {
+		u := *s.usage
+		lastUsage = &u
+	}
 	s.mu.Unlock()
 
 	// 跑着的时候不读内存里那份：core 正在往它上面追加消息，读它就是在和数据竞争
@@ -494,6 +576,7 @@ func (s *Session) snapshotWith(opt historyOptions) snapshot {
 		Mode:     mode,
 		Messages: msgs,
 		HasMore:  hasMore,
+		Usage:    lastUsage,
 	}
 	if !view.UpdatedAt.IsZero() {
 		out.UpdatedAt = view.UpdatedAt.Format("2006-01-02 15:04:05")

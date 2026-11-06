@@ -2,6 +2,7 @@ package webui
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"strings"
@@ -715,5 +716,59 @@ func TestAllCommandsHandled(t *testing.T) {
 		if strings.Contains(reply.Text, "不认识这条命令") {
 			t.Fatalf("%s 掉进了兜底分支", name)
 		}
+	}
+}
+
+// /compact 把较早的对话整理成摘要：进度走 compact 事件，跑完广播 done
+func TestCommandCompact(t *testing.T) {
+	m := newTestManager(t)
+	s := m.create()
+	data := s.Data()
+	for i := 0; i < 10; i++ {
+		id := fmt.Sprintf("call-%d", i)
+		call := domain.ToolCall{Id: id, Name: "echo", Arguments: "{}"}
+		data.AppendAssistant("", "", []domain.ToolCall{call})
+		data.AppendToolResult(call, strings.Repeat("line\n", 20))
+	}
+	data.AppendUser("最后的问题")
+
+	withFakeProvider(t, &fakeProvider{steps: []fakeStep{{content: "之前改过 a.go，还没跑测试"}}})
+	ch, stop := s.Subscribe()
+	defer stop()
+
+	reply := run(t, m, s, "/compact")
+	if reply.Kind != replyText || !strings.Contains(reply.Text, "摘要") {
+		t.Fatalf("/compact 该回一句正在压缩，实际 %+v", reply)
+	}
+
+	evs := collect(t, ch, untilFinish())
+	compacted := false
+	for _, ev := range evs {
+		if ev.Kind == kindCompact {
+			compacted = true
+		}
+	}
+	if !compacted {
+		t.Fatalf("该推一条 compact 事件: %+v", evs)
+	}
+	if last := evs[len(evs)-1]; last.Kind != kindDone {
+		t.Fatalf("压完该推 done 收尾，实际 %q", last.Kind)
+	}
+	if data.Summary == "" || data.SummaryUpTo == 0 {
+		t.Fatalf("摘要没写回会话: %q / %d", data.Summary, data.SummaryUpTo)
+	}
+}
+
+// 这一轮还在跑的时候不接受压缩，免得两边同时改同一份历史
+func TestCommandCompactBusy(t *testing.T) {
+	m := newTestManager(t)
+	s := m.create()
+	s.mu.Lock()
+	s.running = true
+	s.mu.Unlock()
+
+	reply := run(t, m, s, "/compact")
+	if !strings.Contains(reply.Text, "还在跑") {
+		t.Fatalf("跑着的时候该拒绝压缩，实际 %+v", reply)
 	}
 }
