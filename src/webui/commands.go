@@ -119,6 +119,7 @@ func helpText() string {
 		"  地址和密钥填好后能直接从接口拉模型列表，点一个就填进去",
 		"  显示方式默认是精简（只显示正文），顶栏的「精简」徽标或 /quiet 可以切；",
 		"  关掉之后思考过程折叠显示、工具输出点开能看",
+		"  /model 不带参数列出配置好的几套；/model add 新增一套，/model del 名字 删掉一套",
 		"  左侧能切工作区、加工作区；会话列表点一下就能切换",
 		"  写文件、执行命令前会弹出来问一次（完全授权模式不问）",
 	)
@@ -373,7 +374,8 @@ func (m *Manager) commandModel(arg string) commandReply {
 			}
 			lines = append(lines, fmt.Sprintf("%s%s — %s", mark, mc.Label(), modelHint(mc)))
 		}
-		lines = append(lines, "", "切换：/model 名字，会写回配置文件；顶栏的模型徽标点开也能直接挑")
+		lines = append(lines, "", "切换：/model 名字，会写回配置文件；顶栏的模型徽标点开也能直接挑",
+			"新增：/model add（名字留空就用模型名）；删除：/model del 名字")
 		return textReply("%s", strings.Join(lines, "\n"))
 	}
 

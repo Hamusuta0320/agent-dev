@@ -25,6 +25,7 @@ type configField struct {
 
 // configFields 的顺序要和 configForm 里那几个输入框、以及 saveConfigForm 里取的顺序一致
 var configFields = []configField{
+	{"名字", "这套模型在 /model 列表里的名字，留空就用模型名"},
 	{"类型", "←→ 切换（DeepSeek / OpenAI / MiniMax），都走 OpenAI 兼容协议"},
 	{"接口地址", "例如 https://api.deepseek.com，留空就用内置地址"},
 	{"密钥", "sk- 开头的那串"},
@@ -35,7 +36,8 @@ var configFields = []configField{
 
 // 表单里各字段的位置。键位和取值的代码都靠它认字段，不写魔法数字
 const (
-	typeField = iota
+	nameField = iota
+	typeField
 	urlField
 	keyField
 	modelField
@@ -67,10 +69,11 @@ type configForm struct {
 	// fetchSeq 是拉取序号：连按几次 Ctrl+L 时只认最后那次的结果
 	fetchSeq int
 
-	// name / typ 是这套模型的名字和协议类型：名字不在表单里改（它是 /model 认的那把钥匙），
-	// 类型也先固定，保存时原样带回去
-	name string
-	typ  string
+	// editLabel 是正在改哪一套模型的名字（/model 认的那把钥匙）。
+	// 空串 = 新增一套：名字格空着，保存时追加到列表末尾
+	editLabel string
+	// typ 是这套模型的协议类型：类型没有输入框，←→ 在内置类型之间切
+	typ string
 	// effort 是思考强度档位（config.EffortLevels 里的一项，空串表示不发这个参数）。
 	// 和类型一样没有输入框，←→ 在档位之间切
 	effort string
@@ -85,13 +88,14 @@ type modelsFetchedMsg struct {
 	err    error
 }
 
-func newConfigForm(mc config.ModelConfig) configForm {
+func newConfigForm(mc config.ModelConfig, editLabel string) configForm {
 	apiUrl := strings.TrimSpace(mc.ApiUrl)
 	if apiUrl == "" {
 		// 没填过地址就先摆上内置的那个：这几家的地址是固定的，少打一遍
 		apiUrl = config.DefaultApiUrl(mc.Type)
 	}
 	values := make([]string, len(configFields))
+	values[nameField] = editLabel
 	values[urlField] = apiUrl
 	values[keyField] = mc.ApiKey
 	values[modelField] = mc.Model
@@ -107,11 +111,11 @@ func newConfigForm(mc config.ModelConfig) configForm {
 		inputs[i] = in
 	}
 	return configForm{
-		inputs:  inputs,
-		name:    mc.Label(),
-		typ:     normalizeType(mc.Type),
-		effort:  strings.ToLower(strings.TrimSpace(mc.ReasoningEffort)),
-		pickIdx: -1,
+		inputs:    inputs,
+		editLabel: editLabel,
+		typ:       normalizeType(mc.Type),
+		effort:    strings.ToLower(strings.TrimSpace(mc.ReasoningEffort)),
+		pickIdx:   -1,
 	}
 }
 
@@ -149,7 +153,7 @@ func (f configForm) value(i int) string {
 // 按 1024 进制换算）则返回错误，交给界面提示
 func (f configForm) modelConfig() (config.ModelConfig, error) {
 	mc := config.ModelConfig{
-		Name:            f.name,
+		Name:            f.value(nameField),
 		Type:            f.typ,
 		ApiUrl:          f.value(urlField),
 		ApiKey:          f.value(keyField),
@@ -226,7 +230,7 @@ func (f configForm) listLines() []string {
 	case f.fetching:
 		return []string{hintStyle.Render("  正在从接口拉取模型列表…")}
 	case f.fetchErr != "":
-		return []string{errStyle.Render("  拉取模型列表失败：" + f.fetchErr) +
+		return []string{errStyle.Render("  拉取模型列表失败："+f.fetchErr) +
 			hintStyle.Render("（可以重试，也可以直接在模型那格手填）")}
 	case f.picking():
 		return modelPickLines(&f)
@@ -331,11 +335,21 @@ func maskSecret(s string) string {
 // openConfig 打开配置表单，值从内存里的 cfg 重新读一遍，显示的就是当前生效的配置。
 // 地址和密钥都填着的话顺手去接口拉一次模型列表：多半就是来换模型的，列表先摆好
 func (m model) openConfig() (tea.Model, tea.Cmd) {
-	m.form = newConfigForm(m.currentModel())
+	cur := m.currentModel()
+	m.form = newConfigForm(cur, cur.Label())
 	m.resizeForm()
 	m.state = stateConfig
 	m.input.Blur()
 	return m.pullModels(false)
+}
+
+// openConfigNew 打开"新增一套"的表单：什么都是空的，名字留空就用模型名
+func (m model) openConfigNew() (tea.Model, tea.Cmd) {
+	m.form = newConfigForm(config.ModelConfig{}, "")
+	m.resizeForm()
+	m.state = stateConfig
+	m.input.Blur()
+	return m, nil
 }
 
 // resizeForm 让表单里的输入框跟着终端宽度走，内容长了就横向滚动
@@ -507,7 +521,6 @@ func (m model) switchEffort(step int) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-
 // 地址或密钥还没填时先提示一句——这时候请求也发不出去
 func (m model) fetchModelList() (tea.Model, tea.Cmd) {
 	f := &m.form
@@ -602,7 +615,7 @@ func (f *configForm) chooseModel() {
 }
 
 // saveConfig 把表单里的值写回配置文件，并同步内存里的 cfg —— 不用重启，下一轮就用新配置。
-// 配了好几套模型时改的是当前这套：按名字替换掉 Models 里对应的那一条
+// 新增（editLabel 空）就追加到列表末尾；改现有的是改那一条，名字改了就是改名
 func (m model) saveConfig() (tea.Model, tea.Cmd) {
 	mc, err := m.form.modelConfig()
 	if err != nil {
@@ -613,25 +626,49 @@ func (m model) saveConfig() (tea.Model, tea.Cmd) {
 		m.form.err = "接口地址、密钥、模型都得填"
 		return m, nil
 	}
-	// 还没有名字的新模型就用模型名当名字，/model 里才有得叫
-	if strings.TrimSpace(mc.Name) == "" {
-		mc.Name = mc.Label()
+
+	models := m.cfg.AvailableModels()
+	current := m.cfg.Current
+	isNew := m.form.editLabel == ""
+	if isNew {
+		// 新增一套：追加到末尾，当前那套不动。名字留空时 AddModel 用模型名顶上
+		next, err := config.AddModel(models, mc)
+		if err != nil {
+			m.form.err = err.Error()
+			return m, nil
+		}
+		models = next
+	} else {
+		// 编辑模式名字留空 = 名字不变（浏览器那边也是这个口径）：
+		// 名字是这一套的标识，别因为用户清空了输入框就悄悄换成模型名
+		if strings.TrimSpace(mc.Name) == "" {
+			mc.Name = m.form.editLabel
+		}
+		// 改现有那套：mc.Name 换了就是改名（原地换，列表长度不变）
+		next, cur, err := config.EditModel(models, current, m.form.editLabel, mc)
+		if err != nil {
+			m.form.err = err.Error()
+			return m, nil
+		}
+		models, current = next, cur
 	}
-	models := replaceModel(m.cfg.AvailableModels(), mc)
-	if err := config.SaveModels(m.cfgPath, models, mc.Name); err != nil {
+
+	if err := config.SaveModels(m.cfgPath, models, current); err != nil {
 		m.form.err = err.Error()
 		return m, nil
 	}
 	m.cfg.Models = models
-	m.cfg.Current = mc.Name
-	// 老的 Provider 段跟着同步一份，还按老格式读配置的代码看到的也是当前这套
-	legacy := mc
-	legacy.Name = ""
-	_ = m.cfg.Provider.Encode(legacy)
+	m.cfg.Current = current
+	// 老的 Provider 段跟着同步一份：还按老格式读配置的地方看到的也是当前那套
+	m.syncLegacyProvider()
 
 	// 保存后重新生成表单，密钥回到打码显示
-	m.form = newConfigForm(mc)
-	m.contextLimit = mc.Limit()
+	m.form = newConfigForm(mc, mc.Label())
+	// 上下文窗口只在改的就是当前那套时跟着换：界面上的"已用 x%"是按当前那套算的，
+	// 改的是别的套不该把它带跑（新增同理——新加的那套还不是当前在跑的）
+	if strings.EqualFold(current, mc.Label()) {
+		m.contextLimit = mc.Limit()
+	}
 	m.state = stateIdle
 	m.input.Focus()
 	return m, tea.Sequence(
@@ -640,28 +677,20 @@ func (m model) saveConfig() (tea.Model, tea.Cmd) {
 	)
 }
 
-// replaceModel 把 mc 放进 models：名字对得上的那条原地换掉，没有就追加。
-// 名字是 /model 认的那把钥匙，所以改名等于新增一套
-func replaceModel(models []config.ModelConfig, mc config.ModelConfig) []config.ModelConfig {
-	out := make([]config.ModelConfig, 0, len(models)+1)
-	replaced := false
-	for _, old := range models {
-		if !replaced && strings.EqualFold(old.Label(), mc.Name) {
-			out = append(out, mc)
-			replaced = true
-			continue
-		}
-		out = append(out, old)
+// syncLegacyProvider 让内存里老的 Provider 段跟上当前那套：
+// 还按老格式读配置的地方看到的也是现在跑的模型
+func (m *model) syncLegacyProvider() {
+	cur, err := m.cfg.CurrentModel()
+	if err != nil {
+		return
 	}
-	if !replaced {
-		out = append(out, mc)
-	}
-	return out
+	cur.Name = ""
+	_ = m.cfg.Provider.Encode(cur)
 }
 
 // modelFormTitle 是表单标题里那句"哪套模型 · 什么类型"
 func modelFormTitle(f *configForm) string {
-	name := strings.TrimSpace(f.name)
+	name := strings.TrimSpace(f.value(nameField))
 	if name == "" {
 		name = "新模型"
 	}

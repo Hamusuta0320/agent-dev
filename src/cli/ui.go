@@ -64,8 +64,6 @@ const (
 	toolMarkDone = "●"
 	// maxTaskChips 是后台任务栏里最多列几个任务，再多就折成一个"还有 N 个"
 	maxTaskChips = 3
-	// maxResumeList 是 /resume 列表最多列几个会话，再多就折成一句"还有 N 个"
-	maxResumeList = 10
 	// maxActiveRows 是输入框上方那块会变的内容最多占几行：跑任务时是状态、工具调用
 	// 和预览的尾巴，闲着时是补全候选或别的常驻信息。待办清单也从这块里分位置。
 	//
@@ -277,6 +275,14 @@ type model struct {
 	quiet bool
 	// approval 是正在等用户确认的那项写操作，为 nil 表示没有在等
 	approval *approvalState
+	// picker 是打开着的"按键挑一个"列表（/resume、/model、/mode、/effort 不带参数时），
+	// 为 nil 表示没开着。它只占输入框上方那块槽位，不换状态——输入框照旧能打字，
+	// 一打字这块列表就收起（见 handlePickKey）
+	picker *picker
+
+	// pendingDelete 是上一次请求删掉的那套模型（/model del 名字）。
+	// 再打一遍同样的命令才真删——删配置没有后悔药
+	pendingDelete string
 
 	// notice 是启动时想顺带说一句的事情（比如刚把老会话迁过来），空着就不显示
 	notice string
@@ -349,7 +355,7 @@ func newModel(cfg config.GlobalConfig, store *session.Store, workdir string, cur
 		spin:         spin,
 		toolSpin:     toolSpin,
 		state:        stateIdle,
-		form:         newConfigForm(current),
+		form:         newConfigForm(current, current.Label()),
 		contextLimit: current.Limit(),
 		mode:         mode,
 		quiet:        cfg.QuietMode(),
@@ -598,6 +604,12 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	// 列表开着的时候键先归它：↑↓ 挪光标、Enter 定下来、Esc 收起。
+	// 别的键它会把列表收起来再交回这里，所以下面那些处理一条都不用改
+	if m.picker != nil {
+		return m.handlePickKey(msg)
+	}
+
 	switch msg.String() {
 	case "ctrl+c":
 		// 跑着的时候先中断任务，闲着的时候才退出
@@ -1537,7 +1549,9 @@ func (m model) switchMode(input string) (tea.Model, tea.Cmd) {
 		arg = strings.Join(fields[1:], " ")
 	}
 	if arg == "" {
-		return m, m.print(modeText(m.mode))
+		// 不带参数就把三种模式列成能按键挑的列表，↑↓ 选、Enter 切过去
+		m.picker = modePicker(m.mode)
+		return m, nil
 	}
 
 	mode, err := domain.ParseMode(arg)
@@ -1556,15 +1570,41 @@ func (m model) switchMode(input string) (tea.Model, tea.Cmd) {
 }
 
 // switchModel 处理 /model：不带参数就列出手上配置好的几套模型，带了就切过去并写回配置，
-// 下一轮请求就用新模型，不用重启。
+// 下一轮请求就用新模型，不用重启。add 开新增表单，del 删掉一套
 func (m model) switchModel(input string) (tea.Model, tea.Cmd) {
+	fields := strings.Fields(input)
 	arg := ""
-	if fields := strings.Fields(input); len(fields) > 1 {
+	if len(fields) > 1 {
 		arg = strings.Join(fields[1:], " ")
 	}
+	// add / del 是保留字：优先当命令解释，模型名不会叫这两个
+	verb, rest := "", ""
+	if arg != "" {
+		verb = strings.ToLower(fields[1])
+		if len(fields) > 2 {
+			rest = strings.Join(fields[2:], " ")
+		}
+	}
+	switch verb {
+	case "add":
+		m.pendingDelete = ""
+		return m.openConfigNew()
+	case "del", "delete":
+		return m.deleteModel(rest)
+	}
+	// 别的事干过之后，之前那句"要不要删"就作废了：
+	// 再打一遍 /model del 得重新问一次，不能隔着一堆别的操作就真删
+	m.pendingDelete = ""
+
 	models := m.cfg.AvailableModels()
 	if arg == "" {
-		return m, m.print(modelText(models, m.cfg.Current))
+		if len(models) == 0 {
+			return m, m.print(bannerStyle.Render("模型") + "\n" + hintStyle.Render(
+				"  还没配模型：/config 填一套；/model add 也能新增一套"))
+		}
+		// 不带参数就把这几套列成能按键挑的列表，↑↓ 选、Enter 切过去
+		m.picker = modelPicker(models, m.cfg.Current)
+		return m, nil
 	}
 
 	target, ok := pickModel(models, arg)
@@ -1591,6 +1631,57 @@ func (m model) switchModel(input string) (tea.Model, tea.Cmd) {
 	return m, m.print(out)
 }
 
+// deleteModel 删掉一套模型。名字不给就列出来让你挑；
+// 名字给了先问一句，再打一遍同样的命令才真删——删配置没有后悔药
+func (m model) deleteModel(name string) (tea.Model, tea.Cmd) {
+	models := m.cfg.AvailableModels()
+	if len(models) == 0 {
+		return m, m.print(errStyle.Render("还没配模型，没得删"))
+	}
+	if len(models) == 1 {
+		return m, m.print(errStyle.Render("只剩一套模型了，删不掉"))
+	}
+	if name == "" {
+		// 不带名字：列出来让你挑
+		m.picker = modelDeletePicker(models)
+		return m, nil
+	}
+	target, ok := pickModel(models, name)
+	if !ok {
+		return m, m.print(errStyle.Render(fmt.Sprintf("没有叫 %q 的模型；/model 看看有哪些", name)))
+	}
+	// 上一次已经问过、这次是同一个名字：真删
+	if m.pendingDelete == target.Label() {
+		m.pendingDelete = ""
+		return m.removeModel(target)
+	}
+	m.pendingDelete = target.Label()
+	return m, m.print(
+		bannerStyle.Render("删掉 "+target.Label()+"？") + "\n" +
+			hintStyle.Render("  再打一遍 /model del "+target.Label()+" 就删"))
+}
+
+// removeModel 把删掉的那套从配置里去掉，写回文件并同步内存。
+// 删掉的正是当前那套时改用剩下的第一套，上下文窗口也跟着换
+func (m model) removeModel(target config.ModelConfig) (tea.Model, tea.Cmd) {
+	models, current, err := config.DeleteModel(m.cfg.AvailableModels(), m.cfg.Current, target.Label())
+	if err != nil {
+		return m, m.print(errStyle.Render("删除失败: " + err.Error()))
+	}
+	if err := config.SaveModels(m.cfgPath, models, current); err != nil {
+		return m, m.print(errStyle.Render("删除失败: " + err.Error()))
+	}
+	m.cfg.Models = models
+	m.cfg.Current = current
+	m.syncLegacyProvider()
+	// 上下文窗口按现在真正在跑的那套算
+	if cur, err := m.cfg.CurrentModel(); err == nil {
+		m.contextLimit = cur.Limit()
+	}
+	return m, m.print(bannerStyle.Render("已删掉 "+target.Label()) +
+		hintStyle.Render(fmt.Sprintf("  还剩 %d 套，当前用 %s", len(models), m.currentModel().Label())))
+}
+
 // adjustEffort 处理 /effort：不带参数就报当前档位和可选项，带了就改成那一档并写回配置，
 // 下一轮请求就带上新的 reasoning_effort，不用重启。
 // 改的是当前生效的那套模型（/model 切过去的那套），不是别的
@@ -1604,7 +1695,9 @@ func (m model) adjustEffort(input string) (tea.Model, tea.Cmd) {
 		return m, m.print(errStyle.Render("调整思考强度失败: " + err.Error()))
 	}
 	if arg == "" {
-		return m, m.print(effortText(cur))
+		// 不带参数就把几档列成能按键挑的列表，↑↓ 选、Enter 改成那一档
+		m.picker = effortPicker(cur)
+		return m, nil
 	}
 
 	level, ok := effortArg(arg)
@@ -1613,29 +1706,18 @@ func (m model) adjustEffort(input string) (tea.Model, tea.Cmd) {
 			"认不出思考强度 %q；可选 %s（/effort 看看当前是什么）", arg, strings.Join(config.EffortLabels(), " / "))))
 	}
 
-	// 名字先补齐，和 SaveModels 写回时补的一致，两边才认得出是同一套
-	models := m.cfg.AvailableModels()
-	for i := range models {
-		if strings.TrimSpace(models[i].Name) == "" {
-			models[i].Name = models[i].Label()
-		}
+	// 名字先补齐，和 SaveModels 写回时补的一致，两边才认得出是同一套；
+	// 改的是当前这套（按名字找，找不到退回第一套）
+	next, target, err := config.WithEffort(m.cfg, level)
+	if err != nil {
+		return m, m.print(errStyle.Render("调整思考强度失败: " + err.Error()))
 	}
-	// 当前这套就是要改的那套：按名字找，找不到（配置刚被改坏）就退回第一套
-	target := 0
-	for i := range models {
-		if strings.EqualFold(models[i].Label(), cur.Label()) {
-			target = i
-			break
-		}
-	}
-	models[target].ReasoningEffort = level
-	m.cfg.Models = models
-	m.cfg.Current = models[target].Label()
+	m.cfg = next
 
 	out := bannerStyle.Render("思考强度 ") + statusStyle.Render(config.EffortLabel(level)) +
-		hintStyle.Render("  "+effortHint(level)+" · "+models[target].Label())
+		hintStyle.Render("  "+effortHint(level)+" · "+target.Label())
 	// 写回配置失败不影响本次运行，说明一下就行
-	if err := config.SaveModels(m.cfgPath, models, m.cfg.Current); err != nil {
+	if err := config.SaveModels(m.cfgPath, m.cfg.Models, m.cfg.Current); err != nil {
 		out += "\n" + hintStyle.Render("（没能写回配置: "+err.Error()+"，本次运行仍然生效）")
 	}
 	return m, m.print(out)
@@ -1655,26 +1737,6 @@ func effortArg(arg string) (string, bool) {
 	return level, true
 }
 
-// effortText 是 /effort 不带参数时的说明：当前这档标出来，顺便列出有几档、各是什么
-func effortText(cur config.ModelConfig) string {
-	now := config.EffortLabel(cur.ReasoningEffort)
-	title := bannerStyle.Render("思考强度") +
-		hintStyle.Render("  当前 "+now+"（"+cur.Label()+"）")
-	lines := []string{title}
-	for _, level := range config.EffortLevels {
-		mark, style := "  ", hintStyle
-		if config.EffortLabel(level) == now {
-			mark, style = "▸ ", promptStyle
-		}
-		lines = append(lines, style.Render(fmt.Sprintf("%s%-8s %s", mark, config.EffortLabel(level), effortHint(level))))
-	}
-	lines = append(lines,
-		"",
-		hintStyle.Render("  调整：/effort low、/effort high、/effort 默认，会写回配置文件；下次启动还是这档"),
-		hintStyle.Render("  /config 里也能用 ←→ 换，效果一样"))
-	return strings.Join(lines, "\n")
-}
-
 // effortHint 是一句话说明某个档位是什么意思
 func effortHint(level string) string {
 	switch config.EffortLabel(level) {
@@ -1691,55 +1753,10 @@ func effortHint(level string) string {
 	}
 }
 
-// pickModel 把 /model 的参数认成一套配置：名字和模型名都能认，前面几个字对得上也算，
-// 但必须只对上一套——两套以上拿不准时让用户说全
+// pickModel 把 /model 的参数认成一套配置。匹配规则在 config 包里，
+// 浏览器界面的 /model 用的是同一份
 func pickModel(models []config.ModelConfig, arg string) (config.ModelConfig, bool) {
-	arg = strings.TrimSpace(arg)
-	if arg == "" {
-		return config.ModelConfig{}, false
-	}
-	for _, mc := range models {
-		if strings.EqualFold(mc.Label(), arg) || strings.EqualFold(strings.TrimSpace(mc.Model), arg) {
-			return mc, true
-		}
-	}
-	var matched []config.ModelConfig
-	for _, mc := range models {
-		if strings.HasPrefix(strings.ToLower(mc.Label()), strings.ToLower(arg)) {
-			matched = append(matched, mc)
-		}
-	}
-	if len(matched) == 1 {
-		return matched[0], true
-	}
-	return config.ModelConfig{}, false
-}
-
-// modelText 是 /model 不带参数时的说明：当前用的那套标出来，顺便列出怎么切
-func modelText(models []config.ModelConfig, current string) string {
-	title := bannerStyle.Render("模型") +
-		hintStyle.Render(fmt.Sprintf("  共 %d 套，当前用 %s", len(models), orDash(current)))
-	if len(models) == 0 {
-		return title + "\n" + hintStyle.Render(
-			"  还没配模型：/config 填一套；想配多套就在配置文件的 Models 下照着加几段")
-	}
-	lines := []string{title}
-	active, _ := pickModel(models, current)
-	for _, mc := range models {
-		mark, style := "  ", hintStyle
-		if strings.EqualFold(mc.Label(), active.Label()) && current != "" {
-			mark, style = "▸ ", promptStyle
-		} else if current == "" && strings.EqualFold(mc.Label(), models[0].Label()) {
-			// Current 留空时用第一套
-			mark, style = "▸ ", promptStyle
-		}
-		lines = append(lines, style.Render(fmt.Sprintf("%s%-20s %s", mark, mc.Label(), modelHint(mc))))
-	}
-	lines = append(lines,
-		"",
-		hintStyle.Render("  切换：/model 名字，会写回配置文件；下次启动还是这套"),
-		hintStyle.Render("  配多套：在配置文件的 Models 下照着写几段，Current 指定用哪套（路径见 /config 顶部"))
-	return strings.Join(lines, "\n")
+	return config.PickModel(models, arg)
 }
 
 // modelHint 是一句话说明某套模型配的是什么
@@ -1812,7 +1829,14 @@ func (m model) resume(input string) (tea.Model, tea.Cmd) {
 		return m, m.print(errStyle.Render("恢复会话失败: " + err.Error()))
 	}
 	if arg == "" {
-		return m, m.print(resumeListText(infos, m.cur, m.width-4))
+		if len(infos) == 0 {
+			return m, m.print(bannerStyle.Render("会话列表") + "\n" +
+				hintStyle.Render("  还没有存过的会话：跑完一轮就会自动存一份"))
+		}
+		// 不带参数就把会话列成一块能按键挑的列表，↑↓ 选、Enter 恢复。
+		// 和手打 /resume 序号 走同一条路（见 pickApply）
+		m.picker = sessionPicker(infos, m.cur)
+		return m, nil
 	}
 
 	id, err := pickSession(infos, arg)
@@ -1879,43 +1903,6 @@ func pickSession(infos []session.Info, arg string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("没找到会话 %q，先 /resume 看列表", arg)
-}
-
-// resumeListText 是 /resume 不带参数时的会话列表：最近的在最前，当前会话标出来。
-// id 是一串时间戳，认不出是哪一次，所以有标题就把标题跟在后面；width 是列表可用的宽度
-func resumeListText(infos []session.Info, cur *domain.Session, width int) string {
-	title := bannerStyle.Render("会话列表") +
-		hintStyle.Render(fmt.Sprintf("  共 %d 个，最近的在最前", len(infos)))
-	if len(infos) == 0 {
-		return title + "\n" + hintStyle.Render("  还没有存过的会话：跑完一轮就会自动存一份")
-	}
-
-	shown := infos
-	if len(shown) > maxResumeList {
-		shown = shown[:maxResumeList]
-	}
-	lines := []string{title}
-	for i, info := range shown {
-		mark := "  "
-		style := hintStyle
-		if cur != nil && info.Id == cur.Id {
-			mark, style = "▸ ", promptStyle
-		}
-		when := "—"
-		if !info.ModTime.IsZero() {
-			when = info.ModTime.Format("01-02 15:04")
-		}
-		line := fmt.Sprintf("%s%d. %-24s %s  %s", mark, i+1, info.Id, when, sizeText(info.Size))
-		if t := strings.TrimSpace(info.Title); t != "" {
-			line += "  " + t
-		}
-		lines = append(lines, clipLine(style.Render(line), width))
-	}
-	if len(infos) > len(shown) {
-		lines = append(lines, hintStyle.Render(fmt.Sprintf("  …还有 %d 个更早的", len(infos)-len(shown))))
-	}
-	lines = append(lines, "", hintStyle.Render("  恢复：/resume 序号 或 /resume 会话 id"))
-	return strings.Join(lines, "\n")
 }
 
 // sizeText 把字节数说成人话，用来粗略估计一个会话有多长
@@ -2032,6 +2019,8 @@ func (m model) startRun(display, prompt string, images []domain.Image) (tea.Mode
 	m.status = "连接模型…"
 	m.pending = nil
 	m.approval = nil
+	// 列表是"让你挑一个"的东西，已经开始跑了就没人再答它，收起来
+	m.picker = nil
 	m.usage = domain.ContextUsage{}
 	m.reasoning.Reset()
 	m.answer.Reset()
@@ -2742,6 +2731,11 @@ func compose(lines []string, width int) string {
 // 或者闲着时的补全候选、后台任务详情、命令提示。
 func (m model) activeLines() []string {
 	rows := m.activeRows()
+	// 挑东西的列表要整块露出来：这一刻它是唯一在等人回答的东西，
+	// 所以压过待办清单和排队那几行，自己按槽位额度排版（见 pickerLines）
+	if m.picker != nil {
+		return m.pickerLines()
+	}
 	out := m.todoLines(rows)
 	// 排队那几行紧跟在清单后面：它是用户刚敲进去、马上要发的东西，
 	// 排在预览之前，槽位不够时裁掉的是预览而不是它

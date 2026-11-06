@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
-	"unicode"
 
+	cmdspec "hamusuta/agent-dev/src/command"
 	"hamusuta/agent-dev/src/core"
 	"hamusuta/agent-dev/src/domain"
 	"hamusuta/agent-dev/src/session"
@@ -38,71 +38,57 @@ type commandSpec struct {
 	desc string
 }
 
-var commandSpecs = []commandSpec{
-	{cmdHelp, "/help", "看这个帮助"},
-	{cmdNew, "/new", "开一个新会话"},
-	{cmdResume, "/resume", "恢复以前的会话：不带参数列出来，带序号或 id 切过去"},
-	{cmdSession, "/session", "看当前会话 id 和消息条数"},
-	{cmdConfig, "/config", "配置当前这套模型：地址（留空用内置的）、密钥、模型名、思考强度；Ctrl+L 拉模型列表"},
-	{cmdMode, "/mode", "看或切换工作模式：只读 / 编辑需授权 / 完全授权"},
-	{cmdModel, "/model", "看配置好的几套模型，或切到其中一套（会写回配置文件）"},
-	{cmdEffort, "/effort", "看或调整思考强度：默认 / minimal / low / medium / high（会写回配置文件）"},
-	{cmdSkills, "/skills", "看装了哪些技能，直接 /技能名 就能调用"},
-	{cmdTodo, "/todo", "看这次任务的待办清单"},
-	{cmdQuiet, "/quiet", "切换精简显示：只打正文，不显示思考过程和工具输出（会写回配置）"},
-	{cmdExit, "/exit", "退出（也可以 Ctrl+D）"},
+// cmdOf 是"命令名 → 这一层认识的枚举"。名字和说明本身来自 command 包
+// （浏览器界面用的是同一份），这里只补上终端这边执行时要走哪个分支
+var cmdOf = map[string]command{
+	"/help":    cmdHelp,
+	"/new":     cmdNew,
+	"/resume":  cmdResume,
+	"/session": cmdSession,
+	"/config":  cmdConfig,
+	"/mode":    cmdMode,
+	"/model":   cmdModel,
+	"/effort":  cmdEffort,
+	"/skills":  cmdSkills,
+	"/todo":    cmdTodo,
+	"/quiet":   cmdQuiet,
+	"/exit":    cmdExit,
+}
+
+// commandSpecs 是帮助文本和补全候选的数据源，顺序跟 cmdspec.Specs 一致
+var commandSpecs = buildCommandSpecs()
+
+func buildCommandSpecs() []commandSpec {
+	out := make([]commandSpec, 0, len(cmdspec.Specs))
+	for _, spec := range cmdspec.Specs {
+		out = append(out, commandSpec{cmd: cmdOf[spec.Name], name: spec.Name, desc: spec.Desc})
+	}
+	return out
 }
 
 // parseCommand 认出输入里的本地命令，认不出就当成普通提问
 func parseCommand(input string) command {
-	fields := strings.Fields(input)
-	if len(fields) == 0 {
+	switch firstField(input) {
+	case "/quit", "exit", "quit":
+		// 这几个是终端里额外的别名，两个界面共用的表里不列它们
+		return cmdExit
+	}
+	name := firstField(input)
+	if name == "" {
 		return cmdNone
 	}
-	switch fields[0] {
-	case "/help":
-		return cmdHelp
-	case "/new":
-		return cmdNew
-	case "/resume":
-		return cmdResume
-	case "/session":
-		return cmdSession
-	case "/config":
-		return cmdConfig
-	case "/mode":
-		return cmdMode
-	case "/model":
-		return cmdModel
-	case "/effort":
-		return cmdEffort
-	case "/skills":
-		return cmdSkills
-	case "/todo":
-		return cmdTodo
-	case "/quiet":
-		return cmdQuiet
-	case "/exit", "/quit", "exit", "quit":
-		return cmdExit
+	if cmd, ok := cmdOf[name]; ok {
+		return cmd
 	}
 	return cmdNone
 }
 
 // suggestCommands 返回能把当前输入补全的命令。
-// 只在第一段（还没打空格）时补全；输入已经是某个完整命令时不再提示。
+// 匹配规则在 command 包里（浏览器界面用的是同一份），这里只换成终端这边的类型
 func suggestCommands(input string) []commandSpec {
-	s := strings.TrimLeft(input, " \t")
-	if !strings.HasPrefix(s, "/") || strings.ContainsAny(s, " \t\n") {
-		return nil
-	}
 	var out []commandSpec
-	for _, spec := range commandSpecs {
-		if strings.HasPrefix(spec.name, s) {
-			out = append(out, spec)
-		}
-	}
-	if len(out) == 1 && out[0].name == s {
-		return nil
+	for _, spec := range cmdspec.Suggest(input) {
+		out = append(out, commandSpec{cmd: cmdOf[spec.Name], name: spec.Name, desc: spec.Desc})
 	}
 	return out
 }
@@ -111,8 +97,8 @@ func suggestCommands(input string) []commandSpec {
 // 规则跟内置命令一样，只在还没打空格时补；已经打全了就不再提示。
 // 这里对大小写不敏感——技能名是用户自己起的，不该逼他记住大小写
 func suggestSkills(input string, skills []core.Skill) []commandSpec {
-	s := strings.TrimLeft(input, " \t")
-	if !strings.HasPrefix(s, "/") || strings.ContainsAny(s, " \t\n") {
+	s := cmdspec.Prefix(input)
+	if s == "" {
 		return nil
 	}
 	lower := strings.ToLower(s)
@@ -129,29 +115,15 @@ func suggestSkills(input string, skills []core.Skill) []commandSpec {
 	return out
 }
 
-// looksLikeCommand 判断输入的第一段是不是"想打一条命令"：/ 开头，后面全是名字里
-// 该有的字符（字母、数字、连字符、下划线）。认出来却没有对应的命令或技能，
-// 说一句比闷头发给模型强；/tmp/foo.log 这种带路径分隔符的照旧当普通提问
+// looksLikeCommand 判断输入的第一段是不是"想打一条命令"。判据在 command 包里，
+// 两个界面共用一个标准
 func looksLikeCommand(field string) bool {
-	if !strings.HasPrefix(field, "/") || len(field) == 1 {
-		return false
-	}
-	for _, r := range field[1:] {
-		switch {
-		case r == '-' || r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r):
-		default:
-			return false
-		}
-	}
-	return true
+	return cmdspec.LooksLike(field)
 }
 
 // firstField 是输入的第一段，空输入时返回空串
 func firstField(input string) string {
-	if fields := strings.Fields(input); len(fields) > 0 {
-		return fields[0]
-	}
-	return ""
+	return cmdspec.FirstField(input)
 }
 
 // parseSkillCall 把 "/技能名 补充说明" 拆成技能和后面那截补充说明。
@@ -184,9 +156,14 @@ func helpText() string {
 		"  只读模式不给写类工具；完全授权模式不再问",
 		"",
 		bannerStyle.Render("输入"),
-		"  Enter 发送，" + newlineHint() + "（终端不认修饰键时 Shift+Enter 和 Enter 是同一个键），粘贴多行文本会当成一次输入",
+		"  Enter 发送，"+newlineHint()+"（终端不认修饰键时 Shift+Enter 和 Enter 是同一个键），粘贴多行文本会当成一次输入",
 		"  输入以 / 开头时会列出可补全的命令，↑↓ 选择、Tab 或 Enter 补全",
 		"  Tab 被终端接走时（比如 VS Code 集成终端），改用 Ctrl+Space 或 → 补全",
+		"",
+		bannerStyle.Render("按键列表"),
+		"  /resume、/model、/mode、/effort 不带参数时，把候选列在输入框上方让你按键挑：",
+		"  ↑↓ 或 j k 选（PgUp / PgDn 翻页、Home / End 到两头），Enter 定下来，Esc 收起",
+		"  一打字列表就收起来，字照常进输入框；带参数打的 /resume 1、/model 名字 依旧能直接用",
 		"",
 		bannerStyle.Render("排队"),
 		"  一轮还在跑的时候按 Enter 不会丢：消息排进队里，输入框上方能看到排了哪些（黄字）",
@@ -210,8 +187,9 @@ func helpText() string {
 		"  地址和密钥填好后按 Ctrl+L 能从接口拉模型列表，↑↓ 挑、Enter 采用，也可以直接手填模型名",
 		"  思考强度用 ←→ 在 默认 / minimal / low / medium / high 之间换，会作为 reasoning_effort 发给接口；",
 		"  留\"默认\"就不发这个参数（认不认它看各家接口，OpenAI 系的 low/medium/high 最通用）",
-		"  不想开表单就直接打 /effort：不带参数看当前这档，/effort high、/effort 默认 就地改",
-		"  /model 列出配置好的几套模型，/model 名字切过去（会写回配置文件，重启还是它）",
+		"  不想开表单就直接打 /effort：不带参数列出几档（↑↓ 选、Enter 就改成那一档），/effort high 直接改",
+		"  /model 不带参数列出配置好的几套（↑↓ 选、Enter 切过去），同样会写回配置文件，重启还是那套",
+		"  /model add 新增一套（名字留空就用模型名），/model del 名字 删掉一套（会再问一次）",
 		"  配置文件在用户目录下的 .agent-dev/config.yaml，跟工作区无关；Models 下可以写好几套，",
 		"  Current 指定默认用哪套；只写老格式的 Provider 段也能跑，/config 保存一次就会补齐两条",
 		"",
@@ -259,22 +237,8 @@ func skillsText(skills []core.Skill) string {
 // unknownCommandText 是打了一条不认识的 /命令 时的提示。
 // 技能名记不全很常见，把名字里含这段字都列出来，比只甩一句"没有这个命令"有用
 func unknownCommandText(name string, skills []core.Skill) string {
-	lower := strings.ToLower(strings.TrimPrefix(name, "/"))
-	var near []string
-	for _, spec := range commandSpecs {
-		if strings.Contains(strings.TrimPrefix(spec.name, "/"), lower) {
-			near = append(near, spec.name)
-		}
-	}
-	for _, skill := range skills {
-		if strings.Contains(strings.ToLower(skill.Name), lower) {
-			near = append(near, "/"+skill.Name)
-		}
-	}
+	near := cmdspec.Near(name, skillNames(skills))
 	lines := []string{errStyle.Render("没有叫 " + name + " 的命令或技能")}
-	if len(near) > maxNearCommands {
-		near = near[:maxNearCommands]
-	}
 	if len(near) > 0 {
 		lines = append(lines, hintStyle.Render("  相近的：")+strings.Join(near, " · "))
 	}
@@ -283,8 +247,14 @@ func unknownCommandText(name string, skills []core.Skill) string {
 	return strings.Join(lines, "\n")
 }
 
-// maxNearCommands 是"相近的命令"最多列几个：列一屏沾边的等于没提示
-const maxNearCommands = 8
+// skillNames 取出技能名，够 cmdspec.Near 用
+func skillNames(skills []core.Skill) []string {
+	out := make([]string, 0, len(skills))
+	for _, skill := range skills {
+		out = append(out, skill.Name)
+	}
+	return out
+}
 
 func sessionText(cur *domain.Session, workdir string, store *session.Store) string {
 	dir := ""
@@ -299,25 +269,6 @@ func sessionText(cur *domain.Session, workdir string, store *session.Store) stri
 		out += "\n存到 " + dir
 	}
 	return out
-}
-
-// modeText 是 /mode 不带参数时的说明：当前模式标出来，顺便列出怎么切
-func modeText(cur domain.Mode) string {
-	lines := []string{bannerStyle.Render("工作模式") +
-		hintStyle.Render("  当前 ") + statusStyle.Render(cur.Label())}
-	for _, mode := range []domain.Mode{domain.ModeReadOnly, domain.ModeAsk, domain.ModeFull} {
-		mark := "  "
-		style := hintStyle
-		if mode == cur {
-			mark, style = "▸ ", promptStyle
-		}
-		lines = append(lines, style.Render(fmt.Sprintf("%s%s  %-5s %s",
-			mark, mode.Label(), mode.String(), modeHint(mode))))
-	}
-	lines = append(lines,
-		"",
-		hintStyle.Render("  切换：/mode read · /mode ask · /mode full，会写回配置文件"))
-	return strings.Join(lines, "\n")
 }
 
 // modeHint 是一句话说明某个模式放行到什么程度

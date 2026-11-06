@@ -25,14 +25,14 @@ func TestConfigFormFillsBuiltinUrl(t *testing.T) {
 		{"自己填过的", config.ModelConfig{ApiUrl: "https://my.gateway/v1"}, "https://my.gateway/v1"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			if got := newConfigForm(c.mc).value(urlField); got != c.want {
+			if got := newConfigForm(c.mc, c.mc.Label()).value(urlField); got != c.want {
 				t.Fatalf("表单里的地址不对: %q，想要 %q", got, c.want)
 			}
 		})
 	}
 
 	// 保存时地址那一格被清空也不该报错：内置地址顶上
-	f := newConfigForm(config.ModelConfig{Type: "DeepSeek"})
+	f := newConfigForm(config.ModelConfig{Type: "DeepSeek"}, "")
 	f.inputs[urlField].SetValue("  ")
 	mc, err := f.modelConfig()
 	if err != nil {
@@ -47,7 +47,7 @@ func TestConfigFormFillsBuiltinUrl(t *testing.T) {
 func TestConfigFormPickModel(t *testing.T) {
 	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
 	m.state = stateConfig
-	m.form = newConfigForm(config.ModelConfig{Type: "DeepSeek", ApiKey: "sk-test"})
+	m.form = newConfigForm(config.ModelConfig{Type: "DeepSeek", ApiKey: "sk-test"}, "")
 	pulled, _ := m.pullModels(true)
 	m = pulled.(model)
 	if !m.form.fetching {
@@ -91,7 +91,7 @@ func TestConfigFormPickModel(t *testing.T) {
 func TestConfigFormListStale(t *testing.T) {
 	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
 	m.state = stateConfig
-	m.form = newConfigForm(config.ModelConfig{Type: "DeepSeek", ApiKey: "sk-test"})
+	m.form = newConfigForm(config.ModelConfig{Type: "DeepSeek", ApiKey: "sk-test"}, "")
 	pulled, _ := m.pullModels(false)
 	m = pulled.(model)
 	if !m.form.fetching {
@@ -162,7 +162,7 @@ func TestConfigFormListStale(t *testing.T) {
 func TestConfigFormFetchNeedsKey(t *testing.T) {
 	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
 	m.state = stateConfig
-	m.form = newConfigForm(config.ModelConfig{Type: "DeepSeek"})
+	m.form = newConfigForm(config.ModelConfig{Type: "DeepSeek"}, "")
 
 	got, cmd := m.handleConfigKey(tea.KeyPressMsg{Code: 'l', Mod: tea.ModCtrl})
 	if cmd != nil {
@@ -182,7 +182,9 @@ func TestConfigFormSwitchType(t *testing.T) {
 	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
 	m.cfgPath = filepath.Join(t.TempDir(), "config.yaml")
 	m.state = stateConfig
-	m.form = newConfigForm(config.ModelConfig{Type: "DeepSeek"})
+	m.form = newConfigForm(config.ModelConfig{Type: "DeepSeek"}, "")
+	// 光标得停在类型那一格上：←→ 只在类型和思考强度这两格上有用
+	m.form.cur = typeField
 	if got := m.form.value(typeField); got != "DeepSeek" {
 		t.Fatalf("类型没带出来: %q", got)
 	}
@@ -223,7 +225,8 @@ func TestConfigFormSwitchType(t *testing.T) {
 	}
 
 	// 自己填过的地址不跟着换：换个类型它还是自己的
-	custom := newConfigForm(config.ModelConfig{Type: "DeepSeek", ApiUrl: "https://my.gateway/v1"})
+	custom := newConfigForm(config.ModelConfig{Type: "DeepSeek", ApiUrl: "https://my.gateway/v1"}, "")
+	custom.cur = typeField
 	m.form = custom
 	next, _ = m.handleConfigKey(tea.KeyPressMsg{Code: tea.KeyRight})
 	if v := next.(model).form.value(urlField); v != "https://my.gateway/v1" {
@@ -231,7 +234,8 @@ func TestConfigFormSwitchType(t *testing.T) {
 	}
 
 	// ← 从第一个往前绕到最后一个
-	first := newConfigForm(config.ModelConfig{Type: "DeepSeek"})
+	first := newConfigForm(config.ModelConfig{Type: "DeepSeek"}, "")
+	first.cur = typeField
 	m.form = first
 	next, _ = m.handleConfigKey(tea.KeyPressMsg{Code: tea.KeyLeft})
 	if v := next.(model).form.value(typeField); v != "MiniMax" {
@@ -244,7 +248,7 @@ func TestConfigFormSwitchEffort(t *testing.T) {
 	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
 	m.cfgPath = filepath.Join(t.TempDir(), "config.yaml")
 	m.state = stateConfig
-	m.form = newConfigForm(config.ModelConfig{Type: "DeepSeek"})
+	m.form = newConfigForm(config.ModelConfig{Type: "DeepSeek"}, "")
 	m.form.cur = effortField
 	if got := m.form.value(effortField); got != "" {
 		t.Fatalf("没配过的思考强度该是默认档: %q", got)
@@ -311,12 +315,121 @@ func TestConfigFormSwitchEffort(t *testing.T) {
 	}
 
 	// 配置里手写了个表外的档位：不崩，照样能往下切
-	odd := newConfigForm(config.ModelConfig{Type: "DeepSeek", ReasoningEffort: "weird"})
+	odd := newConfigForm(config.ModelConfig{Type: "DeepSeek", ReasoningEffort: "weird"}, "")
 	odd.cur = effortField
 	m.form = odd
 	next, _ = m.handleConfigKey(tea.KeyPressMsg{Code: tea.KeyRight})
 	if v := next.(model).form.value(effortField); v != "minimal" {
 		t.Fatalf("表外的档位该从第一档接着走，实际 %q", v)
+	}
+}
+
+// 表单多一格「名字」：新增时是空的，编辑时预填正在改的那套
+func TestConfigFormNameField(t *testing.T) {
+	// 编辑模式：名字格预填那套的名字
+	f := newConfigForm(config.ModelConfig{Name: "快", Type: "DeepSeek", Model: "model-a"}, "快")
+	if got := f.value(nameField); got != "快" {
+		t.Fatalf("编辑时名字该预填: %q", got)
+	}
+	if f.editLabel != "快" {
+		t.Fatalf("编辑模式该记住正在改哪套: %q", f.editLabel)
+	}
+
+	// 新增模式：名字空着，类型给默认的，地址给内置的
+	blank := newConfigForm(config.ModelConfig{}, "")
+	if blank.editLabel != "" {
+		t.Fatalf("新增模式不该有正在改的那套: %q", blank.editLabel)
+	}
+	if got := blank.value(nameField); got != "" {
+		t.Fatalf("新增时名字该是空的: %q", got)
+	}
+	if got := blank.value(typeField); got != "DeepSeek" {
+		t.Fatalf("新增时类型该默认 DeepSeek: %q", got)
+	}
+	if got := blank.value(urlField); got != config.DefaultDeepSeekApiUrl {
+		t.Fatalf("新增时地址该给内置的: %q", got)
+	}
+
+	// 名字格能填：填了就是这一套的名字
+	f.inputs[nameField].SetValue("  新名字  ")
+	mc, err := f.modelConfig()
+	if err != nil {
+		t.Fatalf("填名字不该报错: %v", err)
+	}
+	if mc.Name != "新名字" {
+		t.Fatalf("名字没取到: %q", mc.Name)
+	}
+}
+
+// 存的时候分两种：新增是追加到末尾，改现有的是改那一条（改名不额外多一套）
+func TestSaveConfigAddAndRename(t *testing.T) {
+	// 新增：列表多一套，当前那套不动
+	m := newModel(config.GlobalConfig{Models: testModels(), Current: "快"}, nil, ".", domain.NewSession("."))
+	m.cfgPath = filepath.Join(t.TempDir(), "config.yaml")
+	m.state = stateConfig
+	m.form = newConfigForm(config.ModelConfig{}, "")
+	// ←→ 切到 MiniMax：地址得跟着换成该类型的内置地址，
+	// 不然会存下一套"类型是 MiniMax、地址却是 DeepSeek"的配置
+	got := m
+	for i := 0; i < 2; i++ {
+		next, _ := got.switchType(1)
+		got = next.(model)
+	}
+	if got.form.value(typeField) != "MiniMax" {
+		t.Fatalf("该切到 MiniMax，实际 %q", got.form.value(typeField))
+	}
+	if got.form.value(urlField) != config.DefaultMiniMaxApiUrl {
+		t.Fatalf("地址该跟着换成 MiniMax 的: %q", got.form.value(urlField))
+	}
+	got.form.inputs[keyField].SetValue("sk-mm")
+	got.form.inputs[modelField].SetValue("MiniMax-M3")
+	saved, _ := got.saveConfig()
+	after := saved.(model)
+	if len(after.cfg.Models) != 3 {
+		t.Fatalf("新增后该有三套，实际 %d: %+v", len(after.cfg.Models), after.cfg.Models)
+	}
+	if after.cfg.Models[2].Model != "MiniMax-M3" {
+		t.Fatalf("新的一套没追加到末尾: %+v", after.cfg.Models)
+	}
+	if after.cfg.Models[2].ApiUrl != config.DefaultMiniMaxApiUrl {
+		t.Fatalf("新的一套地址不对: %+v", after.cfg.Models[2])
+	}
+	if after.cfg.Current != "快" {
+		t.Fatalf("新增不该动当前那套: %q", after.cfg.Current)
+	}
+	// 上下文窗口按当前那套算，不该被新增的带跑
+	if after.contextLimit != 64000 {
+		t.Fatalf("新增不该动上下文窗口: %d", after.contextLimit)
+	}
+
+	// 改名：列表长度不变，Current 跟着更新
+	m2 := newModel(config.GlobalConfig{Models: testModels(), Current: "快"}, nil, ".", domain.NewSession("."))
+	m2.cfgPath = filepath.Join(t.TempDir(), "config.yaml")
+	m2.state = stateConfig
+	m2.form = newConfigForm(testModels()[0], "快")
+	m2.form.inputs[nameField].SetValue("飞快")
+	saved2, _ := m2.saveConfig()
+	after2 := saved2.(model)
+	if len(after2.cfg.Models) != 2 {
+		t.Fatalf("改名不该多出一套，实际 %d: %+v", len(after2.cfg.Models), after2.cfg.Models)
+	}
+	if after2.cfg.Models[0].Name != "飞快" {
+		t.Fatalf("名字没换过来: %+v", after2.cfg.Models[0])
+	}
+	if after2.cfg.Current != "飞快" {
+		t.Fatalf("Current 该跟着改名: %q", after2.cfg.Current)
+	}
+
+	// 编辑时把名字格清空：名字不变（不是变成模型名）
+	m3 := newModel(config.GlobalConfig{Models: testModels(), Current: "快"}, nil, ".", domain.NewSession("."))
+	m3.cfgPath = filepath.Join(t.TempDir(), "config.yaml")
+	m3.state = stateConfig
+	m3.form = newConfigForm(testModels()[0], "快")
+	m3.form.inputs[nameField].SetValue("")
+	saved3, _ := m3.saveConfig()
+	after3 := saved3.(model)
+	if after3.cfg.Models[0].Name != "快" {
+		t.Fatalf("名字留空该保住原来的，实际 %q", after3.cfg.Models[0].Name)
 	}
 }
 

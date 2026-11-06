@@ -708,7 +708,7 @@ func TestUsageLine(t *testing.T) {
 
 // 配置表单里的上下文上限：默认带出默认值，填了就用填的，填了非正整数要拦住
 func TestConfigFormContextLimit(t *testing.T) {
-	f := newConfigForm(config.ModelConfig{ApiUrl: "https://api.deepseek.com", ApiKey: "sk-1", Model: "deepseek-chat"})
+	f := newConfigForm(config.ModelConfig{ApiUrl: "https://api.deepseek.com", ApiKey: "sk-1", Model: "deepseek-chat"}, "")
 	if got := f.value(limitField); got != strconv.Itoa(config.DefaultContextLimit) {
 		t.Fatalf("表单里应该带出默认上限，实际 %q", got)
 	}
@@ -1340,8 +1340,17 @@ func TestSwitchMode(t *testing.T) {
 	}
 
 	got, _ := m.switchMode("/mode")
-	if text := stripANSI(modeText(got.(model).mode)); !strings.Contains(text, "只读") {
-		t.Fatalf("/mode 没报当前模式:\n%s", text)
+	picked := got.(model)
+	if picked.picker == nil || picked.picker.kind != pickKindMode {
+		t.Fatal("/mode 不带参数该把三种模式列成能按键挑的列表")
+	}
+	picked.width = 80
+	text := stripANSI(strings.Join(picked.pickerLines(), "\n"))
+	if !strings.Contains(text, "只读") || !strings.Contains(text, "（当前）") {
+		t.Fatalf("/mode 列表里该有只读那一档、当前那档要标出来:\n%s", text)
+	}
+	if !strings.Contains(text, "Enter 切换") {
+		t.Fatalf("列表底部该说清回车干什么:\n%s", text)
 	}
 
 	got, _ = m.switchMode("/mode full")
@@ -1571,37 +1580,44 @@ func TestResumeText(t *testing.T) {
 	}
 }
 
-// /resume 不带参数的列表：最近的在最前，当前会话要标出来，会话标题跟在后面
-func TestResumeListText(t *testing.T) {
+// /resume 不带参数列成能按键挑的列表：最近的在最前，当前会话要标出来，标题跟在后面
+func TestResumePickerLines(t *testing.T) {
 	cur := &domain.Session{Id: "20240102-000000-0001"}
 	infos := []session.Info{
 		{Id: "20240103-000000-0002", Title: "给恢复会话列表加标题", Size: 2048, ModTime: time.Date(2024, 1, 3, 9, 30, 0, 0, time.UTC)},
 		{Id: cur.Id, Size: 512, ModTime: time.Date(2024, 1, 2, 9, 30, 0, 0, time.UTC)},
 	}
-	text := stripANSI(resumeListText(infos, cur, 76))
+	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+	m.width = 100
+	m.picker = sessionPicker(infos, cur)
+	text := stripANSI(strings.Join(m.pickerLines(), "\n"))
 
-	for _, want := range []string{"共 2 个", "1. 20240103-000000-0002", "2K", "512B", "/resume 序号", "给恢复会话列表加标题"} {
+	for _, want := range []string{"共 2 个", "1. 20240103-000000-0002", "2K", "512B", "给恢复会话列表加标题",
+		"（当前）", "Enter 恢复"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("列表里应该有 %q:\n%s", want, text)
 		}
 	}
+	// 光标一开始停在当前会话上，所以 ▸ 打在这一行
 	if !strings.Contains(text, "▸ 2. "+cur.Id) {
-		t.Fatalf("当前会话应该标出来:\n%s", text)
+		t.Fatalf("当前会话应该被光标选中:\n%s", text)
 	}
 
-	// 一条都没有时给句提示，不要打出空列表
-	empty := stripANSI(resumeListText(nil, cur, 76))
-	if !strings.Contains(empty, "还没有存过的会话") {
-		t.Fatalf("空列表的说明不对: %s", empty)
+	// 一条都没有时不开列表，直接说一句（见 resume）
+	if p := sessionPicker(nil, cur); len(p.items) != 0 {
+		t.Fatalf("没有会话时不该有选项: %+v", p.items)
 	}
 }
 
 // 老会话没有标题，列表里也不该留一截空档或者打个占位符出来
-func TestResumeListTextWithoutTitle(t *testing.T) {
+func TestResumePickerWithoutTitle(t *testing.T) {
 	infos := []session.Info{
 		{Id: "20240103-000000-0002", Size: 2048, ModTime: time.Date(2024, 1, 3, 9, 30, 0, 0, time.UTC)},
 	}
-	text := stripANSI(resumeListText(infos, nil, 76))
+	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+	m.width = 100
+	m.picker = sessionPicker(infos, nil)
+	text := stripANSI(strings.Join(m.pickerLines(), "\n"))
 	line := ""
 	for _, l := range strings.Split(text, "\n") {
 		if strings.Contains(l, "20240103-000000-0002") {
@@ -1610,6 +1626,9 @@ func TestResumeListTextWithoutTitle(t *testing.T) {
 	}
 	if !strings.HasSuffix(strings.TrimRight(line, " "), "2K") {
 		t.Fatalf("没标题时行尾就是大小，实际 %q", line)
+	}
+	if strings.Contains(text, "（当前）") {
+		t.Fatalf("没有当前会话时不该有当前标记:\n%s", text)
 	}
 }
 

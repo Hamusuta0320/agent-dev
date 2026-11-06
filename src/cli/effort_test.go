@@ -16,6 +16,8 @@ func TestEffortShownInUI(t *testing.T) {
 	models := testModels()
 	models[0].ReasoningEffort = "high"
 	m := newModel(config.GlobalConfig{Models: models, Current: "快"}, nil, ".", domain.NewSession("."))
+	// 这个用例会走 /model 和 /effort 的写回路径，路径必须指到临时目录
+	m.cfgPath = filepath.Join(t.TempDir(), "config.yaml")
 	m.width = 200
 
 	if got := m.effortLabel(); got != "high" {
@@ -103,17 +105,21 @@ func TestEffortArg(t *testing.T) {
 	}
 }
 
-// /effort 不带参数时把当前档位和可选项列出来，当前那档标出来
-func TestEffortText(t *testing.T) {
-	text := stripANSI(effortText(config.ModelConfig{Name: "快", Model: "model-a", ReasoningEffort: "high"}))
-	for _, want := range []string{"当前 high", "▸ high", "minimal", "默认", "/effort low"} {
+// /effort 不带参数把几档列成能按键挑的列表，当前那档标出来
+func TestEffortPickerLines(t *testing.T) {
+	m := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession("."))
+	m.width = 120
+	m.picker = effortPicker(config.ModelConfig{Name: "快", Model: "model-a", ReasoningEffort: "high"})
+	text := stripANSI(strings.Join(m.pickerLines(), "\n"))
+	for _, want := range []string{"当前 high", "▸ high", "（当前）", "minimal", "默认", "Enter 调整"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("/effort 列表里少了 %q:\n%s", want, text)
 		}
 	}
 
 	// 没配过的人看到的是"默认"档：这时候不发 reasoning_effort
-	def := stripANSI(effortText(config.ModelConfig{Name: "稳"}))
+	m.picker = effortPicker(config.ModelConfig{Name: "稳"})
+	def := stripANSI(strings.Join(m.pickerLines(), "\n"))
 	for _, want := range []string{"当前 默认", "▸ 默认", "不发这个参数"} {
 		if !strings.Contains(def, want) {
 			t.Fatalf("默认档没标出来（%q）:\n%s", want, def)

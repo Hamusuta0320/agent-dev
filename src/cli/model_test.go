@@ -35,19 +35,26 @@ func testModels() []config.ModelConfig {
 	}
 }
 
-// /model 不带参数时把配置好的几套列出来，当前那套标出来
-func TestModelText(t *testing.T) {
-	text := stripANSI(modelText(testModels(), "快"))
-	for _, want := range []string{"共 2 套", "当前用 快", "▸ 快", "model-b", "OpenAI", "https://b"} {
+// /model 不带参数把配置好的几套列成能按键挑的列表，当前那套标出来
+func TestModelPickerLines(t *testing.T) {
+	m := newModel(config.GlobalConfig{Models: testModels(), Current: "快"}, nil, ".", domain.NewSession("."))
+	m.width = 120
+	m.picker = modelPicker(testModels(), "快")
+	text := stripANSI(strings.Join(m.pickerLines(), "\n"))
+	for _, want := range []string{"共 2 套", "当前用 快", "model-b", "OpenAI", "https://b", "（当前）", "Enter 切换"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("/model 列表里少了 %q:\n%s", want, text)
 		}
 	}
+	// 光标一开始停在当前这套上
+	if !strings.Contains(text, "▸ 快") {
+		t.Fatalf("当前这套该被光标选中:\n%s", text)
+	}
 
-	// 一套都没配时给句提示，告诉人往哪儿填
-	empty := stripANSI(modelText(nil, ""))
-	if !strings.Contains(empty, "/config") || !strings.Contains(empty, "Models") {
-		t.Fatalf("没配模型时的提示不对:\n%s", empty)
+	// 一套都没配时不开列表，直接提示往哪填（见 switchModel）
+	got, _ := newModel(config.GlobalConfig{}, nil, ".", domain.NewSession(".")).switchModel("/model")
+	if got.(model).picker != nil {
+		t.Fatal("没配模型时不该开列表")
 	}
 }
 
@@ -90,6 +97,100 @@ func TestSwitchModel(t *testing.T) {
 	got, _ = after.switchModel("/model 不存在")
 	if got.(model).cfg.Current != "稳" {
 		t.Fatalf("认不出的模型不该切: %q", got.(model).cfg.Current)
+	}
+}
+
+// /model add 开一张空白表单，存完列表里多一套
+func TestModelAddCommand(t *testing.T) {
+	m := newModel(config.GlobalConfig{Models: testModels(), Current: "快"}, nil, ".", domain.NewSession("."))
+	m.cfgPath = filepath.Join(t.TempDir(), "config.yaml")
+	m.state = stateIdle
+
+	got, _ := m.switchModel("/model add")
+	after := got.(model)
+	if after.state != stateConfig {
+		t.Fatal("/model add 该打开配置表单")
+	}
+	if after.form.editLabel != "" {
+		t.Fatalf("新增模式不该有正在改的那套: %q", after.form.editLabel)
+	}
+	if got := after.form.value(urlField); got != config.DefaultDeepSeekApiUrl {
+		t.Fatalf("新增时地址该给内置的: %q", got)
+	}
+}
+
+// /model del：第一次只问一句，再打一遍同样的命令才真删
+func TestModelDeleteCommand(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	m := newModel(config.GlobalConfig{Models: testModels(), Current: "快"}, nil, ".", domain.NewSession("."))
+	m.cfgPath = path
+
+	// 第一次：只提示，不删
+	got, _ := m.switchModel("/model del 稳")
+	after := got.(model)
+	if len(after.cfg.Models) != 2 {
+		t.Fatalf("第一次不该真删: %+v", after.cfg.Models)
+	}
+	if after.pendingDelete != "稳" {
+		t.Fatalf("该记住要删哪套: %q", after.pendingDelete)
+	}
+
+	// 第二次：真删
+	got, _ = after.switchModel("/model del 稳")
+	after2 := got.(model)
+	if len(after2.cfg.Models) != 1 {
+		t.Fatalf("该删掉一套: %+v", after2.cfg.Models)
+	}
+	if after2.cfg.Current != "快" {
+		t.Fatalf("删的不是当前那套，Current 不该动: %q", after2.cfg.Current)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("配置没写回: %v", err)
+	}
+	if strings.Contains(string(data), "model-b") {
+		t.Fatalf("删掉的那套还留在配置里:\n%s", data)
+	}
+}
+
+// 只剩一套时删不掉
+func TestModelDeleteKeepsLast(t *testing.T) {
+	m := newModel(config.GlobalConfig{Models: testModels()[:1], Current: "快"}, nil, ".", domain.NewSession("."))
+	m.cfgPath = filepath.Join(t.TempDir(), "config.yaml")
+	got, _ := m.switchModel("/model del 快")
+	if len(got.(model).cfg.Models) != 1 {
+		t.Fatalf("只剩一套时不该删: %+v", got.(model).cfg.Models)
+	}
+}
+
+// /model del 不带名字时列成能按键挑的列表；挑完也还是先问一句，不直接删
+func TestModelDeletePicker(t *testing.T) {
+	m := newModel(config.GlobalConfig{Models: testModels(), Current: "快"}, nil, ".", domain.NewSession("."))
+	m.cfgPath = filepath.Join(t.TempDir(), "config.yaml")
+	m.width = 120
+
+	got, _ := m.switchModel("/model del")
+	after := got.(model)
+	if after.picker == nil || after.picker.kind != pickKindModelDelete {
+		t.Fatal("/model del 不带名字该列成能按键挑的列表")
+	}
+	if len(after.picker.items) != 2 {
+		t.Fatalf("该列出两套: %+v", after.picker.items)
+	}
+
+	// 挑一套也只是先问一句：删配置没有后悔药
+	for i, item := range after.picker.items {
+		if item.value == "稳" {
+			after.picker.idx = i
+		}
+	}
+	picked, _ := after.pickApply()
+	asked := picked.(model)
+	if len(asked.cfg.Models) != 2 {
+		t.Fatalf("挑完不该真删: %+v", asked.cfg.Models)
+	}
+	if asked.pendingDelete != "稳" {
+		t.Fatalf("该记住要删哪套: %q", asked.pendingDelete)
 	}
 }
 
