@@ -56,9 +56,25 @@ func main() {
 	}
 
 	if wantWeb {
-		// Ctrl+C 停下：ctx 一取消，Serve 就优雅关掉，正在跑的那一轮能收尾
-		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-		defer stop()
+		// Ctrl+C 停服务。这里自己管信号而不用 signal.NotifyContext，是为了能响应第二次：
+		// NotifyContext 的 ctx 一旦取消，后面的信号都被它吃掉，用户按多少下都没反应，
+		// 只能干等 Shutdown 超时。万一某个请求赖着不走，得留一条"再按一次就硬退"的路
+		sigCh := make(chan os.Signal, 2)
+		signal.Notify(sigCh, os.Interrupt)
+		defer signal.Stop(sigCh)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() {
+			<-sigCh // 第一次：走优雅关闭
+			fmt.Fprintln(os.Stderr, "\n正在停止…（再按一次 Ctrl+C 强制退出）")
+			cancel()
+			<-sigCh // 第二次：立刻退，不再等
+			fmt.Fprintln(os.Stderr, "强制退出")
+			tool.StopAllTasks()
+			os.Exit(130)
+		}()
+
 		// 会话根目录决定前端能看见、能切换哪些工作区。算不出来时留空，
 		// webui 里会再试一次，实在不行就只认启动目录这一个工作区
 		root, _ := session.DefaultRoot()
