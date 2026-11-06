@@ -853,8 +853,52 @@ func TestReplayQueueListShowsPrompts(t *testing.T) {
 	}
 }
 
+// 列表用键盘挑会话：敲 /resume 出来一块列表，↑↓ 挪、Enter 恢复，
+// 屏幕上真的换成了挑中的那段历史，输入框也没被顶出屏幕
+func TestReplayPickerResumeByKeys(t *testing.T) {
+	store := session.NewStore(filepath.Join(t.TempDir(), "sessions"))
+	for _, text := range []string{"更早那个会话问的话", "最新那个会话问的话"} {
+		s := domain.NewSession(".")
+		s.AppendUser(text)
+		if err := store.Save(s); err != nil {
+			t.Fatalf("准备会话失败: %v", err)
+		}
+	}
 
-// 待办清单出现在帧里（帧一下变高）或收起（帧一下变矮）的同时又往历史区打内容，
+	hs := newHarnessStore(t, 100, 30, false, store)
+	hs.send(doneMsg{}) // 这一轮跑完了，回到空闲才能敲命令
+	time.Sleep(200 * time.Millisecond)
+
+	hs.typeText("/resume")
+	hs.p.Send(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	time.Sleep(250 * time.Millisecond)
+
+	view := strings.Join(hs.snapshot("会话列表"), "\n")
+	for _, want := range []string{"会话列表", "Enter 恢复", "1. ", "2. "} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("列表里少了 %q:\n%s", want, view)
+		}
+	}
+
+	// ↓ 挪一下再回车：切到列表里第二条
+	hs.p.Send(tea.KeyPressMsg(tea.Key{Code: tea.KeyDown}))
+	time.Sleep(80 * time.Millisecond)
+	hs.p.Send(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	time.Sleep(300 * time.Millisecond)
+
+	view = strings.Join(hs.snapshot("按 Enter 之后"), "\n")
+	if !strings.Contains(view, "已恢复会话") {
+		t.Fatalf("回车该把挑中的会话恢复出来:\n%s", view)
+	}
+	if !strings.Contains(view, "更早那个会话问的话") && !strings.Contains(view, "最新那个会话问的话") {
+		t.Fatalf("恢复之后该把这段历史重打一遍:\n%s", view)
+	}
+	// 界面底部还在：列表收起之后输入框照常在最下面
+	if !strings.Contains(view, "Enter 发送") {
+		t.Fatalf("恢复之后输入框那行不该丢:\n%s", view)
+	}
+}
+
 // 是"帧高变化 + 插行"叠在一起的那一刻：插行的落点按屏幕上那一帧的位置算，
 // 按成另一帧的行数就会把帧顶出屏幕，旧帧的下半截留在屏幕上擦不掉。
 func TestReplayTodoListChangesFrame(t *testing.T) {

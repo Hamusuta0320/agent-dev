@@ -129,6 +129,128 @@ func (s *Store) SaveWorkspace(workDir string) error {
 	return os.WriteFile(filepath.Join(s.Dir, workspaceFile), data, 0o644)
 }
 
+// LoadWorkspace 读回某个工作区目录里记的 workspace.json。
+// 目录里没有这份文件（老版本建的、或者文件被删了）时返回 os.ErrNotExist，
+// 调用方自己决定是当"未知工作区"跳过还是用目录名兜底
+func LoadWorkspace(dir string) (Workspace, error) {
+	data, err := os.ReadFile(filepath.Join(dir, workspaceFile))
+	if err != nil {
+		return Workspace{}, err
+	}
+	var info Workspace
+	if err := json.Unmarshal(data, &info); err != nil {
+		return Workspace{}, fmt.Errorf("解析工作区信息失败: %w", err)
+	}
+	// 目录名才是权威的 id：workspace.json 里那位是写文件时算出来的，
+	// 目录被手工改过名就对不上了
+	info.Id = filepath.Base(dir)
+	return info, nil
+}
+
+// ListWorkspaces 列出 root 下所有工作区，最近打开过的排最前。
+//
+// 只认子目录：每个工作区就是一层目录。目录里没有 workspace.json 的也算一个
+// 工作区（Path 留空），不然手工建出来的目录在列表里就凭空消失了。
+// 点开头的目录是内部用的（比如删除工作区时搬去 .trash 的那份），不当工作区列出来。
+func ListWorkspaces(root string) ([]Workspace, error) {
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("读取工作区目录失败: %w", err)
+	}
+	out := make([]Workspace, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		dir := filepath.Join(root, e.Name())
+		info, err := LoadWorkspace(dir)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				out = append(out, Workspace{Id: e.Name()})
+				continue
+			}
+			// 单个工作区坏了不该让整个列表报错
+			continue
+		}
+		out = append(out, info)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].LastOpenedAt.Equal(out[j].LastOpenedAt) {
+			return out[i].LastOpenedAt.After(out[j].LastOpenedAt)
+		}
+		return out[i].Id < out[j].Id
+	})
+	return out, nil
+}
+
+// Delete 删掉一个会话文件。文件本来就不在时 ok 为 false、err 为 nil——
+// 这不是错误，界面上把那条摘掉就行
+func (s *Store) Delete(id string) (bool, error) {
+	path, err := s.path(id)
+	if err != nil {
+		return false, err
+	}
+	if err := os.Remove(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("删除会话失败: %w", err)
+	}
+	return true, nil
+}
+
+// trashDir 是"仅移除展示"时把工作区目录搬去的地方，藏在会话根目录下。
+// 带前导点，所以 ListWorkspaces 不会把它自己当成一个工作区
+const trashDir = ".trash"
+
+// RemoveWorkspace 把一个工作区从列表里摘掉：
+//   - purge 为真：连会话目录一起删，里面的会话文件就真没了
+//   - purge 为假：整个目录搬到 <root>/.trash/<id>-<时间戳>，会话文件还在，
+//     想找回来手工搬回 <root>/<id> 就行
+//
+// 只动 <root>/<id> 这一层，绝不碰工作目录本身（那是用户的代码）。
+// 返回搬去（或删掉）的路径，调用方可以打出来给人看
+func RemoveWorkspace(root, id string, purge bool) (string, error) {
+	if root == "" {
+		return "", fmt.Errorf("算不出会话根目录")
+	}
+	// id 会拼进路径，挡一下跨目录的名字
+	if id == "" || id != filepath.Base(id) || strings.ContainsAny(id, `/\`) || strings.HasPrefix(id, ".") {
+		return "", fmt.Errorf("非法的工作区 id: %q", id)
+	}
+	src := filepath.Join(root, id)
+	fi, err := os.Stat(src)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("找不到工作区 %s 的会话目录", id)
+		}
+		return "", fmt.Errorf("查看工作区目录失败: %w", err)
+	}
+	if !fi.IsDir() {
+		return "", fmt.Errorf("%s 不是目录", src)
+	}
+	if purge {
+		if err := os.RemoveAll(src); err != nil {
+			return "", fmt.Errorf("删除工作区目录失败: %w", err)
+		}
+		return src, nil
+	}
+
+	trash := filepath.Join(root, trashDir)
+	if err := os.MkdirAll(trash, 0o755); err != nil {
+		return "", fmt.Errorf("创建回收目录失败: %w", err)
+	}
+	// 目录名带上时间戳：同一个工作区删两次也不会撞在一起
+	dst := filepath.Join(trash, fmt.Sprintf("%s-%s", id, time.Now().Format("20060102-150405")))
+	if err := os.Rename(src, dst); err != nil {
+		return "", fmt.Errorf("把工作区目录搬到回收站失败: %w", err)
+	}
+	return dst, nil
+}
+
 // Migrate 把老目录里的会话复制到新目录，返回复制了几个。
 // 只复制不删除：老目录留着当备份，同一个 id 的目标文件已存在时跳过，重复跑也没事。
 func Migrate(oldDir, newDir string) (int, error) {

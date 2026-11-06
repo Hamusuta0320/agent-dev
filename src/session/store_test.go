@@ -237,6 +237,88 @@ func TestSaveWorkspaceNotListed(t *testing.T) {
 	}
 }
 
+// 存下去的工作区信息要能原样读回来；id 以目录名为准，目录被改名了也认
+func TestLoadWorkspace(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "proj-abc")
+	work := t.TempDir()
+	if err := NewStore(dir).SaveWorkspace(work); err != nil {
+		t.Fatalf("保存工作区信息失败: %v", err)
+	}
+	info, err := LoadWorkspace(dir)
+	if err != nil {
+		t.Fatalf("读工作区信息失败: %v", err)
+	}
+	if info.Path != filepath.Clean(work) {
+		t.Fatalf("工作区路径不对: %q vs %q", info.Path, filepath.Clean(work))
+	}
+	if info.Id != "proj-abc" {
+		t.Fatalf("工作区 id 该取目录名: %q", info.Id)
+	}
+	if info.LastOpenedAt.IsZero() {
+		t.Fatal("最近打开时间没读出来")
+	}
+
+	// 目录里没这份文件：让调用方自己决定怎么办
+	if _, err := LoadWorkspace(filepath.Join(root, "nope")); err == nil {
+		t.Fatal("没有 workspace.json 该报错")
+	}
+}
+
+// 列工作区：只算子目录，最近打开过的排最前，缺 workspace.json 的也留着
+func TestListWorkspaces(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now()
+
+	// 一个正常的、一个更早就打开过的、一个没有 workspace.json 的老目录
+	for _, item := range []struct {
+		id   string
+		path string
+		at   time.Time
+	}{
+		{"a-old", filepath.Join(root, "work-a"), now.Add(-time.Hour)},
+		{"b-new", filepath.Join(root, "work-b"), now},
+	} {
+		dir := filepath.Join(root, item.id)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		data, err := json.Marshal(Workspace{Id: item.id, Path: item.path, LastOpenedAt: item.at})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, workspaceFile), data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(root, "c-bare"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// 根目录下的普通文件不是工作区
+	if err := os.WriteFile(filepath.Join(root, "readme.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	infos, err := ListWorkspaces(root)
+	if err != nil {
+		t.Fatalf("列工作区失败: %v", err)
+	}
+	if len(infos) != 3 {
+		t.Fatalf("该有 3 个工作区，实际 %d 个: %+v", len(infos), infos)
+	}
+	if infos[0].Id != "b-new" {
+		t.Fatalf("最近的该排最前，实际第一个是 %s", infos[0].Id)
+	}
+	if infos[len(infos)-1].Id != "c-bare" || infos[len(infos)-1].Path != "" {
+		t.Fatalf("没有 workspace.json 的目录该留在列表末尾且路径为空: %+v", infos[len(infos)-1])
+	}
+
+	// 目录还不存在时不该报错，只是没东西
+	if infos, err := ListWorkspaces(filepath.Join(root, "nope")); err != nil || len(infos) != 0 {
+		t.Fatalf("目录不存在该返回空: %v %v", infos, err)
+	}
+}
+
 // 老目录里的会话复制过来，原件留着；重复迁移不会重复复制，也不会覆盖新的
 func TestMigrate(t *testing.T) {
 	root := t.TempDir()

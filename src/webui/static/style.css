@@ -1,0 +1,812 @@
+/* 界面骨架用 Bootstrap 5（static/vendor/，离线打包），这里只做两件事：
+   一是把 Bootstrap 的暗色主题调成项目原来的配色，二是写 Bootstrap 没有的东西
+   （对话流、工具卡片、审批弹窗的内容排版）。
+   通用组件（按钮、输入框、下拉、进度条、徽标）一律用 Bootstrap 的类，不在这儿重复造。 */
+
+/* ---------- 主题：沿用 TUI 那套深底 + 绿色强调 ---------- */
+[data-bs-theme="dark"] {
+  --bs-body-bg: #16181d;
+  --bs-body-color: #d7dae0;
+  --bs-emphasis-color: #f2f4f8;
+  --bs-secondary-color: #8b93a1;
+  --bs-tertiary-color: #6b7280;
+  --bs-secondary-bg: #22262f;
+  --bs-tertiary-bg: #1c1f26;
+  --bs-border-color: #2c313c;
+  --bs-border-color-translucent: #2c313c;
+  --bs-link-color: #6cc08b;
+  --bs-link-hover-color: #8dd6a8;
+  --bs-code-color: #d787af;
+  --bs-body-font-family: "Segoe UI", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+}
+
+/* Bootstrap 的按钮颜色在编译时就写进了 --bs-btn-*，改 --bs-primary 没用，
+   只能这样盖一层，让主按钮跟项目里的绿对上 */
+.btn-primary {
+  --bs-btn-color: #0d1f16;
+  --bs-btn-bg: #6cc08b;
+  --bs-btn-border-color: #6cc08b;
+  --bs-btn-hover-color: #0d1f16;
+  --bs-btn-hover-bg: #7fd09c;
+  --bs-btn-hover-border-color: #7fd09c;
+  --bs-btn-active-color: #0d1f16;
+  --bs-btn-active-bg: #5cb17c;
+  --bs-btn-active-border-color: #5cb17c;
+  --bs-btn-disabled-color: #0d1f16;
+  --bs-btn-disabled-bg: #6cc08b;
+  --bs-btn-disabled-border-color: #6cc08b;
+  font-weight: 600;
+}
+
+html, body { height: 100%; }
+body { overflow: hidden; }
+
+.app { display: flex; height: 100vh; height: 100dvh; }
+
+/* ---------- 侧栏 ---------- */
+.sidebar {
+  width: 264px;
+  flex: 0 0 264px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--bs-tertiary-bg);
+  border-right: 1px solid var(--bs-border-color);
+}
+
+.sidebar-head {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border-bottom: 1px solid var(--bs-border-color);
+}
+
+.ws-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  text-align: left;
+  padding: 6px 10px;
+}
+.ws-toggle-text { display: flex; flex-direction: column; min-width: 0; line-height: 1.3; }
+.ws-name {
+  font-weight: 600;
+  color: var(--bs-body-color);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ws-path {
+  font-size: 11px;
+  color: var(--bs-tertiary-color);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ws-caret { opacity: .55; font-size: 11px; }
+
+.ws-menu { width: 100%; max-height: 60vh; overflow-y: auto; }
+.ws-menu .ws-item-name { display: block; line-height: 1.3; }
+.ws-menu .ws-item-path {
+  display: block;
+  font-size: 11px;
+  color: var(--bs-tertiary-color);
+  line-height: 1.3;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ws-menu .dropdown-item { white-space: normal; }
+.ws-menu .dropdown-item.current::after {
+  content: "✓";
+  float: right;
+  color: var(--bs-link-color);
+}
+
+.sessions {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+/* 会话条目：一条 = 状态圆点 + 标题/时间 + hover 时露出的删除按钮 */
+.session {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 2px 4px 2px 2px;
+}
+.session:hover { background: var(--bs-secondary-bg); }
+.session.active { background: var(--bs-secondary-bg); border-color: var(--bs-border-color); }
+.session-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  text-align: left;
+  background: none;
+  border: 0;
+  color: inherit;
+  padding: 5px 5px 5px 7px;
+  font: inherit;
+  cursor: pointer;
+  border-radius: 6px;
+}
+/* 标题和时间那一列：宽度可缩，长标题自己截断 */
+.session-body { flex: 1 1 auto; min-width: 0; }
+.session-title {
+  display: block;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.session-meta { display: block; font-size: 12px; color: var(--bs-tertiary-color); }
+
+/* 状态圆点：转圈=进行中，黄=等你说话，绿=这一轮完成，灰=还没聊过 */
+.status {
+  display: inline-block;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  margin-right: 6px;
+  vertical-align: middle;
+  flex: none;
+}
+.status.running {
+  width: 9px; height: 9px;
+  background: none;
+  border: 1.5px solid rgba(217, 194, 106, .25);
+  border-top-color: #d9c26a;
+  animation: spin .9s linear infinite;
+}
+.status.waiting { background: #d9c26a; }
+.status.done { background: #6cc08b; }
+.status.idle { background: #4b5563; }
+
+/* 删除按钮平时不显眼，指到那条会话才露出来 */
+.session-del, .ws-del {
+  flex: none;
+  background: none;
+  border: 0;
+  color: var(--bs-tertiary-color);
+  font-size: 12px;
+  line-height: 1;
+  padding: 4px 6px;
+  border-radius: 6px;
+  opacity: 0;
+  cursor: pointer;
+}
+.session:hover .session-del, .ws-item:hover .ws-del { opacity: 1; }
+.session-del:hover, .ws-del:hover { background: rgba(224, 108, 117, .16); color: #e06c75; }
+.session-del:focus-visible, .ws-del:focus-visible { opacity: 1; }
+
+/* 工作区下拉：一行 = 名字/路径 + 删除按钮 */
+.ws-item { position: relative; display: flex; align-items: center; }
+.ws-item .dropdown-item { flex: 1 1 auto; min-width: 0; }
+.sidebar-foot {
+  padding: 8px 12px;
+  border-top: 1px solid var(--bs-border-color);
+  font-size: 12px;
+  color: var(--bs-tertiary-color);
+  word-break: break-all;
+}
+
+/* ---------- 主区 ---------- */
+.main {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--bs-border-color);
+}
+.title {
+  font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.badges { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.badges .badge { font-weight: 400; }
+.badges #badge-effort.on { color: #d9c26a; }
+.badges select { width: auto; font-size: 12px; }
+
+/* 连接状态：绿=通着、黄=正在连、红=断了 */
+.conn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--bs-secondary-color);
+  border: 1px solid var(--bs-border-color);
+  border-radius: 999px;
+  padding: 2px 9px;
+  white-space: nowrap;
+}
+.conn-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--bs-secondary-color);
+}
+.conn[data-state="online"] { color: #6cc08b; border-color: #2f4a3a; }
+.conn[data-state="online"] .conn-dot {
+  background: #6cc08b;
+  box-shadow: 0 0 0 3px rgba(108, 192, 139, .16);
+}
+.conn[data-state="connecting"] { color: #d9c26a; border-color: #4a4325; }
+.conn[data-state="connecting"] .conn-dot { background: #d9c26a; animation: pulse 1.2s ease-in-out infinite; }
+.conn[data-state="offline"] { color: #e06c75; border-color: #4a2b2e; }
+.conn[data-state="offline"] .conn-dot { background: #e06c75; }
+@keyframes pulse { 50% { opacity: .25; } }
+
+/* ---------- 上下文占用 ---------- */
+.usage { padding: 8px 16px 0; }
+.usage .progress { height: 4px; background: var(--bs-secondary-bg); }
+.usage .progress-bar { background: #6cc08b; transition: width .3s ease; }
+.usage .progress-bar.warn { background: #d9c26a; }
+.usage .progress-bar.hot { background: #e06c75; }
+.usage-text { font-size: 12px; color: var(--bs-tertiary-color); padding-top: 5px; }
+
+/* ---------- 对话区 ---------- */
+.chat {
+  flex: 1 1 auto;
+  /* flex item 默认 min-height: auto，也就是"不肯比内容矮"。对话一长它就把
+     底下的排队块和输入区顶出屏幕，两块挤在一起看着像叠住了。
+     显式给 0，让它能被压缩、自己滚，底部那几块永远留在原位 */
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.empty { color: var(--bs-tertiary-color); margin: auto; text-align: center; line-height: 2; }
+
+.msg { display: flex; flex-direction: column; gap: 6px; max-width: 100%; }
+.msg-user { align-items: flex-end; }
+.bubble {
+  background: var(--bs-secondary-bg);
+  border: 1px solid var(--bs-border-color);
+  border-radius: 10px;
+  padding: 9px 12px;
+  max-width: min(760px, 86%);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.msg-user .bubble { background: #24313a; border-color: #2f4250; }
+.msg-images { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+.msg-images img {
+  max-width: 180px; max-height: 140px;
+  border-radius: 8px;
+  border: 1px solid var(--bs-border-color);
+}
+
+/* 思考：灰、默认折叠成一行，点开看全文 */
+.reasoning {
+  border-left: 2px solid var(--bs-border-color);
+  padding: 2px 0 2px 10px;
+  color: var(--bs-secondary-color);
+  font-size: 13px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-width: min(760px, 86%);
+}
+.reasoning summary { cursor: pointer; user-select: none; color: var(--bs-tertiary-color); }
+
+/* 工具调用 */
+.tools { display: flex; flex-direction: column; gap: 4px; max-width: min(880px, 94%); }
+.tool {
+  border: 1px solid var(--bs-border-color);
+  border-radius: 8px;
+  background: var(--bs-tertiary-bg);
+  overflow: hidden;
+}
+.tool-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+  font-size: 13px;
+  background: var(--bs-secondary-bg);
+}
+/* 工具调用前面那个小图标：勾 / 叉 / 细圆环（转圈）。
+   以前是实心圆点，一行行堆起来满屏都是，太吵 */
+.tool-icon {
+  flex: 0 0 auto;
+  width: 12px;
+  height: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+}
+.tool-icon::before {
+  content: "";
+  display: block;
+  box-sizing: border-box;
+}
+/* 成功：一个细细的勾 */
+.tool-icon.ok::before {
+  width: 9px;
+  height: 5px;
+  border-left: 1.6px solid #6cc08b;
+  border-bottom: 1.6px solid #6cc08b;
+  transform: rotate(-45deg) translate(1px, -1px);
+  border-radius: 1px;
+}
+/* 失败：一个叉 */
+.tool-icon.fail::before,
+.tool-icon.fail::after {
+  content: "";
+  position: absolute;
+  width: 10px;
+  height: 1.6px;
+  background: #e06c75;
+  border-radius: 1px;
+}
+.tool-icon.fail::before { transform: rotate(45deg); }
+.tool-icon.fail::after { transform: rotate(-45deg); }
+/* 还没结果：细圆环，转起来 */
+.tool-icon.running::before {
+  width: 10px;
+  height: 10px;
+  border: 1.4px solid rgba(217, 194, 106, .25);
+  border-top-color: #d9c26a;
+  border-radius: 50%;
+  animation: spin .8s linear infinite;
+}
+/* 历史里没跑完的那次调用：静态的浅色圆环，不转（它不会再动了） */
+.tool-icon.pending::before {
+  width: 10px;
+  height: 10px;
+  border: 1.4px solid rgba(150, 150, 150, .45);
+  border-radius: 50%;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+.tool-name { color: #d787af; font-weight: 600; }
+.tool-intent {
+  color: var(--bs-secondary-color);
+  flex: 1 1 auto;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.tool-status { font-size: 12px; color: var(--bs-tertiary-color); flex: 0 0 auto; }
+.tool-status.ok { color: #6cc08b; }
+.tool-status.fail { color: #e06c75; }
+.tool-body { padding: 0 10px 8px; display: none; }
+.tool.open .tool-body { display: block; }
+.tool-body pre {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  background: #12141a;
+  border-radius: 6px;
+  overflow-x: auto;
+  font: 12px/1.5 "Cascadia Mono", Consolas, monospace;
+  color: #b8bec9;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 420px;
+}
+.tool-fail { color: #e06c75; font-size: 12px; padding-top: 4px; }
+/* 流式回答 */
+.stream { max-width: min(780px, 88%); word-break: break-word; }
+/* 流式时最后一个字后面那个方块。以前挂在容器的 ::after 上，块级排版之后会掉到
+   下面单独一行，所以改成真元素、塞进最后一个块里（见 placeCaret） */
+.caret {
+  display: inline-block;
+  width: .5em;
+  height: 1.05em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  background: #6cc08b;
+  border-radius: 1px;
+  animation: blink 1s step-end infinite;
+}
+@keyframes blink { 50% { opacity: 0; } }
+
+/* ---------- markdown 正文 ---------- */
+/* 模型输出按 markdown 排版。样式只写"排版"，配色沿用页面的变量，
+   不引入新的一套主题 */
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p { margin: 0 0 .75em; line-height: 1.75; }
+.md h1, .md h2, .md h3, .md h4, .md h5, .md h6 {
+  margin: 1.1em 0 .5em;
+  line-height: 1.35;
+  font-weight: 600;
+}
+.md h1 { font-size: 1.45em; }
+.md h2 { font-size: 1.28em; }
+.md h3 { font-size: 1.13em; }
+.md h4, .md h5, .md h6 { font-size: 1em; }
+.md ul, .md ol { margin: 0 0 .75em; padding-left: 1.6em; }
+.md li { margin: .2em 0; line-height: 1.7; }
+.md li > p { margin: 0 0 .3em; }
+.md li > ul, .md li > ol { margin: .2em 0 .2em; }
+.md blockquote {
+  margin: 0 0 .75em;
+  padding: .3em .9em;
+  border-left: 3px solid var(--bs-border-color);
+  color: var(--bs-secondary-color);
+}
+.md blockquote > :last-child { margin-bottom: 0; }
+.md hr {
+  margin: 1.1em 0;
+  border: 0;
+  border-top: 1px solid var(--bs-border-color);
+}
+.md a { color: #7cc0e8; text-decoration: none; border-bottom: 1px solid rgba(124, 192, 232, .35); }
+.md a:hover { border-bottom-color: #7cc0e8; }
+.md strong { font-weight: 600; }
+/* 行内代码：和正文里的等宽片段，颜色比正文淡一点，不抢戏 */
+.md code {
+  font: .92em/1.5 "Cascadia Mono", Consolas, monospace;
+  background: rgba(255, 255, 255, .08);
+  border-radius: 4px;
+  padding: 1px 5px;
+  word-break: break-word;
+}
+/* 代码块：带一条顶栏（语言标签 + 复制），内容自己横滚 */
+.md-pre {
+  margin: 0 0 .85em;
+  border: 1px solid var(--bs-border-color);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #12141a;
+}
+.md-pre-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 8px 3px 10px;
+  background: rgba(255, 255, 255, .04);
+  border-bottom: 1px solid var(--bs-border-color);
+  font-size: 11px;
+  color: var(--bs-tertiary-color);
+}
+.md-lang { flex: 1 1 auto; font-family: "Cascadia Mono", Consolas, monospace; }
+.md-copy {
+  flex: none;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  color: inherit;
+  font-size: 11px;
+  padding: 1px 6px;
+  opacity: .55;
+  cursor: pointer;
+}
+.md-pre:hover .md-copy { opacity: 1; }
+.md-copy:hover { border-color: var(--bs-border-color); color: var(--bs-body-color); }
+.md-pre pre {
+  margin: 0;
+  padding: 9px 11px;
+  overflow-x: auto;
+}
+.md-pre code {
+  font: 12px/1.6 "Cascadia Mono", Consolas, monospace;
+  background: none;
+  padding: 0;
+  white-space: pre;
+}
+/* 表格：窄屏上自己横滚，别把对话区撑宽 */
+.md table {
+  margin: 0 0 .85em;
+  border-collapse: collapse;
+  font-size: 13px;
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+}
+.md th, .md td {
+  border: 1px solid var(--bs-border-color);
+  padding: 5px 9px;
+  text-align: left;
+  vertical-align: top;
+}
+.md th { background: rgba(255, 255, 255, .05); font-weight: 600; }
+.notice { font-size: 12px; color: var(--bs-tertiary-color); }
+.notice.err { color: #e06c75; }
+
+/* ---------- 排队消息 ---------- */
+/* 它和待办、后台任务排在同一列里（都在输入框上方），所以做成一块带黄底的小卡片：
+   有圆角、有内边距，和上面那块灰底的后台任务泾渭分明，不会连成一片 */
+.queue {
+  margin: 0;
+  border: 1px solid rgba(217, 194, 106, .35);
+  border-radius: 8px;
+  padding: 6px 9px;
+  font-size: 13px;
+  color: #d9c26a;
+  background: rgba(217, 194, 106, .08);
+  max-height: 180px;
+  overflow-y: auto;
+}
+.queue[hidden] { display: none; }
+.queue b { font-weight: 600; display: block; margin-bottom: 4px; }
+.queue-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+}
+.queue-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 取回 / 删除：平时淡一点，指到那一行才明显 */
+.queue-btn {
+  flex: none;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: inherit;
+  font-size: 12px;
+  padding: 1px 6px;
+  opacity: .5;
+  cursor: pointer;
+}
+.queue-item:hover .queue-btn { opacity: 1; }
+.queue-btn:hover { border-color: rgba(217, 194, 106, .45); }
+.queue-btn.del:hover { color: #e06c75; border-color: rgba(224, 108, 117, .45); }
+
+/* ---------- 待办清单与后台任务 ---------- */
+/* 这两块和排队消息排在同一列里（输入框上方），所以都做成小卡片：各有底色和圆角，
+   高度有上限、内部自己滚。以前它们是无背景的一行行小字，紧贴着排队块的黄条，
+   看着就糊成一片 */
+.runtime {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--bs-secondary-color);
+}
+/* 这两块用 display:flex，会盖掉 hidden 自带的 display:none，得显式关掉 */
+.runtime[hidden], .todos[hidden], .tasks[hidden] { display: none; }
+.todos, .tasks {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 6px 9px;
+  border: 1px solid var(--bs-border-color);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, .03);
+  max-height: 120px;
+  overflow-y: auto;
+}
+.runtime-title { color: var(--bs-tertiary-color); margin-bottom: 2px; }
+.todo-item.in_progress { color: #d9c26a; }
+.todo-item.completed { color: var(--bs-tertiary-color); text-decoration: line-through; }
+.task-item { display: flex; gap: 8px; align-items: baseline; }
+.task-item .task-id { font-family: "Cascadia Mono", Consolas, monospace; flex: none; }
+.task-item .task-status { flex: none; color: var(--bs-tertiary-color); }
+.task-item.running .task-status { color: #d9c26a; }
+.task-item .task-cmd {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  color: var(--bs-tertiary-color);
+}
+
+/* ---------- 输入区 ---------- */
+.composer {
+  border-top: 1px solid var(--bs-border-color);
+  padding: 10px 16px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--bs-tertiary-bg);
+}
+.composer textarea {
+  resize: none;
+  min-height: 66px;
+  max-height: 220px;
+  line-height: 1.6;
+  background: var(--bs-secondary-bg);
+  border-color: var(--bs-border-color);
+}
+.composer textarea:focus { background: var(--bs-secondary-bg); }
+
+.attachments { display: flex; flex-wrap: wrap; gap: 6px; }
+.attachment {
+  position: relative;
+  border: 1px solid var(--bs-border-color);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.attachment img { display: block; max-width: 90px; max-height: 70px; }
+.attachment button {
+  position: absolute;
+  top: 0; right: 0;
+  background: rgba(0, 0, 0, .65);
+  color: #fff;
+  border: 0;
+  border-radius: 0 0 0 6px;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0 5px;
+}
+
+.composer-actions { display: flex; align-items: center; gap: 8px; }
+.composer-actions .file { cursor: pointer; }
+.hint {
+  flex: 1 1 auto;
+  font-size: 12px;
+  color: var(--bs-tertiary-color);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* ---------- 弹窗（原生 dialog，自带焦点管理和 Esc） ---------- */
+.dialog {
+  border: 1px solid var(--bs-border-color);
+  border-radius: 14px;
+  background: var(--bs-tertiary-bg);
+  color: var(--bs-body-color);
+  padding: 0;
+  width: min(720px, 92vw);
+  max-height: 88vh;
+  overflow: auto;
+}
+.dialog::backdrop { background: rgba(8, 9, 12, .72); }
+.dialog-box { padding: 16px 18px; display: flex; flex-direction: column; gap: 10px; }
+.dialog-head { display: flex; align-items: center; gap: 8px; }
+.dialog-title { font-weight: 600; }
+.dialog-detail { font-size: 13px; color: var(--bs-secondary-color); margin: 0; }
+.dialog-target {
+  font: 13px/1.6 "Cascadia Mono", Consolas, monospace;
+  background: #12141a;
+  border-radius: 8px;
+  padding: 9px 11px;
+  word-break: break-all;
+  white-space: pre-wrap;
+}
+.dialog-error { font-size: 12px; color: #e06c75; }
+.dialog-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+
+/* ---------- 文件夹选择器 ---------- */
+.ws-picker { width: min(760px, 94vw); }
+.ws-picker-bar { display: flex; align-items: center; gap: 6px; }
+.ws-picker-bar .form-control {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+.ws-dir-list {
+  height: 300px;
+  max-height: 45vh;
+  overflow-y: auto;
+  border: 1px solid var(--bs-border-color);
+  border-radius: 8px;
+  background: #12141a;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.ws-dir {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--bs-body-color);
+  font-size: 13px;
+  text-align: left;
+}
+.ws-dir:hover, .ws-dir:focus-visible { background: rgba(255, 255, 255, .07); }
+.ws-dir.dim { opacity: .6; }
+.ws-dir-icon { flex: none; width: 1.2em; text-align: center; }
+.ws-dir-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ws-dir-hint { margin-left: auto; font-size: 11px; color: var(--bs-tertiary-color); }
+.ws-dir-note { padding: 10px; font-size: 12px; color: var(--bs-tertiary-color); }
+.ws-newfolder { display: flex; }
+/* author 样式里的 display 会盖过 hidden 属性自带的 display:none，得显式关掉 */
+.ws-newfolder[hidden] { display: none; }
+.diff {
+  font: 12px/1.5 "Cascadia Mono", Consolas, monospace;
+  background: #12141a;
+  border-radius: 8px;
+  padding: 8px 10px;
+  max-height: 300px;
+  overflow: auto;
+}
+.diff .del { color: #e06c75; white-space: pre-wrap; }
+.diff .add { color: #6cc08b; white-space: pre-wrap; }
+.diff .cut { color: var(--bs-tertiary-color); }
+
+/* ---------- 命令候选 ---------- */
+/* 候选摆在输入框上方，最多显示一屏的一半：命令多的时候自己滚 */
+.suggest {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  max-height: 40vh;
+  overflow-y: auto;
+  border: 1px solid var(--bs-border-color);
+  border-radius: 10px;
+  background: var(--bs-body-bg);
+  padding: 4px;
+}
+.suggest[hidden] { display: none; }
+.suggest-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.suggest-row.active { background: var(--bs-secondary-bg); }
+.suggest-name {
+  flex: 0 0 auto;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  color: #8ec07c;
+  min-width: 9em;
+}
+.suggest-desc {
+  color: var(--bs-tertiary-color);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---------- 命令回显与输出 ---------- */
+.cmd-line {
+  font: 13px/1.6 "Cascadia Mono", Consolas, monospace;
+  color: #8ec07c;
+}
+.cmd-line::first-line { color: #8ec07c; }
+.cmd-out {
+  font: 12px/1.6 "Cascadia Mono", Consolas, monospace;
+  background: #12141a;
+  border: 1px solid var(--bs-border-color);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin: 0;
+  max-height: 340px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ---------- /config 表单 ---------- */
+.cfg-dialog { width: min(620px, 94vw); }
+.cfg-grid {
+  display: grid;
+  grid-template-columns: 6.5em 1fr;
+  align-items: center;
+  gap: 8px 12px;
+}
+.cfg-grid > label { font-size: 13px; color: var(--bs-secondary-color); }
+.cfg-model-row { display: flex; gap: 6px; }
+.cfg-model-row .form-control { flex: 1 1 auto; }
+.cfg-models { display: flex; flex-direction: column; gap: 6px; }
+/* display:flex 会盖掉 hidden 自带的 display:none，得显式关掉 */
+.cfg-models[hidden] { display: none; }
+.cfg-model-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-height: 180px;
+  overflow: auto;
+}
+
+/* 窄屏：侧栏收窄，只留名字 */
+@media (max-width: 720px) {
+  .sidebar { width: 168px; flex-basis: 168px; }
+  .ws-path, .topbar .title { display: none; }
+  .attachments, .composer-actions .hint { display: none; }
+}

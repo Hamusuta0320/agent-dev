@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-bs-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agent-dev</title>
+<!-- 不引外部图标：这个页面要能离线打开，也给浏览器一个空的 favicon 免得它反复请求 /favicon.ico -->
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/vendor/bootstrap.min.css">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="app">
+
+  <aside class="sidebar">
+    <div class="sidebar-head">
+      <div class="dropdown w-100">
+        <button class="btn btn-outline-secondary btn-sm w-100 ws-toggle" id="ws-toggle" type="button"
+                data-bs-toggle="dropdown" aria-expanded="false" title="切换工作区">
+          <span class="ws-toggle-text">
+            <span class="ws-name" id="ws-name">工作区</span>
+            <span class="ws-path" id="ws-path"></span>
+          </span>
+          <span class="ws-caret">▾</span>
+        </button>
+        <ul class="dropdown-menu ws-menu" id="ws-menu"></ul>
+      </div>
+      <button id="new-session" class="btn btn-primary btn-sm w-100" type="button">＋ 新会话</button>
+    </div>
+    <div class="sessions" id="sessions"></div>
+    <div class="sidebar-foot" id="workdir"></div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div class="title" id="title">新会话</div>
+      <div class="badges">
+        <span class="badge rounded-pill text-bg-secondary" id="badge-model" title="当前模型">—</span>
+        <span class="badge rounded-pill text-bg-secondary" id="badge-effort" title="思考强度">—</span>
+        <button type="button" class="badge rounded-pill text-bg-secondary" id="badge-quiet"
+                title="显示方式：精简只显示正文；点一下切换（也可以敲 /quiet）">—</button>
+        <select id="mode" class="form-select form-select-sm" title="工作模式">
+          <option value="read">只读</option>
+          <option value="ask">编辑需授权</option>
+          <option value="full">完全授权</option>
+        </select>
+        <span class="conn" id="conn" data-state="connecting" title="与服务端的连接状态">
+          <span class="conn-dot"></span><span class="conn-text" id="conn-text">连接中</span>
+        </span>
+      </div>
+    </header>
+
+    <div class="usage" id="usage" hidden>
+      <div class="progress" role="progressbar" aria-label="上下文占用" aria-valuemin="0" aria-valuemax="100">
+        <div class="progress-bar" id="usage-fill"></div>
+      </div>
+      <div class="usage-text" id="usage-text"></div>
+    </div>
+
+    <div class="chat" id="chat"></div>
+
+    <form class="composer" id="composer">
+      <!-- 输入框上方那几块，自上而下：待办清单 → 后台任务 → 排队消息。
+           放在同一个容器里排，各自带底色，谁是谁一眼分得清，不会挤成一片 -->
+      <div class="runtime" id="runtime" hidden>
+        <div class="todos" id="todos" hidden></div>
+        <div class="tasks" id="tasks" hidden></div>
+      </div>
+      <div class="queue" id="queue" hidden></div>
+      <!-- 命令候选：输入框里打 / 时浮在上面，↑↓ 选、Tab 或 Enter 补全、Esc 收起 -->
+      <div class="suggest" id="suggest" hidden role="listbox" aria-label="命令候选"></div>
+      <div class="attachments" id="attachments" hidden></div>
+      <textarea id="input" class="form-control" rows="3" placeholder="问点什么…（Enter 发送，Shift+Enter 换行，打 / 看命令）"></textarea>
+      <div class="composer-actions">
+        <label class="btn btn-outline-secondary btn-sm file" title="附图（也可以直接粘贴截图）">
+          📎 图片<input type="file" id="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
+        </label>
+        <span class="hint" id="composer-hint"></span>
+        <button type="button" id="cancel" class="btn btn-outline-danger btn-sm" hidden>中断</button>
+        <button type="submit" id="send" class="btn btn-primary btn-sm">发送</button>
+      </div>
+    </form>
+  </main>
+</div>
+
+<dialog class="dialog" id="approval">
+  <div class="dialog-box">
+    <div class="dialog-head">
+      <span class="badge rounded-pill text-bg-warning" id="approval-kind"></span>
+      <span class="dialog-title" id="approval-tool"></span>
+    </div>
+    <div class="dialog-target" id="approval-target"></div>
+    <div class="dialog-detail" id="approval-detail"></div>
+    <div class="diff" id="approval-diff" hidden></div>
+    <div class="dialog-actions">
+      <button type="button" id="approval-deny" class="btn btn-outline-danger btn-sm">拒绝</button>
+      <button type="button" id="approval-always" class="btn btn-outline-secondary btn-sm">本回合都允许</button>
+      <button type="button" id="approval-allow" class="btn btn-success btn-sm">允许一次</button>
+    </div>
+    <input id="approval-feedback" class="form-control form-control-sm" placeholder="拒绝时想说的话（会转给模型，可留空）">
+  </div>
+</dialog>
+
+<dialog class="dialog ws-picker" id="ws-dialog">
+  <div class="dialog-box">
+    <div class="dialog-head">
+      <span class="dialog-title">添加工作区</span>
+      <span class="dialog-detail" id="ws-server"></span>
+    </div>
+    <p class="dialog-detail">
+      选一个服务器上的目录。加进来之后，在它里面开的会话单独列在侧栏，
+      agent 也在这个目录里干活。
+    </p>
+    <div class="ws-picker-bar">
+      <button type="button" id="ws-up" class="btn btn-outline-secondary btn-sm" title="上一级">↑</button>
+      <input id="ws-input" class="form-control form-control-sm" placeholder="目录路径，回车跳转"
+             autocomplete="off" spellcheck="false">
+      <button type="button" id="ws-roots" class="btn btn-outline-secondary btn-sm" title="盘符 / 根目录">根目录</button>
+      <button type="button" id="ws-home" class="btn btn-outline-secondary btn-sm" title="用户主目录">主目录</button>
+    </div>
+    <div class="ws-dir-list" id="ws-list" role="listbox" aria-label="子目录"></div>
+    <div class="dialog-error" id="ws-error" hidden></div>
+    <div class="ws-newfolder" id="ws-newfolder" hidden>
+      <input id="ws-new-name" class="form-control form-control-sm" placeholder="新文件夹名字，回车创建"
+             autocomplete="off" spellcheck="false">
+    </div>
+    <div class="dialog-actions">
+      <button type="button" id="ws-new" class="btn btn-outline-secondary btn-sm me-auto">新建文件夹</button>
+      <button type="button" id="ws-cancel" class="btn btn-outline-secondary btn-sm">取消</button>
+      <button type="button" id="ws-add" class="btn btn-primary btn-sm">选择此文件夹</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog class="dialog confirm-dialog" id="confirm-dialog">
+  <div class="dialog-box">
+    <div class="dialog-head">
+      <span class="dialog-title" id="confirm-title">确认</span>
+    </div>
+    <p class="dialog-detail" id="confirm-text"></p>
+    <div class="dialog-actions">
+      <button type="button" id="confirm-cancel" class="btn btn-outline-secondary btn-sm">取消</button>
+      <button type="button" id="confirm-alt" class="btn btn-outline-secondary btn-sm" hidden></button>
+      <button type="button" id="confirm-ok" class="btn btn-danger btn-sm">确定</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog class="dialog cfg-dialog" id="cfg-dialog">
+  <div class="dialog-box">
+    <div class="dialog-head">
+      <span class="dialog-title">模型配置</span>
+      <span class="dialog-detail" id="cfg-title"></span>
+    </div>
+    <p class="dialog-detail">
+      改的是当前生效的那套模型，保存后写回配置文件，下一轮请求就用新的，不用重启。
+      接口地址留空用该类型内置的。
+    </p>
+    <div class="cfg-grid">
+      <label for="cfg-type">类型</label>
+      <select id="cfg-type" class="form-select form-select-sm"></select>
+
+      <label for="cfg-url">接口地址</label>
+      <input id="cfg-url" class="form-control form-control-sm" autocomplete="off" spellcheck="false">
+
+      <label for="cfg-key">密钥</label>
+      <input id="cfg-key" class="form-control form-control-sm" type="password"
+             autocomplete="off" spellcheck="false" placeholder="留空表示不改">
+
+      <label for="cfg-model">模型名</label>
+      <div class="cfg-model-row">
+        <input id="cfg-model" class="form-control form-control-sm" autocomplete="off" spellcheck="false">
+        <button type="button" id="cfg-fetch" class="btn btn-outline-secondary btn-sm" title="按上面的地址和密钥从接口拉列表">
+          拉列表
+        </button>
+      </div>
+
+      <label for="cfg-limit">上下文上限</label>
+      <input id="cfg-limit" class="form-control form-control-sm" autocomplete="off" spellcheck="false"
+             placeholder="128k、1M 都认，留空用默认">
+
+      <label for="cfg-effort">思考强度</label>
+      <select id="cfg-effort" class="form-select form-select-sm"></select>
+    </div>
+    <div class="cfg-models" id="cfg-models" hidden></div>
+    <div class="dialog-error" id="cfg-error" hidden></div>
+    <div class="dialog-actions">
+      <span class="dialog-detail me-auto" id="cfg-path"></span>
+      <button type="button" id="cfg-cancel" class="btn btn-outline-secondary btn-sm">取消</button>
+      <button type="button" id="cfg-save" class="btn btn-primary btn-sm">保存</button>
+    </div>
+  </div>
+</dialog>
+
+<script src="/vendor/bootstrap.bundle.min.js"></script>
+<script src="/markdown.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

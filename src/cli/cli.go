@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 
@@ -12,6 +14,7 @@ import (
 	"hamusuta/agent-dev/src/session"
 	"hamusuta/agent-dev/src/tool"
 	"hamusuta/agent-dev/src/util"
+	"hamusuta/agent-dev/src/webui"
 
 	tea "charm.land/bubbletea/v2"
 	"gopkg.in/yaml.v3"
@@ -20,6 +23,14 @@ import (
 func main() {
 	// 先把控制台切到 UTF-8，否则 Windows 下界面里的中文会乱码
 	useUTF8Console()
+
+	// --web [地址] 走浏览器界面，不带参数还是原来的终端界面
+	webAddr, wantWeb, err := parseArgs(os.Args[1:])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, usage)
+		os.Exit(2)
+	}
 
 	cfgPath, err := config.DefaultPath()
 	if err != nil {
@@ -33,12 +44,40 @@ func main() {
 		os.Exit(1)
 	}
 
-	cur := domain.NewSession(workdir)
 	store, notice, err := openStore(workdir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	// 启动时那两句提示（迁了多少老会话、配置搬过家）在终端里是打一行，
+	// web 这边没有历史区可以垫，只在有内容时提一句
+	if msg := joinNotice(notice, cfgNotice); msg != "" {
+		fmt.Fprintln(os.Stderr, msg)
+	}
+
+	if wantWeb {
+		// Ctrl+C 停下：ctx 一取消，Serve 就优雅关掉，正在跑的那一轮能收尾
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+		defer stop()
+		// 会话根目录决定前端能看见、能切换哪些工作区。算不出来时留空，
+		// webui 里会再试一次，实在不行就只认启动目录这一个工作区
+		root, _ := session.DefaultRoot()
+		if err := webui.Serve(ctx, webui.Options{
+			Addr:    webAddr,
+			WorkDir: workdir,
+			CfgPath: cfgPath,
+			Cfg:     cfg,
+			Store:   store,
+			Root:    root,
+		}); err != nil {
+			fmt.Fprintln(os.Stderr, "web 界面启动失败", err)
+			os.Exit(1)
+		}
+		tool.StopAllTasks()
+		return
+	}
+
+	cur := domain.NewSession(workdir)
 	m := newModel(cfg, store, workdir, cur)
 	m.cfgPath = cfgPath
 	m.notice = joinNotice(notice, cfgNotice)
@@ -50,6 +89,37 @@ func main() {
 	}
 	// 退出时把还没跑完的后台任务一起收掉，别留一堆看不见的进程
 	tool.StopAllTasks()
+}
+
+// usage 是不认识的命令行参数时打出来的用法
+const usage = `用法:
+  agent-dev                 终端界面
+  agent-dev --web [地址]     浏览器界面，默认 127.0.0.1:8080`
+
+// parseArgs 认命令行参数：只有 --web 一种带可选值的形式。
+// 返回值 wantWeb 说明要不要走浏览器界面，addr 是监听地址（空表示用默认的）。
+// 不认识的参数直接报错：这个工具能读写磁盘，猜错了代价比打一行用法大
+func parseArgs(args []string) (addr string, wantWeb bool, err error) {
+	for i := 0; i < len(args); i++ {
+		arg := strings.TrimSpace(args[i])
+		switch {
+		case arg == "--web" || arg == "-web":
+			wantWeb = true
+			// 后面还跟着东西、又不是另一个参数，那就当成地址
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				addr = args[i+1]
+				i++
+			}
+		case strings.HasPrefix(arg, "--web="):
+			wantWeb = true
+			addr = strings.TrimSpace(strings.TrimPrefix(arg, "--web="))
+		case arg == "":
+			// 空参数跳过，不算错
+		default:
+			return "", false, fmt.Errorf("不认识的参数 %q", arg)
+		}
+	}
+	return addr, wantWeb, nil
 }
 
 // openStore 准备当前工作区的会话目录：会话统一放在用户目录下，按工作区分开。
