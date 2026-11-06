@@ -351,12 +351,13 @@ func (m *Manager) commandModel(arg string) commandReply {
 	switch verb {
 	case "add":
 		return commandReply{Kind: replyConfig, Config: "new"}
-	case "del", "delete", "rm":
+	case "del", "delete":
 		return m.commandDeleteModel(rest)
 	}
 
 	cfg := m.Config()
-	models := cfg.AvailableModels()
+	// 拷贝一份再改：AvailableModels 返回的就是配置里那个数组，不能就地改
+	models := append([]config.ModelConfig(nil), cfg.AvailableModels()...)
 	if len(models) == 0 {
 		return textReply("%s", "还没配模型：/config 填一套；/model add 也能新增一套")
 	}

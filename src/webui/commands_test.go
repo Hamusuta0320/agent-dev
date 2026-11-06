@@ -299,7 +299,8 @@ func TestHTTPConfigForm(t *testing.T) {
 	if strings.Contains(body, "sk-test") {
 		t.Fatalf("密钥不能明文回给前端:\n%s", body)
 	}
-	if view.Type != "DeepSeek" || view.Model != "test-model" || view.ContextLimit != "39k" {
+	// 上下文上限给的是原始数字，不是"39k"那种写法——往回一存就掉精度
+	if view.Type != "DeepSeek" || view.Model != "test-model" || view.ContextLimit != "40000" {
 		t.Fatalf("表单值不对: %+v", view)
 	}
 	if len(view.Types) != len(config.ProviderTypes) || len(view.Efforts) != len(config.EffortLevels) {
@@ -587,6 +588,90 @@ func TestSaveConfigKeepsEditedKey(t *testing.T) {
 	models = m.Config().AvailableModels()
 	if models[0].ApiKey != "sk-A" {
 		t.Fatalf("改当前那套时密钥该沿用: %+v", models[0])
+	}
+}
+
+// 改的不是当前那套时，Current 不该跟着动
+func TestSaveConfigOtherModelKeepsCurrent(t *testing.T) {
+	m := newTestManager(t)
+	m.setConfig(config.GlobalConfig{Models: []config.ModelConfig{
+		{Name: "快", Type: "DeepSeek", ApiUrl: "https://a", ApiKey: "sk-A", Model: "model-a"},
+		{Name: "稳", Type: "OpenAI", ApiUrl: "https://b", ApiKey: "sk-B", Model: "model-b"},
+	}, Current: "快"})
+
+	if _, err := m.saveConfig(configRequest{
+		EditLabel: "稳", Name: "稳", Type: "OpenAI", ApiUrl: "https://b2",
+		ApiKey: "sk-B", Model: "model-b",
+	}); err != nil {
+		t.Fatalf("保存失败: %v", err)
+	}
+	if m.Config().Current != "快" {
+		t.Fatalf("改的不是当前那套，Current 不该动: %q", m.Config().Current)
+	}
+}
+
+// 上下文上限来回存一遍不能掉精度
+func TestSaveConfigKeepsContextLimit(t *testing.T) {
+	m := newTestManager(t)
+	m.setConfig(config.GlobalConfig{Models: []config.ModelConfig{
+		{Name: "快", Type: "DeepSeek", ApiUrl: "https://a", ApiKey: "sk-A", Model: "model-a", ContextLimit: 40000},
+	}, Current: "快"})
+
+	// 表单里显示的就是配置里那个数，不该是"39k"这种会掉精度的写法
+	view := m.configForm()
+	if view.ContextLimit != "40000" {
+		t.Fatalf("上下文上限该显示原始数字，实际 %q", view.ContextLimit)
+	}
+	if _, err := m.saveConfig(configRequest{
+		EditLabel: "快", Name: "快", Type: "DeepSeek", ApiUrl: "https://a",
+		ApiKey: "sk-A", Model: "model-a", ContextLimit: view.ContextLimit,
+	}); err != nil {
+		t.Fatalf("保存失败: %v", err)
+	}
+	models := m.Config().AvailableModels()
+	if models[0].ContextLimit != 40000 {
+		t.Fatalf("上下文上限掉了精度: %d", models[0].ContextLimit)
+	}
+}
+
+// 老的 Provider 段要跟着当前那套
+func TestSaveConfigSyncsLegacyProvider(t *testing.T) {
+	m := newTestManager(t)
+	m.setConfig(config.GlobalConfig{Models: []config.ModelConfig{
+		{Name: "快", Type: "DeepSeek", ApiUrl: "https://a", ApiKey: "sk-A", Model: "model-a"},
+	}, Current: "快"})
+
+	if _, err := m.saveConfig(configRequest{
+		EditLabel: "快", Name: "快", Type: "DeepSeek", ApiUrl: "https://a2",
+		ApiKey: "sk-A", Model: "model-a",
+	}); err != nil {
+		t.Fatalf("保存失败: %v", err)
+	}
+	var legacy config.ModelConfig
+	// Provider.Decode 是指针方法，得先落到变量上才能调
+	cfg := m.Config()
+	if err := cfg.Provider.Decode(&legacy); err != nil {
+		t.Fatalf("Provider 段解不开: %v", err)
+	}
+	if legacy.ApiUrl != "https://a2" || legacy.Name != "" {
+		t.Fatalf("Provider 段该跟着当前那套（不带 Name）: %+v", legacy)
+	}
+}
+
+// 删一套时名字的认法和 /model del 一样：唯一前缀也认
+func TestDeleteConfigModelByPrefix(t *testing.T) {
+	m := newTestManager(t)
+	m.setConfig(config.GlobalConfig{Models: []config.ModelConfig{
+		{Name: "快", Type: "DeepSeek", ApiUrl: "https://a", ApiKey: "sk-A", Model: "model-a"},
+		{Name: "稳稳稳", Type: "OpenAI", ApiUrl: "https://b", ApiKey: "sk-B", Model: "model-b"},
+	}, Current: "快"})
+
+	if _, err := m.deleteModel("稳"); err != nil {
+		t.Fatalf("删除失败: %v", err)
+	}
+	models := m.Config().AvailableModels()
+	if len(models) != 1 || models[0].Name != "快" {
+		t.Fatalf("该删掉稳稳稳那套: %+v", models)
 	}
 }
 

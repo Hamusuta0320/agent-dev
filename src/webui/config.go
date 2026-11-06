@@ -2,6 +2,8 @@ package webui
 
 import (
 	"context"
+	"fmt"
+	"strconv"
 	"strings"
 
 	"hamusuta/agent-dev/src/config"
@@ -23,7 +25,9 @@ type configView struct {
 	ApiUrl    string `json:"api_url"`
 	Model     string `json:"model"`
 	ApiKeySet bool   `json:"api_key_set"`
-	// ContextLimit 是给人填的写法（128k、1M 都认），没配过就是默认值
+	// ContextLimit 是上下文窗口的 token 数。给的是原始数字，不是"39k"那种
+	// 给人看的写法——那样往回一存就掉精度（40000 → "39k" → 39936）。
+	// 用户照样可以手填带单位的写法（128k、1M 都认）
 	ContextLimit string `json:"context_limit"`
 	Effort       string `json:"effort"`
 	// Types / Efforts 是下拉框的可选项，前端不用自己写死一份
@@ -53,7 +57,7 @@ func (m *Manager) configForm() configView {
 	out.ApiUrl = apiUrlOrDefault(mc)
 	out.Model = strings.TrimSpace(mc.Model)
 	out.ApiKeySet = strings.TrimSpace(mc.ApiKey) != ""
-	out.ContextLimit = domain.FormatTokens(mc.Limit())
+	out.ContextLimit = strconv.Itoa(mc.Limit())
 	out.Effort = config.EffortLabel(mc.ReasoningEffort)
 	return out
 }
@@ -69,7 +73,7 @@ func (m *Manager) newConfigForm() configView {
 	out.ApiUrl = config.DefaultApiUrl("DeepSeek")
 	out.Model = ""
 	out.ApiKeySet = false
-	out.ContextLimit = domain.FormatTokens(config.DefaultContextLimit)
+	out.ContextLimit = strconv.Itoa(config.DefaultContextLimit)
 	out.Effort = config.EffortLabel("")
 	return out
 }
@@ -141,10 +145,10 @@ func (m *Manager) saveConfig(req configRequest) (configView, error) {
 	// 正在改的是哪一套：新增时是空串
 	label := strings.TrimSpace(req.EditLabel)
 	if label == "" && !req.New {
+		// 认不出当前那套就让它空着：Current 写了个不存在的名字说明配置坏了，
+		// 这时候猜第一套是在做用户没要求的动作。下面会报"没说要改哪一套"
 		if cur, err := cfg.CurrentModel(); err == nil {
 			label = cur.Label()
-		} else if len(models) > 0 {
-			label = models[0].Label()
 		}
 	}
 
@@ -189,8 +193,14 @@ func (m *Manager) saveConfig(req configRequest) (configView, error) {
 		return configView{}, errFieldsRequired
 	}
 
-	// 还没配过任何模型时没有什么可改的，这一套就是新加的
-	if req.New || len(models) == 0 {
+	if len(models) == 0 {
+		// 还没配过任何模型：没什么可改的，这一套只能是新加的
+		next, err := config.AddModel(nil, mc)
+		if err != nil {
+			return configView{}, errString(err.Error())
+		}
+		models = next
+	} else if req.New {
 		// 新增一套：追加到末尾，当前那套不动
 		next, err := config.AddModel(models, mc)
 		if err != nil {
@@ -199,6 +209,9 @@ func (m *Manager) saveConfig(req configRequest) (configView, error) {
 		models = next
 	} else {
 		// 改现有那套：名字换了就是改名（原地换，列表长度不变）
+		if label == "" {
+			return configView{}, errString("没说要改哪一套")
+		}
 		// 名字留空就是"不改名字"：编辑模式下名字是这一套的标识，
 		// 没填就保住原来那个，别默默换成模型名
 		if mc.Name == "" {
@@ -216,19 +229,20 @@ func (m *Manager) saveConfig(req configRequest) (configView, error) {
 	}
 	cfg.Models = models
 	cfg.Current = current
-	// 老的 Provider 段跟着同步一份：还按老格式读配置的地方看到的也是当前这套
-	if cur, err := cfg.CurrentModel(); err == nil {
-		cur.Name = ""
-		_ = cfg.Provider.Encode(cur)
-	}
+	syncLegacyProvider(&cfg)
 	m.setConfig(cfg)
 	return m.configForm(), nil
 }
 
-// deleteModel 删掉叫 name 的那套。删的是当前那套就改用剩下的第一套
+// deleteModel 删掉叫 name 的那套。名字认法跟 /model del 一样（认名字、模型名，
+// 唯一前缀也对），免得同一个名字在两个地方认出不同的套
 func (m *Manager) deleteModel(name string) (configView, error) {
 	cfg := m.Config()
-	models, current, err := config.DeleteModel(cfg.AvailableModels(), cfg.Current, name)
+	target, ok := config.PickModel(cfg.AvailableModels(), name)
+	if !ok {
+		return configView{}, errString(fmt.Sprintf("没有叫 %q 的模型", name))
+	}
+	models, current, err := config.DeleteModel(cfg.AvailableModels(), cfg.Current, target.Label())
 	if err != nil {
 		return configView{}, err
 	}
@@ -237,12 +251,21 @@ func (m *Manager) deleteModel(name string) (configView, error) {
 	}
 	cfg.Models = models
 	cfg.Current = current
-	if cur, err := cfg.CurrentModel(); err == nil {
-		cur.Name = ""
-		_ = cfg.Provider.Encode(cur)
-	}
+	syncLegacyProvider(&cfg)
 	m.setConfig(cfg)
 	return m.configForm(), nil
+}
+
+// syncLegacyProvider 把老的 Provider 段同步成当前这套：
+// 还按老格式读配置的地方看到的也是当前这套。
+// Current 认不出当前那套时不动它——配置本身就坏了，乱写一份更糟
+func syncLegacyProvider(cfg *config.GlobalConfig) {
+	cur, err := cfg.CurrentModel()
+	if err != nil {
+		return
+	}
+	cur.Name = ""
+	_ = cfg.Provider.Encode(cur)
 }
 
 // errFieldsRequired 是表单没填全时的提示，和终端界面的措辞一致
