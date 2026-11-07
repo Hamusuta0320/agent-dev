@@ -637,8 +637,11 @@ function renderWorkspaces() {
     const wrap = node("li", "ws-item");
     const item = node("button", "dropdown-item" + (ws.id === state.workspaceId ? " current" : ""));
     item.type = "button";
-    item.append(node("span", "ws-item-name", ws.name));
-    if (ws.path) item.append(node("span", "ws-item-path", ws.path));
+    // 名字和路径装在同一个盒子里，右边留给"当前工作区"的对号（见 style.css 里 .current::after）
+    const text = node("span", "ws-item-text");
+    text.append(node("span", "ws-item-name", ws.name));
+    if (ws.path) text.append(node("span", "ws-item-path", ws.path));
+    item.append(text);
     item.addEventListener("click", () => {
       bootstrap.Dropdown.getOrCreateInstance(el.wsToggle).hide();
       if (ws.id !== state.workspaceId) selectWorkspace(ws.id);

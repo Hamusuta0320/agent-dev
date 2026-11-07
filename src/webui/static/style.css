@@ -97,10 +97,13 @@ body { overflow: hidden; }
   line-height: 1.3;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.ws-menu .dropdown-item { white-space: normal; }
+/* 对号要跟名字排在同一行：名字/路径装进 .ws-item-text 一列，右边单占一个 flex 项，
+   按基线对齐就落在名字那一行上；float 会跟着块级内容沉到路径下面去 */
+.ws-menu .dropdown-item { white-space: normal; display: flex; align-items: baseline; gap: 6px; }
+.ws-menu .ws-item-text { flex: 1 1 auto; min-width: 0; }
 .ws-menu .dropdown-item.current::after {
   content: "✓";
-  float: right;
+  flex: 0 0 auto;
   color: var(--bs-link-color);
 }
 
