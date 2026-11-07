@@ -57,20 +57,23 @@ func ParseTokens(s string) (int, error) {
 // PromptTokens / CompletionTokens 来自响应的 usage，是真值；
 // System / Tool / Message 三项是把 PromptTokens 按本地估算的比例拆出来的
 // （接口只报总数，不报这三部分各占多少），所以三者之和正好等于 PromptTokens。
+//
+// 这份结构会跟着会话一起落盘（见 Session.LastUsage），键名用下划线是为了和
+// 会话文件里其它字段一个风格——那个文件是给人看的。
 type ContextUsage struct {
 	// SystemTokens 是系统提示词那部分的占用
-	SystemTokens int
+	SystemTokens int `json:"system_tokens,omitempty"`
 	// ToolTokens 是工具定义（名字、说明和参数 schema）那部分的占用
-	ToolTokens int
+	ToolTokens int `json:"tool_tokens,omitempty"`
 	// MessageTokens 是对话消息（含工具结果）那部分的占用
-	MessageTokens int
+	MessageTokens int `json:"message_tokens,omitempty"`
 	// PromptTokens 是响应里报的本次 prompt 总 token 数
-	PromptTokens int
+	PromptTokens int `json:"prompt_tokens,omitempty"`
 	// CompletionTokens 是这次回答（含思考）消耗的 token 数
-	CompletionTokens int
+	CompletionTokens int `json:"completion_tokens,omitempty"`
 	// ContextLimit 是模型的上下文窗口（token），用来算已用百分比；
 	// 不知道窗口大小时为 0，此时只显示用量不显示百分比
-	ContextLimit int
+	ContextLimit int `json:"context_limit,omitempty"`
 }
 
 // Total 是这次请求的 token 总量：prompt + 回答

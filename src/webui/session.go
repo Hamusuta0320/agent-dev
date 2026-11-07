@@ -245,10 +245,16 @@ func (s *Session) emit(ev domain.Event) {
 		}
 	}
 	// 上下文占用：这个事件一轮只推一次，页面刷过之后就再也收不到了
-	// （EventSource 不会补发历史事件），所以照着留一份，快照里带出去
+	// （EventSource 不会补发历史事件），所以照着留一份，快照里带出去。
+	// 内存那份只活到这个进程结束——重启之后页面上那条用量会整块消失，
+	// 看着像功能坏了。所以同时记进会话，跟着每步落盘一起存下来
 	if ev.Kind == domain.EventUsage && e != nil && e.Usage != nil {
 		u := *e.Usage
 		s.usage = &u
+		if s.data != nil {
+			cu := ev.Usage
+			s.data.LastUsage = &cu
+		}
 	}
 	// 待办清单：TodoWrite 每次传上来的都是整份，照着替换就行。
 	// core 那边记的是进程级的一份，多开几个会话会串，所以这里按会话留一份
@@ -550,6 +556,12 @@ func (s *Session) snapshotWith(opt historyOptions) snapshot {
 		lastUsage = &u
 	}
 	s.mu.Unlock()
+
+	// 内存里没有（刚重启，这条会话是从磁盘读出来的）：退回会话里存的那份。
+	// 换了个进程不该让"上次请求占了多少"这条信息凭空消失
+	if lastUsage == nil && data.LastUsage != nil {
+		lastUsage = usageFromContext(*data.LastUsage)
+	}
 
 	// 跑着的时候不读内存里那份：core 正在往它上面追加消息，读它就是在和数据竞争
 	// （TUI 那边靠"运行中只读自己攒的流式缓冲"避开了这件事）。

@@ -719,6 +719,39 @@ func TestSnapshotKeepsUsage(t *testing.T) {
 	}
 }
 
+// 进程重启之后那条用量还得在：它跟着会话落盘了，不该换个进程就消失。
+// 以前它只挂在运行时对象上（Session.usage），Manager 从磁盘 Load 出来的会话没有它，
+// 页面上"上下文 xx / xxx"就整块没了
+func TestSnapshotKeepsUsageAfterRestart(t *testing.T) {
+	m := newTestManager(t)
+	s := m.create()
+	usage := domain.ContextUsage{
+		PromptTokens: 310272, CompletionTokens: 620, ContextLimit: 1048576,
+		SystemTokens: 17408, ToolTokens: 3686, MessageTokens: 288768,
+	}
+	s.emit(domain.Event{Kind: domain.EventUsage, Usage: usage})
+	// 用量本身不落盘（一轮里每步都有一条），下一条"内容刚进会话"的事件才存
+	s.emit(domain.Event{Kind: domain.EventAnswerEnd, Text: "好了"})
+
+	id := s.Data().Id
+	// 换一个 Manager：内存里什么都没有，等于进程重启后重新打开这条会话
+	restarted := newManager(Options{
+		WorkDir: m.workdir, Root: m.root, CfgPath: m.cfgPath, Cfg: m.Config(),
+		Store: session.NewStore(m.defaultSpace().Store.Dir),
+	})
+	reopened, err := restarted.open(id)
+	if err != nil {
+		t.Fatalf("重启后打不开会话: %v", err)
+	}
+	got := reopened.snapshot()
+	if got.Usage == nil {
+		t.Fatal("重启之后快照里没有用量了")
+	}
+	if got.Usage.PromptTokens != 310272 || got.Usage.ContextLimit != 1048576 || got.Usage.UsedPercent != 29 {
+		t.Fatalf("用量读回来不对: %+v", got.Usage)
+	}
+}
+
 // 消息发出去之后，SSE 那条连接真的收到事件流
 func TestHTTPEvents(t *testing.T) {
 	m := newTestManager(t)

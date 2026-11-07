@@ -62,6 +62,45 @@ func TestLoadRejectsBadId(t *testing.T) {
 	}
 }
 
+// 上下文用量跟着会话落盘：换个进程重新读回来，"上次请求占了多少"还认得出来。
+// 它以前只活在内存里，进程一重启页面上那条用量就整块消失了
+func TestSaveAndLoadLastUsage(t *testing.T) {
+	store := NewStore(filepath.Join(t.TempDir(), "sessions"))
+	s := domain.NewSession(".")
+	s.AppendUser("聊一句")
+	s.LastUsage = &domain.ContextUsage{
+		SystemTokens:     100,
+		ToolTokens:       200,
+		MessageTokens:    300,
+		PromptTokens:     600,
+		CompletionTokens: 40,
+		ContextLimit:     1024 << 10,
+	}
+	if err := store.Save(s); err != nil {
+		t.Fatalf("保存失败: %v", err)
+	}
+
+	got, err := store.Load(s.Id)
+	if err != nil {
+		t.Fatalf("读取失败: %v", err)
+	}
+	if got.LastUsage == nil {
+		t.Fatal("用量没存住，读回来是空的")
+	}
+	if *got.LastUsage != *s.LastUsage {
+		t.Fatalf("用量读回来不对: %+v vs %+v", *got.LastUsage, *s.LastUsage)
+	}
+
+	// 没存过用量的会话（老会话、还没请求过模型的）读出来该是 nil，而不是一堆零值
+	plain := domain.NewSession(".")
+	plain.AppendUser("老会话")
+	if err := store.Save(plain); err != nil {
+		t.Fatalf("保存失败: %v", err)
+	}
+	if got, err := store.Load(plain.Id); err != nil || got.LastUsage != nil {
+		t.Fatalf("没存过用量的会话该是 nil: %+v %v", got, err)
+	}
+}
 // /resume 的列表要按修改时间从新到旧排，最新的排最前
 func TestListInfoNewestFirst(t *testing.T) {
 	store := NewStore(filepath.Join(t.TempDir(), "sessions"))

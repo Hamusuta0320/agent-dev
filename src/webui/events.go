@@ -80,6 +80,20 @@ type usage struct {
 	UsedPercent      int `json:"used_percent"`
 }
 
+// usageFromContext 把 domain 那份占用翻成给前端的样子。事件推的和快照里补的
+// 都走这一份换算，免得两处各算一遍、百分比还对不上
+func usageFromContext(u domain.ContextUsage) *usage {
+	return &usage{
+		PromptTokens:     u.PromptTokens,
+		CompletionTokens: u.CompletionTokens,
+		SystemTokens:     u.SystemTokens,
+		ToolTokens:       u.ToolTokens,
+		MessageTokens:    u.MessageTokens,
+		ContextLimit:     u.ContextLimit,
+		UsedPercent:      u.LimitPercent(),
+	}
+}
+
 // approval 是一项等用户点头的写操作。ID 用来回答时指认是哪一项：
 // 同时可能有多个工具在等，光靠顺序对不上。
 type approval struct {
@@ -129,15 +143,7 @@ func eventFromDomain(seq int, ev domain.Event) *event {
 	case domain.EventUsage:
 		e.Kind = kindUsage
 		u := ev.Usage
-		e.Usage = &usage{
-			PromptTokens:     u.PromptTokens,
-			CompletionTokens: u.CompletionTokens,
-			SystemTokens:     u.SystemTokens,
-			ToolTokens:       u.ToolTokens,
-			MessageTokens:    u.MessageTokens,
-			ContextLimit:     u.ContextLimit,
-			UsedPercent:      u.LimitPercent(),
-		}
+		e.Usage = usageFromContext(u)
 	case domain.EventApproval:
 		e.Kind = kindApproval
 		if ev.Approval != nil {

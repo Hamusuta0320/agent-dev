@@ -51,7 +51,12 @@ func TestHistoryAppliesCompaction(t *testing.T) {
 	s := &Session{
 		Messages: []SessionMessage{
 			{Role: RoleUser, Content: "老问题"},
-			{Role: RoleTool, Content: original, ToolName: "Read", Compressed: true},
+			// 摘要之后留着的那一段，从一次工具调用开始：调用和结果要一起留下，
+			// 不能只留结果（接口会认为它是条孤立的 tool 消息）
+			{Role: RoleAssistant, Reasoning: "读一下", ToolCalls: []ToolCall{
+				{Id: "call_1", Name: "Read", Arguments: `{"path":"a.go"}`},
+			}},
+			{Role: RoleTool, Content: original, ToolName: "Read", ToolCallId: "call_1", Compressed: true},
 			{Role: RoleUser, Content: "新问题"},
 		},
 		Summary:     "之前改过 a.go",
@@ -59,20 +64,23 @@ func TestHistoryAppliesCompaction(t *testing.T) {
 	}
 
 	history := s.History()
-	if len(history) != 3 {
-		t.Fatalf("应该有 摘要 + 工具结果 + 新问题 3 条，实际 %d: %+v", len(history), history)
+	if len(history) != 4 {
+		t.Fatalf("应该有 摘要 + 调用 + 工具结果 + 新问题 4 条，实际 %d: %+v", len(history), history)
 	}
 	if history[0].Role != RoleUser || !strings.Contains(history[0].Content, "[更早对话的摘要]") ||
 		!strings.Contains(history[0].Content, "之前改过 a.go") {
 		t.Fatalf("摘要应该作为第一条 user 消息: %+v", history[0])
 	}
-	if history[1].Role != RoleTool || !strings.Contains(history[1].Content, "省略 2 行") {
-		t.Fatalf("压缩过的工具结果应该发截断版: %+v", history[1])
+	if history[1].Role != RoleAssistant || len(history[1].ToolCalls) != 1 {
+		t.Fatalf("工具调用要留着: %+v", history[1])
 	}
-	if history[2].Content != "新问题" {
-		t.Fatalf("最近的消息要保持原文: %+v", history[2])
+	if history[2].Role != RoleTool || !strings.Contains(history[2].Content, "省略 2 行") {
+		t.Fatalf("压缩过的工具结果应该发截断版: %+v", history[2])
 	}
-	if s.Messages[1].Content != original {
-		t.Fatalf("会话里的原文不该被改写: %q", s.Messages[1].Content)
+	if history[3].Content != "新问题" {
+		t.Fatalf("最近的消息要保持原文: %+v", history[3])
+	}
+	if s.Messages[2].Content != original {
+		t.Fatalf("会话里的原文不该被改写: %q", s.Messages[2].Content)
 	}
 }

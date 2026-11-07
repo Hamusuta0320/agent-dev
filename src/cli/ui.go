@@ -1904,12 +1904,20 @@ func (m model) resume(input string) (tea.Model, tea.Cmd) {
 	// 换会话了，窗口标题跟着换成这段会话的名字；老会话没标题就退回程序名，
 	// 总之不能继续挂着上一个会话的名字
 	setWindowTitle(next.Title)
-	// 换会话了，攒着的图不再属于谁；上下文占用那行也得清掉，它说的是上一个会话
-	// 的用量，留着会让人以为这段历史已经占了那么多窗口。排队消息同理，那是排给上一段对话的
+	// 换会话了，攒着的图不再属于谁；上下文占用那行换成这条会话自己的——
+	// 它跟着会话落盘了（Session.LastUsage），换个进程也认得回来。
+	// 没存过（老会话、还没请求过模型）就是空的，那一行不占位置
 	m.attachments = nil
 	m.queue = nil
 	m.queueIdx = -1
 	m.usage = domain.ContextUsage{}
+	if next.LastUsage != nil {
+		m.usage = *next.LastUsage
+		// 存的时候还不知道窗口有多大：用当前配置的那个补上，百分比才有意义
+		if m.usage.ContextLimit <= 0 {
+			m.usage.ContextLimit = m.contextLimit
+		}
+	}
 	// 待办清单同理：那是上一个会话里的任务
 	tool.ClearTodos()
 
