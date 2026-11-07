@@ -151,6 +151,10 @@ const state = {
   // 运行中又敲了消息就先排在这儿，这一轮正常结束自动发下一条。
   // 这是当前会话的那一份：切走的时候存进 drafts，切回来再取出来
   queue: [],
+  // sentTexts 是这条会话里用户发出过的消息正文，早的在前。空白输入框按 ↑
+  // 就把最后一条填回来改。它从历史快照和 started 事件里收集，所以刷新页面、
+  // 切走再切回来都还在——不靠输入框里残留的东西
+  sentTexts: [],
   // 附图，{mediaType, data, url}
   images: [],
   // drafts 是每条会话自己的草稿：输入框里的字、附图、排队那几条。  // 界面只有一套 DOM，但内容必须按会话分开——不然在 A 里写了一半，切到 B 就看见 A 的字，
@@ -992,6 +996,8 @@ function clearSessionView() {
   // 主动断的，不用弹"连接断了"
   setConn("idle");
   state.status = "idle";
+  // 手上没有会话了，"上一条发出的话"也就不存在，别把上一条会话的留在那儿
+  state.sentTexts = [];
   renderEmpty();
   renderRuntime(null);
   el.title.textContent = "新会话";
@@ -1149,8 +1155,19 @@ function assistantBlock(m) {
   return wrap;
 }
 
+// userTextsIn 从一份历史里挑出用户发出过的话，按时间顺序。
+// 只贴了图没写字的那种跳过——正文是空的，填回输入框等于没填
+function userTextsIn(messages) {
+  return (messages || [])
+    .filter((m) => m.role === "user" && typeof m.content === "string" && m.content.trim() !== "")
+    .map((m) => m.content);
+}
+
 function renderHistory(snapshot) {
   el.chat.replaceChildren();
+  // 顺手记下这条会话里用户发出过的话：空白输入框按 ↑ 靠它取回上一条。
+  // 每次都按快照重建（而不是往后追加），refresh 反复调用也不会攒出重复的
+  state.sentTexts = userTextsIn(snapshot.messages);
   // 快照里带着上次请求的上下文占用：刷新页面后 usage 事件不会补发，
   // 只有靠它才能把那一条复原。没有（还没聊过）就把整块收起来，
   // 不然会留着上一条会话的用量，看着像这条已经用掉那么多
@@ -1440,6 +1457,8 @@ function handleEvent(ev) {
       setStatus("连接模型…");
       // 附图跟着这条一起挂进聊天记录：发出去之后就只剩这一份，输入区里的预览已经清掉了
       if (ev.text || (ev.images && ev.images.length)) el.chat.append(userBubble(ev.text, ev.images));
+      // 也记进"发出过的话"：这条刚发出去，还没经过任何一次快照，↑ 也要能取回它
+      if (ev.text && ev.text.trim()) state.sentTexts.push(ev.text);
       scrollToBottom();
       // 这一轮开始了：列表上的圆点要转起来
       loadSessions();
@@ -1654,6 +1673,9 @@ async function openSession(id) {
   if (state.workspaceId) localStorage.setItem(`agent-dev.session.${state.workspaceId}`, id);
   state.calls.clear();
   state.turn = null;
+  // 换会话了：先清掉上一条的"发出过的话"，免得这一瞬间按 ↑ 取回的是别人的消息。
+  // 紧接着的 refresh 会按新会话的历史重建它
+  state.sentTexts = [];
   setStatus("");
   hideApproval();
   hideSuggest();
@@ -2016,6 +2038,27 @@ function resizeInput() {
   el.input.style.height = `${Math.min(el.input.scrollHeight, 220)}px`;
 }
 
+// recallLastInput 把这条会话里最后一条发出过的消息填回输入框，空白框按 ↑ 时用。
+//
+// 只在框是空的时候动手：里面已经有字说明正在写别的，那会儿 ↑ 该归给光标移动
+// 或 Shift 选中，不能被抢。取回之后光标停在末尾——多半是要在尾巴上补一句。
+// 返回有没有真的填，没填就让浏览器按它原来的意思处理这个键
+function recallLastInput() {
+  if (!state.sessionId) return false;
+  if (el.input.value.trim() !== "") return false;
+  const texts = state.sentTexts || [];
+  if (texts.length === 0) return false;
+  const text = texts[texts.length - 1];
+  if (!text) return false;
+  el.input.value = text;
+  el.input.setSelectionRange(text.length, text.length);
+  // 走一遍和手打一样的收尾：高度跟着内容变、该弹的命令候选也弹、草稿同步过去
+  resizeInput();
+  refreshSuggest();
+  saveDraft();
+  return true;
+}
+
 async function loadMeta() {
   try {
     applyMeta(await api("/api/meta"));
@@ -2296,6 +2339,15 @@ function bindEvents() {
           break;
         default:
           break;
+      }
+    }
+    // 空白输入框按 ↑：把上一条发出过的消息填回来接着改。
+    // 候选开着时 ↑ 已经在上面的 switch 里归候选了；带修饰键的是选中文字或跳词，
+    // 也别抢——所以只在光秃秃一个 ↑ 的时候动手
+    if (e.key === "ArrowUp" && !e.isComposing && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
+      if (recallLastInput()) {
+        e.preventDefault();
+        return;
       }
     }
     // Enter 发送、Shift+Enter 换行。拼音输入法选词时的 Enter 不算
