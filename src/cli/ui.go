@@ -333,7 +333,8 @@ var loadSkills = core.Skills
 
 func newModel(cfg config.GlobalConfig, store *session.Store, workdir string, cur *domain.Session) model {
 	input := textarea.New()
-	input.Placeholder = "问点什么，/help 看命令"
+	// 空输入框就空着，不挂 placeholder：那行灰字和真敲进去的话看着一样，
+	// 容易让人以为自己已经打了点什么。按键提示交给框下面那几行。
 	input.ShowLineNumbers = false
 	// 高度固定 3 行：整块界面依赖"行数恒定"来对齐，输入框一旦跟着内容长高，
 	// 下面的行就被挤出屏幕，inline 渲染会把顶上的边框裁掉，看着像输入框缺了一块。

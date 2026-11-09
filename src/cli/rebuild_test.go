@@ -59,8 +59,8 @@ func TestRebuildClearsResidue(t *testing.T) {
 					t.Errorf("重建后 %q 出现 %d 次，应该只有 1 次:\n%s", want, n, joined)
 				}
 			}
-			// 帧得在屏幕上
-			if !strings.Contains(joined, "问点什么") {
+			// 帧得在屏幕上：输入框那圈圆角框的顶边
+			if !strings.Contains(joined, "╭") {
 				t.Errorf("重建后输入框没了:\n%s", joined)
 			}
 		})
