@@ -33,7 +33,7 @@ func TestReadWithLineNumbers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("执行失败: %v", err)
 	}
-	want := "     1→alpha\n     2→beta\n"
+	want := "   1→alpha\n   2→beta\n"
 	if out != want {
 		t.Fatalf("输出不符合预期:\n%q\nwant:\n%q", out, want)
 	}
@@ -56,10 +56,10 @@ func TestReadOffsetAndLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("执行失败: %v", err)
 	}
-	if !strings.Contains(out, "     2→2\n") || !strings.Contains(out, "     3→3\n") {
+	if !strings.Contains(out, "   2→2\n") || !strings.Contains(out, "   3→3\n") {
 		t.Fatalf("offset/lines 没有生效: %q", out)
 	}
-	if strings.Contains(out, "     4→") {
+	if strings.Contains(out, "   4→") {
 		t.Fatalf("超出 lines 的行不该输出: %q", out)
 	}
 	// 没读完时要提示下一次该用的 offset
@@ -74,7 +74,7 @@ func TestReadToEOFNoHint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("执行失败: %v", err)
 	}
-	if !strings.Contains(out, "     2→b\n") {
+	if !strings.Contains(out, "   2→b\n") {
 		t.Fatalf("最后一行没有输出: %q", out)
 	}
 	if strings.Contains(out, "还没读完") {
@@ -143,7 +143,7 @@ func TestReadLongLine(t *testing.T) {
 	if len(out) > maxLineBytes+4096 {
 		t.Fatalf("超长行的输出没有被限制住: %d 字节", len(out))
 	}
-	if !strings.Contains(out, "     2→tail\n") {
+	if !strings.Contains(out, "   2→tail\n") {
 		t.Fatalf("超长行后面的行要保持行号正确: %q", out[max(0, len(out)-200):])
 	}
 }
@@ -161,14 +161,14 @@ func TestReadWideLineNumbers(t *testing.T) {
 	}
 }
 
-// 没到 6 位时保持原来的 6 格宽度，别把已有的输出格式改掉
+// 没到 4 位时保持默认的 4 格宽度；更长的行号按实际位数加宽
 func TestLineNumberWidth(t *testing.T) {
 	cases := []struct {
 		maxNo int
 		want  int
 	}{
 		{1, minLineNumberWidth},
-		{999999, minLineNumberWidth},
+		{999, minLineNumberWidth},
 		{1000000, 7},
 		{12345678, 8},
 	}

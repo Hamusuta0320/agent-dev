@@ -2,7 +2,9 @@ package core
 
 import (
 	"encoding/json"
+	"fmt"
 	"sort"
+	"strings"
 
 	"hamusuta/agent-dev/src/domain"
 )
@@ -119,6 +121,105 @@ func newContextUsage(systemPrompt string, toolTokens, messageTokens int, usage d
 		CompletionTokens: usage.CompletionTokens,
 		ContextLimit:     limit,
 	}
+}
+
+// heavyLimit 是 /usage 占用排行列几条，够看出是哪类工具在吃上下文
+const heavyLimit = 5
+
+// heavyPreviewRunes 是排行里那行预览保留的字符数
+const heavyPreviewRunes = 60
+
+// heavyMessage 是历史里一条占 token 较多的消息，/usage 靠它说清"钱花在哪了"
+type heavyMessage struct {
+	// ToolName 是工具名；不是工具结果的退回角色名
+	ToolName string
+	Tokens   int
+	Preview  string
+}
+
+// historyHeavy 数出会话里还没被摘要覆盖的消息各占多少 token，返回最占的前 n 条。
+// 估算口径和真正发出去的一致：压缩过的工具结果按截断版算，空 assistant 跳过。
+// 只在 /usage 里现算，不进每轮请求，所以不占常态 token
+func historyHeavy(session *domain.Session, n int) []heavyMessage {
+	if session == nil || n <= 0 {
+		return nil
+	}
+	start := min(max(session.SummaryUpTo, 0), len(session.Messages))
+	var items []heavyMessage
+	for _, m := range session.Messages[start:] {
+		text := m.Content
+		if m.Role == domain.RoleTool && m.Compressed {
+			text = domain.TruncateToolContent(text)
+		}
+		if m.Role == domain.RoleAssistant && text == "" && len(m.ToolCalls) == 0 {
+			continue
+		}
+		tokens := estimateMessages([]domain.AIChatMessage{
+			{Role: m.Role, Content: text, ToolCalls: m.ToolCalls},
+		})
+		if tokens <= 0 {
+			continue
+		}
+		name := m.ToolName
+		if name == "" {
+			name = m.Role
+		}
+		items = append(items, heavyMessage{ToolName: name, Tokens: tokens, Preview: previewLine(text)})
+	}
+	sort.SliceStable(items, func(i, j int) bool { return items[i].Tokens > items[j].Tokens })
+	if len(items) > n {
+		items = items[:n]
+	}
+	return items
+}
+
+// previewLine 取内容第一行有字的，压成一行并截到 heavyPreviewRunes，
+// 让排行一眼能认出是哪个文件/哪条命令
+func previewLine(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		line = strings.Join(strings.Fields(line), " ")
+		runes := []rune(line)
+		if len(runes) > heavyPreviewRunes {
+			return string(runes[:heavyPreviewRunes]) + "…"
+		}
+		return line
+	}
+	return "（空）"
+}
+
+// UsageReport 是 /usage 的正文：先报上下文占用的分项，再列历史里最占 token 的几条，
+// 用来回答"这次任务里到底是什么在吃上下文"——先看清楚再谈优化
+func UsageReport(session *domain.Session) string {
+	var sb strings.Builder
+	sb.WriteString("上下文占用\n")
+	if session != nil && session.LastUsage != nil {
+		u := *session.LastUsage
+		limit := ""
+		if u.ContextLimit > 0 {
+			limit = fmt.Sprintf(" / %s（已用 %d%%）", domain.FormatTokens(u.ContextLimit), u.LimitPercent())
+		}
+		fmt.Fprintf(&sb, "  最近一次请求 %s%s · 本轮回复 %s\n",
+			domain.FormatTokens(u.PromptTokens), limit, domain.FormatTokens(u.CompletionTokens))
+		fmt.Fprintf(&sb, "  系统提示词 %s · 工具定义 %s · 对话消息 %s\n",
+			domain.FormatTokens(u.SystemTokens), domain.FormatTokens(u.ToolTokens), domain.FormatTokens(u.MessageTokens))
+	} else {
+		sb.WriteString("  还没有请求记录：跑一轮之后才有用量数据\n")
+	}
+
+	heavy := historyHeavy(session, heavyLimit)
+	if len(heavy) == 0 {
+		sb.WriteString("历史消息占用排行\n  还没有可统计的消息\n")
+		return strings.TrimRight(sb.String(), "\n")
+	}
+	fmt.Fprintf(&sb, "历史消息占用排行（估算，只算还没被摘要覆盖的，压缩过的按截断版算）\n")
+	for i, h := range heavy {
+		fmt.Fprintf(&sb, "  %d. %-14s %8s  %s\n", i+1, h.ToolName, domain.FormatTokens(h.Tokens), h.Preview)
+	}
+	return strings.TrimRight(sb.String(), "\n")
 }
 
 // splitByWeight 按权重把 total 分成 len(weights) 份，

@@ -1513,6 +1513,8 @@ func (m model) submit() (tea.Model, tea.Cmd) {
 		return m.resume(input)
 	case cmdSession:
 		return m, m.print(sessionText(m.cur, m.workdir, m.store))
+	case cmdUsage:
+		return m, m.print(core.UsageReport(m.cur))
 	case cmdCompact:
 		return m.startCompact()
 	case cmdConfig:

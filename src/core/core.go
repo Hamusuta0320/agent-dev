@@ -125,7 +125,10 @@ func Run(ctx domain.Ctx, session *domain.Session) (string, error) {
 		if lastPrompt > used {
 			used = lastPrompt
 		}
-		if needCompact(ctx.ContextLimit, used) {
+		// 每步都跑一次压缩：截断较早工具输出那段代价很小、也不该等阈值——
+		// 一次大输出会在它之后每一步都跟着重发，越早换成截断版越省。
+		// 截断完还超阈值时才做摘要（这一步要花一次请求），由 forceSummary 和内部判断把关
+		if len(session.Messages) > keepRecentMessages || needCompact(ctx.ContextLimit, used) {
 			force := lastPrompt > 0 && needCompact(ctx.ContextLimit, lastPrompt)
 			if compactContext(ctx, session, emit, usage, estimateTokens(sys), force) {
 				usage.messageTokens = estimateMessages(session.History())

@@ -13,11 +13,13 @@ import (
 )
 
 const (
-	defaultReadLines = 2000
+	// defaultReadLines 是一次默认读多少行。800 行一般是几百行的小文件一次读完、
+	// 大文件分几次读；再往上默认值，每次读都要把整段内容在后续每一步里重发一遍
+	defaultReadLines = 800
 	// maxLineBytes 单行上限，避免一行超长的文件（压缩过的 js、二进制）吃光内存
 	maxLineBytes = 1024 * 1024
 	// minLineNumberWidth 行号列最少这么宽，行号更长时按实际位数加宽，保证 "→" 不会歪掉
-	minLineNumberWidth = 6
+	minLineNumberWidth = 4
 )
 
 // readItem 是 Read 缓冲下来的一行：行号、内容，以及这一行是不是因为太长被截断了
@@ -38,9 +40,9 @@ func (t ReadTool) Name() string {
 func (t ReadTool) Mutating() bool { return false }
 
 func (t ReadTool) Description() string {
-	return "读取文本文件，按行返回，默认每行前面带行号（格式 `    12→代码`）。" +
+	return "读取文本文件，按行返回，默认每行前面带行号（格式 `  12→代码`）。" +
 		"intent 写一句这次读取要看什么，会显示在界面上。" +
-		"默认从第 1 行开始、最多读 2000 行；文件更长时返回末尾会提示下一次该用的 offset。" +
+		"默认从第 1 行开始、最多读 800 行；文件更长时返回末尾会提示下一次该用的 offset。" +
 		"不是 UTF-8 的文件（例如 GBK 或 GB18030 编码）会自动按本地编码解码后显示。" +
 		"不要用它读目录或二进制文件；搜文件内容用 Grep，新建/覆盖文件用 Write，只改一小段用 Edit。"
 }
@@ -60,7 +62,7 @@ func (t ReadTool) Schema() map[string]any {
 			},
 			"lines": map[string]any{
 				"type":        "integer",
-				"description": "最多读取的行数，默认 2000",
+				"description": "最多读取的行数，默认 800",
 			},
 			"line_numbers": map[string]any{
 				"type":        "boolean",

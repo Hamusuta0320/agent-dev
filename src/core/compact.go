@@ -8,10 +8,12 @@ import (
 )
 
 const (
-	// compactThresholdPercent 是上下文占用到达窗口的百分之多少时开始压缩
-	compactThresholdPercent = 80
-	// keepRecentMessages 是压缩时原样保留的最近消息条数
-	keepRecentMessages = 12
+	// compactThresholdPercent 是上下文占用到达窗口的百分之多少时把旧对话摘要掉。
+	// 65% 留出更多余量：摘要本身也要花一次请求，等压到 80% 才动手容易一步就顶到窗口
+	compactThresholdPercent = 65
+	// keepRecentMessages 是压缩时原样保留的最近消息条数。更早的工具输出每步都会被重发，
+	// 越早换成截断版越省；留 8 条是让模型还能看到刚跑完那几步的完整结果
+	keepRecentMessages = 8
 	// summaryMaxRunes 是单条消息送进摘要请求前的上限，免得摘要请求本身又撑爆上下文
 	summaryMaxRunes = 2000
 )
@@ -32,7 +34,9 @@ func needCompact(limit, used int) bool {
 
 // compactContext 按两级压缩会话：先把较早的工具输出截断，还不够就把更早的消息摘要掉。
 // 只改压缩标记和摘要，原文一直留在会话里，所以这里动过的会话照常落盘即可。
-// forceSummary 表示上一轮接口报的用量已经超阈值——本地估算可能偏低，这时候别跳过摘要。
+// 每一步都可以调它：截断阶段代价很小、也不看阈值（越早回收越省），
+// 摘要阶段才要超阈值才做——forceSummary 表示上一轮接口报的用量已经超阈值，
+// 本地估算可能偏低，这时候别跳过摘要。
 // 返回是否真的改动了会话。
 func compactContext(ctx domain.Ctx, session *domain.Session, emit domain.EmitFunc, usage *usageTracker, systemTokens int, forceSummary bool) bool {
 	if session == nil || usage == nil {

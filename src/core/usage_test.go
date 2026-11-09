@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"hamusuta/agent-dev/src/domain"
@@ -128,6 +129,43 @@ func TestUsageTrackerMatchesFullEstimate(t *testing.T) {
 	// 工具定义只算一次，和当场重算的结果也要一致
 	if want := estimateToolSpecs(specs); tracker.toolTokens != want {
 		t.Fatalf("工具定义估算是 %d，重算是 %d", tracker.toolTokens, want)
+	}
+}
+
+// historyHeavy 要按占用从大到小排、只留前 n 条，并跳过被摘要覆盖的老消息
+func TestHistoryHeavy(t *testing.T) {
+	session := domain.NewSession("/tmp/demo")
+	session.AppendUser("看看代码")
+	small := domain.ToolCall{Id: "c1", Name: "Read", Arguments: `{}`}
+	session.AppendAssistant("", "", []domain.ToolCall{small})
+	session.AppendToolResult(small, "短结果\n")
+	big := domain.ToolCall{Id: "c2", Name: "Bash", Arguments: `{"command":"ls"}`}
+	session.AppendAssistant("", "", []domain.ToolCall{big})
+	session.AppendToolResult(big, strings.Repeat("很长的输出行\n", 500))
+
+	heavy := historyHeavy(session, 3)
+	if len(heavy) == 0 {
+		t.Fatal("应该有排行")
+	}
+	if heavy[0].ToolName != "Bash" {
+		t.Fatalf("最占 token 的应该是 Bash，实际 %q", heavy[0].ToolName)
+	}
+	if heavy[0].Preview == "" {
+		t.Fatal("预览不该是空的")
+	}
+
+	// 老消息全被摘要覆盖后就不再算进去
+	session.SummaryUpTo = len(session.Messages)
+	if got := historyHeavy(session, 5); len(got) != 0 {
+		t.Fatalf("全被摘要覆盖后不该再有排行: %+v", got)
+	}
+}
+
+// UsageReport 没有会话时也要给出可读的说明，不能崩
+func TestUsageReportWithoutSession(t *testing.T) {
+	out := UsageReport(nil)
+	if !strings.Contains(out, "还没有请求记录") {
+		t.Fatalf("没有会话时该说清楚没数据: %q", out)
 	}
 }
 

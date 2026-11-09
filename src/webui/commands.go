@@ -70,6 +70,8 @@ func (m *Manager) runCommand(s *Session, input string) commandReply {
 		return m.commandResume(s, arg)
 	case "/session":
 		return m.commandSession(s)
+	case "/usage":
+		return textReply("%s", core.UsageReport(s.Data()))
 	case "/compact":
 		return m.commandCompact(s)
 	case "/config":

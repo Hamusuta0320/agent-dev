@@ -20,6 +20,7 @@ const (
 	cmdNew
 	cmdResume
 	cmdSession
+	cmdUsage
 	cmdCompact
 	cmdConfig
 	cmdMode
@@ -46,6 +47,7 @@ var cmdOf = map[string]command{
 	"/new":     cmdNew,
 	"/resume":  cmdResume,
 	"/session": cmdSession,
+	"/usage":   cmdUsage,
 	"/compact": cmdCompact,
 	"/config":  cmdConfig,
 	"/mode":    cmdMode,

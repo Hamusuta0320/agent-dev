@@ -17,8 +17,8 @@ func TestNeedCompact(t *testing.T) {
 	}{
 		{0, 99999, false}, // 不知道窗口大小，不压
 		{1000, 0, false},
-		{1000, 799, false},
-		{1000, 800, true}, // 正好 80% 就开始压
+		{1000, compactThresholdPercent*10 - 1, false},
+		{1000, compactThresholdPercent * 10, true}, // 正好到阈值就开始压
 		{1000, 900, true},
 	}
 	for _, c := range tests {

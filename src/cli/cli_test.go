@@ -251,7 +251,7 @@ func TestWithMark(t *testing.T) {
 // 输入以 / 开头时列出能补全的命令，打全了就不再提示
 func TestSuggestCommands(t *testing.T) {
 	cases := map[string][]string{
-		"/":     {"/help", "/new", "/resume", "/session", "/compact", "/config", "/mode", "/model", "/effort", "/skills", "/todo", "/quiet", "/exit"},
+		"/":     {"/help", "/new", "/resume", "/session", "/usage", "/compact", "/config", "/mode", "/model", "/effort", "/skills", "/todo", "/quiet", "/exit"},
 		"/c":    {"/compact", "/config"},
 		"/re":   {"/resume"},
 		"/se":   {"/session"},

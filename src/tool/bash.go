@@ -20,8 +20,10 @@ const (
 	defaultBashTimeout = 30 * time.Second
 	// maxBashTimeout 允许模型给慢命令（构建、装依赖）多留点时间，再长就该用后台任务了
 	maxBashTimeout = 10 * time.Minute
-	// maxBashOutput 是 stdout+stderr 合并后保留的字节数，超出时开头和结尾各留一半
-	maxBashOutput = 64 * 1024
+	// maxBashOutput 是 stdout+stderr 合并后保留的字节数，超出时开头和结尾各留一半。
+	// 32KB 足够看清构建/测试的结尾摘要；再往上留，一次命令的输出会在它之后的每一步
+	// 都跟着重发一遍（历史里的工具结果每轮都要重新发给模型），是上下文里最烧钱的一类
+	maxBashOutput = 32 * 1024
 	// psUTF8Prefix 让 PowerShell 按 UTF-8 解码原生命令的输出、也按 UTF-8 写出去。
 	// 中文 Windows 的默认代码页是 GBK，不改的话 go test、ls 这类输出里的中文会全变成乱码
 	psUTF8Prefix = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
@@ -118,6 +120,7 @@ func (t BashTool) Description() string {
 		"background=true 让命令转到后台运行，立刻拿到任务 id，之后用 Task 工具看输出、等它结束或停掉它"+
 		"（跑完会自动提醒你，不用轮询），适合 dev server、长时间构建这类不该卡住这一轮的命令。"+
 		"前台适合构建、测试、git、查看目录等；文件的读写和内容搜索请优先用 Read/Write/Edit/Grep。"+
+		"输出过长时只保留开头和结尾（中间会说明省了多少字节），需要完整输出请自己重定向到文件再 Read。"+
 		"不要执行交互式命令（vim、more、read），它们会一直等输入。",
 		runtime.GOOS, runtime.GOARCH, s.Name, s.Hint, shortDuration(maxBashTimeout))
 }
@@ -449,7 +452,7 @@ func (o *outputBuffer) String() string {
 	tail := trimReplacementLeft(decodeOutput(o.tail))
 	var sb strings.Builder
 	sb.WriteString(head)
-	fmt.Fprintf(&sb, "\n...[输出过长，中间省略 %d 字节，只保留开头和结尾]\n", o.total-len(o.head)-len(o.tail))
+	fmt.Fprintf(&sb, "\n...[输出过长，中间省略 %d 字节，只保留开头和结尾；要看完整输出请把命令重定向到文件再 Read]\n", o.total-len(o.head)-len(o.tail))
 	sb.WriteString(tail)
 	return sb.String()
 }

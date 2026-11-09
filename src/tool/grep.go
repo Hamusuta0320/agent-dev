@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	defaultGrepMaxResults = 200
+	defaultGrepMaxResults = 100
 	// maxGrepFileBytes 超过这个大小的文件直接跳过，真有需要请用 Bash 里的专用工具
 	maxGrepFileBytes = 10 * 1024 * 1024
 	// maxGrepLineBytes 单行上限，防止压缩产物那种超长行吃光内存
@@ -57,7 +57,7 @@ func (t GrepTool) Description() string {
 		"默认在当前目录递归搜索，自动跳过 .git / node_modules / vendor / dist / build 等目录、二进制文件和超过 10MB 的文件。" +
 		"不是 UTF-8 的文件（例如 GBK / GB18030 编码）会先按本地编码解码再匹配，pattern 请照常写 UTF-8。" +
 		"path 可以指定文件或目录；glob 限定文件类型（如 *.go，多个用逗号分隔）；" +
-		"case_insensitive 忽略大小写；max_results 限制返回条数（默认 200）；" +
+		"case_insensitive 忽略大小写；max_results 限制返回条数（默认 100）；" +
 		"context_lines 让每处匹配多显示前后各几行上下文（默认 0，最多 10），上下文行用 `-` 分隔，" +
 		"需要看清命中周围在干什么时再传。" +
 		"pattern 是 Go 正则（RE2），不支持后向引用，搜代码里的符号要转义 ( ) [ ] { } * + ? | ^ $ . \\。"
@@ -86,7 +86,7 @@ func (t GrepTool) Schema() map[string]any {
 			},
 			"max_results": map[string]any{
 				"type":        "integer",
-				"description": "最多返回多少处匹配，默认 200",
+				"description": "最多返回多少处匹配，默认 100",
 			},
 			"context_lines": map[string]any{
 				"type":        "integer",
