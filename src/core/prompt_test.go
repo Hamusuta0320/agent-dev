@@ -2,6 +2,7 @@ package core
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -68,5 +69,74 @@ func TestTaskNoticeIsTrailingUserMessage(t *testing.T) {
 	}
 	if len(taskNotice(nil)) != 0 {
 		t.Fatal("没有通知时不该返回消息")
+	}
+}
+
+// 系统提示词按会话存快照：同样的输入必须原样返回同一份，否则每个 step 都在改前缀
+func TestSystemPromptReusesSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "AGENTS.md")
+	if err := os.WriteFile(path, []byte("# 项目约定\n第一版\n"), 0o644); err != nil {
+		t.Fatalf("写约定文件失败: %v", err)
+	}
+	session := domain.NewSession(dir)
+	ctx := domain.Ctx{WorkDir: dir, Session: session}
+
+	first := systemPrompt(ctx)
+	if session.PromptCache == nil {
+		t.Fatal("应该留下了一份快照")
+	}
+	if second := systemPrompt(ctx); second != first {
+		t.Fatal("输入没变时不该重拼，返回的字节必须一模一样")
+	}
+}
+
+// 约定文件被改过时快照要失效，不能一直拿老提示词
+func TestSystemPromptSnapshotInvalidated(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "AGENTS.md")
+	if err := os.WriteFile(path, []byte("# 项目约定\n第一版\n"), 0o644); err != nil {
+		t.Fatalf("写约定文件失败: %v", err)
+	}
+	session := domain.NewSession(dir)
+	ctx := domain.Ctx{WorkDir: dir, Session: session}
+	if !strings.Contains(systemPrompt(ctx), "第一版") {
+		t.Fatal("提示词里应该有第一版约定")
+	}
+
+	if err := os.WriteFile(path, []byte("# 项目约定\n第二版，这次多加了三条规矩\n"), 0o644); err != nil {
+		t.Fatalf("改写约定文件失败: %v", err)
+	}
+	got := systemPrompt(ctx)
+	if strings.Contains(got, "第一版") || !strings.Contains(got, "第二版") {
+		t.Fatalf("约定文件改过之后快照没失效:\n%s", got)
+	}
+}
+
+// 切模式要重拼提示词：只读和完全授权写进去的约束不一样
+func TestSystemPromptSnapshotFollowsMode(t *testing.T) {
+	session := domain.NewSession(t.TempDir())
+	ctx := domain.Ctx{WorkDir: t.TempDir(), Session: session, Mode: domain.ModeFull}
+	full := systemPrompt(ctx)
+	if !strings.Contains(full, "完全授权") {
+		t.Fatalf("完全授权模式的提示词不对:\n%s", full)
+	}
+
+	ctx.Mode = domain.ModeReadOnly
+	readOnly := systemPrompt(ctx)
+	if readOnly == full || !strings.Contains(readOnly, "只读") {
+		t.Fatalf("切了模式提示词没跟着变:\n%s", readOnly)
+	}
+}
+
+// 尾部注入合并成一处：没有通知也没有提醒时什么都不多出来
+func TestTrailingMessages(t *testing.T) {
+	if got := trailingMessages(nil); len(got) != 0 {
+		t.Fatalf("没有内容时不该多出消息: %+v", got)
+	}
+	notice := domain.AIChatMessage{Role: domain.RoleUser, Content: "## 待办清单\n还有两条没核销"}
+	got := trailingMessages([]domain.AIChatMessage{notice})
+	if len(got) != 1 || got[0].Content != notice.Content {
+		t.Fatalf("提醒应该原样跟在末尾: %+v", got)
 	}
 }

@@ -3,6 +3,7 @@ package core
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 
@@ -12,25 +13,58 @@ import (
 
 // systemPrompt 告诉模型它是谁、在什么环境里干活，以及这个项目对工具使用的约定。
 // 工具的入参由各自的 schema 描述，这里只讲"该优先用哪个"和"别做什么"。
+//
+// 这段文字是每条消息之前的前缀，接口侧按前缀比对命中缓存，所以它在一次提问里
+// 必须逐字节稳定。里面的"项目约定"和"可用技能"要读磁盘，于是这里按会话存一份
+// 快照：输入指纹对得上就直接返回上次那份，既不重复读文件，也不会因为重拼出来的
+// 内容有半点不同而把后面整段历史一起废掉。
 func systemPrompt(ctx domain.Ctx) string {
+	workdir := resolveWorkDir(ctx)
+	mode := ctx.CurrentMode()
+	stamp := promptStamp(workdir)
+	if s := ctx.Session; s != nil && s.PromptCache != nil &&
+		s.PromptCache.Stamp == stamp && s.PromptCache.Mode == mode && s.PromptCache.Shell == ctx.Shell {
+		return s.PromptCache.Text
+	}
+
+	text := renderSystemPrompt(workdir, ctx.Shell, mode)
+	if ctx.Session != nil {
+		ctx.Session.PromptCache = &domain.PromptCache{
+			Text:  text,
+			Stamp: stamp,
+			Mode:  mode,
+			Shell: ctx.Shell,
+		}
+	}
+	return text
+}
+
+// resolveWorkDir 取工作目录：调用方给了就用它，没给退回进程当前目录
+func resolveWorkDir(ctx domain.Ctx) string {
+	if workdir := strings.TrimSpace(ctx.WorkDir); workdir != "" {
+		return workdir
+	}
+	if wd, err := os.Getwd(); err == nil {
+		return wd
+	}
+	return ""
+}
+
+// renderSystemPrompt 真正拼一遍系统提示词。同一个会话里尽量少走这里，
+// 走一次就说明约定文件或技能目录动过了
+func renderSystemPrompt(workdir, shell string, mode domain.Mode) string {
 	var sb strings.Builder
 	sb.WriteString("你是一个能读写文件、执行命令的编程助手，在用户的项目目录里工作。\n\n## 环境\n")
 
-	workdir := strings.TrimSpace(ctx.WorkDir)
-	if workdir == "" {
-		if wd, err := os.Getwd(); err == nil {
-			workdir = wd
-		}
-	}
 	if workdir != "" {
 		fmt.Fprintf(&sb, "- 工作目录: %s（相对路径都相对于它）\n", workdir)
 	}
 	fmt.Fprintf(&sb, "- 系统: %s/%s\n", runtime.GOOS, runtime.GOARCH)
-	if shell := strings.TrimSpace(ctx.Shell); shell != "" {
+	if shell = strings.TrimSpace(shell); shell != "" {
 		fmt.Fprintf(&sb, "- Bash 工具实际用的 shell: %s\n", shell)
 	}
 	// 模式按"此刻"写：跑的过程中切了模式，下一步请求的系统提示词就跟着变
-	sb.WriteString(modeSection(ctx.CurrentMode()))
+	sb.WriteString(modeSection(mode))
 	sb.WriteString(conventionSection(workdir))
 	if root, err := SkillsRoot(); err == nil {
 		sb.WriteString(skillSection(root))
@@ -76,6 +110,66 @@ func systemPrompt(ctx domain.Ctx) string {
 // 接口侧的上下文缓存只会在末尾多出这一条；历史里的工具调用配对也不受影响。
 func taskMessages() []domain.AIChatMessage {
 	return taskNotice(tool.TaskNotifications())
+}
+
+// trailingMessages 是本步追加在对话末尾的一次性内容：后台任务通知 + 本轮临时提醒。
+// 两者都易失，统一放在最末，前面 [系统提示词 + 历史] 的字节才稳定；合成一处之后
+// 尾部只有一个断点，不会两段各自前后漂移
+func trailingMessages(notices []domain.AIChatMessage) []domain.AIChatMessage {
+	msgs := taskMessages()
+	if len(notices) == 0 {
+		return msgs
+	}
+	return append(msgs, notices...)
+}
+
+// promptStamp 是拼系统提示词用到的全部外部输入的状态指纹：工作目录、约定文件的
+// 修改时间和大小、技能目录里每个技能说明文件的状态。指纹一样，重拼出来的字符串
+// 就逐字节一样，可以直接用快照
+func promptStamp(workDir string) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "workdir|%s\n", workDir)
+
+	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+		for _, rel := range homeConventions {
+			statInto(&sb, filepath.Join(home, rel))
+		}
+	}
+	for _, dir := range ancestorDirs(workDir) {
+		for _, name := range conventionFiles {
+			statInto(&sb, filepath.Join(dir, name))
+		}
+	}
+
+	root, err := SkillsRoot()
+	if err != nil {
+		return sb.String()
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		// 目录读不动时 skillSection 也是空串，指纹里记一笔"没有"就够
+		sb.WriteString("skills|absent\n")
+		return sb.String()
+	}
+	for _, entry := range entries {
+		path := filepath.Join(root, entry.Name())
+		if entry.IsDir() {
+			// 目录本身的 mtime 不跟着里面文件的内容变，得看那份说明文件
+			path = filepath.Join(path, skillFileName)
+		}
+		statInto(&sb, path)
+	}
+	return sb.String()
+}
+
+// statInto 把一个文件的状态写进指纹：不存在记 absent，存在就记修改时间和大小
+func statInto(sb *strings.Builder, path string) {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		fmt.Fprintf(sb, "%s|absent\n", path)
+		return
+	}
+	fmt.Fprintf(sb, "%s|%d|%d\n", path, info.ModTime().UnixNano(), info.Size())
 }
 
 // taskNotice 把通知文本拼成消息，没有通知时返回 nil（不往请求里塞空消息）

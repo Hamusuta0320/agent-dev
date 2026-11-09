@@ -47,6 +47,11 @@ func buildSpecs(tools map[string]domain.Tool) []domain.ToolSpec {
 // 每一轮都按 session 重新拼 messages，所以会话历史就是上下文。
 // 过程进度通过 ctx.Emit 上报，没设置时走默认的控制台打印。
 func Run(ctx domain.Ctx, session *domain.Session) (string, error) {
+	// 系统提示词快照挂在会话上：直接调 Run 的调用方可能只传了 session 参数，
+	// 这里补一下，不然每一步都要重拼一遍提示词
+	if ctx.Session == nil {
+		ctx.Session = session
+	}
 	maxSteps := ctx.MaxSteps
 	if maxSteps <= 0 {
 		maxSteps = config.DefaultMaxSteps
@@ -130,16 +135,15 @@ func Run(ctx domain.Ctx, session *domain.Session) (string, error) {
 		// 截断完还超阈值时才做摘要（这一步要花一次请求），由 forceSummary 和内部判断把关
 		if len(session.Messages) > keepRecentMessages || needCompact(ctx.ContextLimit, used) {
 			force := lastPrompt > 0 && needCompact(ctx.ContextLimit, lastPrompt)
-			if compactContext(ctx, session, emit, usage, estimateTokens(sys), force) {
+			if compactContext(ctx, session, emit, usage, estimateTokens(sys), force, false) {
 				usage.messageTokens = estimateMessages(session.History())
 				lastPrompt = 0
 			}
 		}
 		messages := buildMessages(sys, session)
-		// 后台任务的通知追加在最后：前面 [系统提示词 + 历史] 的字节保持稳定，
-		// 只有这条新内容需要模型重新处理
-		messages = append(messages, taskMessages()...)
-		messages = append(messages, notices...)
+		// 尾部一次性内容统一追加在最末：前面 [系统提示词 + 历史] 的字节保持稳定，
+		// 只有这一块需要模型重新处理
+		messages = append(messages, trailingMessages(notices)...)
 		res, err := ctx.Provider.Chat(ctx.Context, messages, specs, onDelta)
 		if err != nil {
 			return "", err

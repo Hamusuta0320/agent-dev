@@ -54,6 +54,22 @@ type Session struct {
 	// 整块消失，看着像功能坏了。落进会话文件，换个进程也还看得见上次占了多少。
 	// 老会话没有这个字段，读出来是 nil
 	LastUsage *ContextUsage `json:"last_usage,omitempty"`
+	// PromptCache 是本会话系统提示词的运行期快照，不落盘。
+	// 系统提示词要读约定文件和技能目录，每个 step 重拼一遍既白读磁盘，又会在
+	// 文件被动过时把整段请求前缀换掉（接口侧的上下文缓存跟着全废），
+	// 所以存一份快照，输入指纹对得上就原样返回
+	PromptCache *PromptCache `json:"-"`
+}
+
+// PromptCache 是一份系统提示词的快照：正文，加上拼出它时的输入指纹。
+// Stamp 一样就说明重拼出来的字符串逐字节一样，可以直接复用
+type PromptCache struct {
+	Text  string
+	Stamp string
+	// Mode 是这份提示词对应的授权模式；切了模式提示词要跟着换
+	Mode Mode
+	// Shell 是写进提示词的 shell 名，换 shell 也得重拼
+	Shell string
 }
 
 // NewSession 起一个新会话。id 里带时间戳，按文件名排序就是会话的先后顺序

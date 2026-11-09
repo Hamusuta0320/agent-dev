@@ -14,6 +14,15 @@ const (
 	// keepRecentMessages 是压缩时原样保留的最近消息条数。更早的工具输出每步都会被重发，
 	// 越早换成截断版越省；留 8 条是让模型还能看到刚跑完那几步的完整结果
 	keepRecentMessages = 8
+	// keepRecentTokens 是保留区至少留多少 token 的历史。
+	// 保留区如果只按条数划，每个 step 追加两条消息就把标记点往前推两条，
+	// 于是每步都有工具结果被改写成截断版——请求前缀的尾部每步都在变，
+	// 接口侧的前缀缓存永远热不起来。按 token 预算划，正常一步只涨几百 token，
+	// 好几次检查都不会动到标记点
+	keepRecentTokens = 8000
+	// compactMinRunes 是单条工具结果值不值得截断的下限。几百字的输出压下去省不了
+	// 多少 token，却要让前缀从那条开始全部重算，得不偿失
+	compactMinRunes = 2000
 	// summaryMaxRunes 是单条消息送进摘要请求前的上限，免得摘要请求本身又撑爆上下文
 	summaryMaxRunes = 2000
 )
@@ -32,30 +41,62 @@ func needCompact(limit, used int) bool {
 	return limit > 0 && used > 0 && used*100 >= limit*compactThresholdPercent
 }
 
-// compactContext 按两级压缩会话：先把较早的工具输出截断，还不够就把更早的消息摘要掉。
-// 只改压缩标记和摘要，原文一直留在会话里，所以这里动过的会话照常落盘即可。
-// 每一步都可以调它：截断阶段代价很小、也不看阈值（越早回收越省），
-// 摘要阶段才要超阈值才做——forceSummary 表示上一轮接口报的用量已经超阈值，
-// 本地估算可能偏低，这时候别跳过摘要。
-// 返回是否真的改动了会话。
-func compactContext(ctx domain.Ctx, session *domain.Session, emit domain.EmitFunc, usage *usageTracker, systemTokens int, forceSummary bool) bool {
-	if session == nil || usage == nil {
-		return false
+// keepBoundary 划出"原样保留、绝不改写"的那一段，返回它的起点下标。
+// 手动压缩是用户明确要求的，只按条数留底：哪怕这段对话总共没多少 token 也该照做。
+// 自动压缩按 token 预算划：从尾部往前累计，至少 keepRecentMessages 条、并且至少
+// keepRecentTokens 个 token 才算够。消息不够多（累完还没到预算）时返回 0，一条都不动
+func keepBoundary(session *domain.Session, manual bool) int {
+	end := len(session.Messages)
+	if manual {
+		return max(end-keepRecentMessages, 0)
 	}
-	changed := false
+	used := 0
+	keepFrom := end
+	for i := end - 1; i >= 0; i-- {
+		keepFrom = i
+		used += estimateSessionMessage(session.Messages[i])
+		if end-i >= keepRecentMessages && used >= keepRecentTokens {
+			break
+		}
+	}
+	return keepFrom
+}
 
-	// 第一阶段：截断较早的工具输出。最近 keepRecentMessages 条保持原样
-	truncBefore := max(len(session.Messages)-keepRecentMessages, 0)
+// truncateOlderToolOutputs 把保留区之外、而且确实够大的工具结果标成压缩版，
+// 返回这次新标记的条数。标记只影响发给模型的那份正文，会话里仍是原文。
+// 门槛有两道：必须先滑出保留区（不然每步都要改一次前缀），
+// 其次原文得超过 compactMinRunes（不然省不下 token 还白改一遍）
+func truncateOlderToolOutputs(session *domain.Session, keepFrom int) int {
 	truncated := 0
-	for i := range truncBefore {
+	for i := 0; i < keepFrom; i++ {
 		msg := &session.Messages[i]
 		if msg.Role != domain.RoleTool || msg.Compressed {
+			continue
+		}
+		if len([]rune(msg.Content)) < compactMinRunes {
 			continue
 		}
 		msg.Compressed = true
 		truncated++
 	}
-	if truncated > 0 {
+	return truncated
+}
+
+// compactContext 按两级压缩会话：先把较早的工具输出截断，还不够就把更早的消息摘要掉。
+// 只改压缩标记和摘要，原文一直留在会话里，所以这里动过的会话照常落盘即可。
+// forceSummary 表示上一轮接口报的用量已经超阈值——本地估算可能偏低，这时候别跳过摘要；
+// manual 表示这是用户敲 /compact 要求的，保留区按条数划，不看 token 预算。
+// 返回是否真的改动了会话。
+func compactContext(ctx domain.Ctx, session *domain.Session, emit domain.EmitFunc, usage *usageTracker, systemTokens int, forceSummary, manual bool) bool {
+	if session == nil || usage == nil {
+		return false
+	}
+	changed := false
+	keepFrom := keepBoundary(session, manual)
+
+	// 第一阶段：截断保留区之外的工具输出。只动"确实够大"的那些，
+	// 而且要它已经滑出保留区——两个条件都不满足就别改前缀
+	if truncated := truncateOlderToolOutputs(session, keepFrom); truncated > 0 {
 		changed = true
 		emitCompact(emit, fmt.Sprintf("已截断 %d 条较早的工具输出", truncated))
 	}
@@ -64,7 +105,7 @@ func compactContext(ctx domain.Ctx, session *domain.Session, emit domain.EmitFun
 	if !forceSummary && !needCompact(ctx.ContextLimit, systemTokens+usage.toolTokens+estimateMessages(session.History())) {
 		return changed
 	}
-	end := summaryBoundary(session, truncBefore)
+	end := summaryBoundary(session, keepFrom)
 	if end <= session.SummaryUpTo {
 		return changed
 	}
@@ -98,14 +139,14 @@ func CompactNow(ctx domain.Ctx, session *domain.Session) bool {
 	if emit == nil {
 		emit = consoleEmit()
 	}
-	// 最近 keepRecentMessages 条永远原样留着，能进摘要的只有它前面那截
-	truncBefore := max(len(session.Messages)-keepRecentMessages, 0)
-	if summaryBoundary(session, truncBefore) <= session.SummaryUpTo {
+	// 最近那一段永远原样留着，能进摘要的只有它前面那截
+	keepFrom := keepBoundary(session, true)
+	if summaryBoundary(session, keepFrom) <= session.SummaryUpTo {
 		emitCompact(emit, fmt.Sprintf("没有可压缩的内容：最近 %d 条要原样留着，前面已经没有未压缩的消息了",
 			keepRecentMessages))
 		return false
 	}
-	return compactContext(ctx, session, emit, newUsageTracker(nil, session), 0, true)
+	return compactContext(ctx, session, emit, newUsageTracker(nil, session), 0, true, true)
 }
 
 // summaryBoundary 找摘要和原文的分界：Messages[:end] 进摘要，Messages[end:] 原样留着。

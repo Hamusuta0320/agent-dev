@@ -46,6 +46,21 @@ func estimateMessages(messages []domain.AIChatMessage) int {
 // 足够让界面上那根百分比条不至于漏掉图片这一块
 const imageTokens = 1000
 
+// estimateSessionMessage 估一条会话记录的占用，口径和 estimateMessages 一致。
+// 它的用处是划压缩的保留区：那里拿的是 Session.Messages 而不是拼好的请求消息
+func estimateSessionMessage(m domain.SessionMessage) int {
+	total := estimateTokens(m.Role) + estimateTokens(m.Content) + estimateTokens(m.ToolCallId)
+	for _, call := range m.ToolCalls {
+		total += estimateTokens(call.Name) + estimateTokens(call.Arguments)
+	}
+	for _, img := range m.Images {
+		if !img.Empty() {
+			total += imageTokens
+		}
+	}
+	return total
+}
+
 // estimateToolSpecs 估工具定义（名字、说明、参数 schema）的占用
 func estimateToolSpecs(specs []domain.ToolSpec) int {
 	total := 0

@@ -82,9 +82,12 @@ func (p *failingSummaryProvider) Chat(ctx context.Context, messages []domain.AIC
 	return domain.ChatResult{Content: "好了"}, nil
 }
 
+// bigToolOutput 造一条够大的工具结果：只有超过 compactMinRunes 的才值得截断
+func bigToolOutput() string { return strings.Repeat("line\n", 600) }
+
 // 占用刚到阈值时只截断老工具输出，不做摘要
 func TestCompactTruncatesOldToolOutputs(t *testing.T) {
-	session := compactDialog(10, strings.Repeat("line\n", 20))
+	session := compactDialog(20, bigToolOutput())
 	usage := &usageTracker{}
 	before := estimateMessages(session.History())
 	// 让占用正好卡在阈值上：截断之后自然会掉下去
@@ -93,7 +96,7 @@ func TestCompactTruncatesOldToolOutputs(t *testing.T) {
 	var events []domain.Event
 	changed := compactContext(domain.Ctx{ContextLimit: limit}, session, func(ev domain.Event) {
 		events = append(events, ev)
-	}, usage, 0, false)
+	}, usage, 0, false, false)
 	if !changed {
 		t.Fatal("超过阈值应该压缩会话")
 	}
@@ -101,28 +104,81 @@ func TestCompactTruncatesOldToolOutputs(t *testing.T) {
 		t.Fatalf("只是截断就够了，不该做摘要: %q / %d", session.Summary, session.SummaryUpTo)
 	}
 
+	keepFrom := keepBoundary(session, false)
 	compressed := 0
-	for _, msg := range session.Messages {
-		if msg.Compressed {
-			compressed++
+	for i, msg := range session.Messages {
+		if !msg.Compressed {
+			continue
+		}
+		compressed++
+		if i >= keepFrom {
+			t.Fatalf("保留区里的消息不该被改写: %+v", msg)
 		}
 	}
 	if compressed == 0 {
 		t.Fatal("应该有条工具输出被标记为压缩")
-	}
-	for _, msg := range session.Messages[len(session.Messages)-keepRecentMessages:] {
-		if msg.Compressed {
-			t.Fatalf("最近 %d 条不该压缩: %+v", keepRecentMessages, msg)
-		}
 	}
 	if len(events) != 1 || events[0].Kind != domain.EventCompact || !strings.Contains(events[0].Text, "截断") {
 		t.Fatalf("应该报一条截断事件，实际 %+v", events)
 	}
 }
 
+// 几百字的工具结果压下去省不了多少 token，却要让前缀从那条开始重算，不值得动
+func TestTruncateSkipsSmallToolOutputs(t *testing.T) {
+	session := compactDialog(3, strings.Repeat("line\n", 20))
+	big := domain.SessionMessage{
+		Role:       domain.RoleTool,
+		Content:    bigToolOutput(),
+		ToolCallId: "big",
+		ToolName:   "echo",
+	}
+	session.Messages = append([]domain.SessionMessage{big}, session.Messages...)
+
+	if got := truncateOlderToolOutputs(session, len(session.Messages)); got != 1 {
+		t.Fatalf("只有那条大的该被截断，实际 %d 条", got)
+	}
+	if !session.Messages[0].Compressed {
+		t.Fatal("够大的工具结果应该被标记")
+	}
+	for _, msg := range session.Messages[1:] {
+		if msg.Compressed {
+			t.Fatalf("短工具结果不该被标记: %+v", msg)
+		}
+	}
+}
+
+// 保留区按 token 预算划，不按条数：消息少时整段都留着，一条都不改写
+func TestKeepBoundaryReservesRecentTail(t *testing.T) {
+	short := compactDialog(2, bigToolOutput())
+	if got := keepBoundary(short, false); got != 0 {
+		t.Fatalf("消息这么少，应该整段保留，实际保留区起点 %d", got)
+	}
+
+	long := compactDialog(40, bigToolOutput())
+	keepFrom := keepBoundary(long, false)
+	if keepFrom <= 0 || keepFrom >= len(long.Messages) {
+		t.Fatalf("保留区起点不合理: %d / %d", keepFrom, len(long.Messages))
+	}
+	if kept := len(long.Messages) - keepFrom; kept < keepRecentMessages {
+		t.Fatalf("保留区至少要 %d 条，实际 %d 条", keepRecentMessages, kept)
+	}
+	kept := 0
+	for _, msg := range long.Messages[keepFrom:] {
+		kept += estimateSessionMessage(msg)
+	}
+	if kept < keepRecentTokens {
+		t.Fatalf("保留区至少要 %d token，实际 %d", keepRecentTokens, kept)
+	}
+
+	// 手动压缩（/compact）是用户明确要求的，只按条数留底，不受 token 预算影响
+	if manualKept := len(long.Messages) - keepBoundary(long, true); manualKept != keepRecentMessages {
+		t.Fatalf("手动压缩该只留 %d 条，实际 %d 条", keepRecentMessages, manualKept)
+	}
+}
+
 // 接口上一轮报的用量已经超阈值时，即使本地估算偏低也要摘要
 func TestCompactForceSummarizes(t *testing.T) {
-	session := compactDialog(10, strings.Repeat("line\n", 20))
+	session := compactDialog(40, bigToolOutput())
 	usage := &usageTracker{}
 	before := estimateMessages(session.History())
 	// 这个上限下，截断后的本地估算会低于阈值；force 仍然要求做摘要
@@ -133,7 +189,7 @@ func TestCompactForceSummarizes(t *testing.T) {
 		ContextLimit: limit,
 		Provider:     p,
 		Context:      context.Background(),
-	}, session, nil, usage, 0, true)
+	}, session, nil, usage, 0, true, false)
 	if !changed || p.summaries != 1 || session.Summary == "" || session.SummaryUpTo == 0 {
 		t.Fatalf("强制摘要没有生效: changed=%v summaries=%d summary=%q upTo=%d",
 			changed, p.summaries, session.Summary, session.SummaryUpTo)
@@ -142,7 +198,7 @@ func TestCompactForceSummarizes(t *testing.T) {
 
 // 截断之后还超阈值就做摘要；分界不能拆散工具调用和它的结果
 func TestCompactSummarizesOldMessages(t *testing.T) {
-	session := compactDialog(10, strings.Repeat("line\n", 20))
+	session := compactDialog(40, bigToolOutput())
 	usage := &usageTracker{}
 	p := &summaryProvider{}
 
@@ -150,7 +206,7 @@ func TestCompactSummarizesOldMessages(t *testing.T) {
 		ContextLimit: 1, // 故意给个极小的窗口，保证截断后仍然超阈值
 		Provider:     p,
 		Context:      context.Background(),
-	}, session, nil, usage, 0, false)
+	}, session, nil, usage, 0, false, false)
 	if !changed {
 		t.Fatal("应该压缩了会话")
 	}
@@ -186,7 +242,7 @@ func TestCompactSummarizesOldMessages(t *testing.T) {
 
 // 摘要失败只报一条事件，这一轮照常请求模型
 func TestCompactSummaryFailureDoesNotBreakRun(t *testing.T) {
-	session := compactDialog(10, strings.Repeat("line\n", 20))
+	session := compactDialog(40, bigToolOutput())
 	var events []domain.Event
 	p := &failingSummaryProvider{}
 
@@ -221,7 +277,7 @@ func TestCompactSummaryFailureDoesNotBreakRun(t *testing.T) {
 
 // Run 在发请求前压缩，并且请求里用的是摘要后的历史
 func TestRunCompactsBeforeRequest(t *testing.T) {
-	session := compactDialog(10, strings.Repeat("line\n", 20))
+	session := compactDialog(40, bigToolOutput())
 	p := &summaryProvider{}
 
 	if _, err := Run(domain.Ctx{
@@ -256,7 +312,7 @@ func TestRunCompactsBeforeRequest(t *testing.T) {
 
 // 手动压缩不看阈值：上下文还宽裕，也要把较早的对话整理成摘要
 func TestCompactNowIgnoresThreshold(t *testing.T) {
-	session := compactDialog(10, strings.Repeat("line\n", 20))
+	session := compactDialog(40, bigToolOutput())
 	p := &summaryProvider{}
 
 	var events []domain.Event
